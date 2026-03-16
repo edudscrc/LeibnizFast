@@ -23,6 +23,8 @@ pub struct Renderer {
     surface_config: wgpu::SurfaceConfiguration,
     /// Whether the device supports compute shaders (WebGPU = true, WebGL2 = false)
     pub has_compute: bool,
+    /// Maximum 2D texture dimension supported by the device
+    pub max_texture_dimension: u32,
     /// Compute pipeline for colormap application (WebGPU path only)
     compute_pipeline: Option<wgpu::ComputePipeline>,
     compute_bind_group: Option<wgpu::BindGroup>,
@@ -35,6 +37,9 @@ pub struct Renderer {
     /// Matrix dimensions needed for compute dispatch
     matrix_rows: u32,
     matrix_cols: u32,
+    /// Whether the colormap has been pre-applied to the texture (staging path).
+    /// When true, render_frame skips the compute pass.
+    colormap_applied: bool,
 }
 
 impl Renderer {
@@ -88,6 +93,7 @@ impl Renderer {
         // but the device may be created with lower limits.
         let device_limits = device.limits();
         let has_compute = device_limits.max_storage_buffers_per_shader_stage > 0;
+        let max_texture_dimension = device_limits.max_texture_dimension_2d;
         log::info!(
             "Compute shaders: {} (storage buffers: {})",
             if has_compute {
@@ -97,6 +103,7 @@ impl Renderer {
             },
             device_limits.max_storage_buffers_per_shader_stage
         );
+        log::info!("Max texture dimension: {max_texture_dimension}");
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -124,6 +131,7 @@ impl Renderer {
             surface,
             surface_config,
             has_compute,
+            max_texture_dimension,
             compute_pipeline: None,
             compute_bind_group: None,
             render_pipeline: None,
@@ -132,6 +140,7 @@ impl Renderer {
             colored_texture_view: None,
             matrix_rows: 0,
             matrix_cols: 0,
+            colormap_applied: false,
         })
     }
 
@@ -160,6 +169,16 @@ impl Renderer {
     ) -> Result<(), String> {
         let colormap = colormap.as_ref().ok_or("No colormap set")?;
 
+        // Validate texture dimensions against device limits
+        let max_dim = self.max_texture_dimension;
+        if cols > max_dim || rows > max_dim {
+            return Err(format!(
+                "Matrix dimensions ({cols}×{rows}) exceed the device's maximum texture size \
+                 ({max_dim}×{max_dim}). Use a smaller matrix or enable the Streaming API \
+                 to load data in chunks."
+            ));
+        }
+
         self.matrix_rows = rows;
         self.matrix_cols = cols;
 
@@ -167,10 +186,11 @@ impl Renderer {
 
         if self.has_compute {
             // WebGPU path: compute shader applies colormap on GPU
-            let matrix = matrix.as_ref().ok_or("No matrix data set (WebGPU path requires MatrixView)")?;
+            let matrix = matrix
+                .as_ref()
+                .ok_or("No matrix data set (WebGPU path requires MatrixView)")?;
 
-            let (colored_texture, colored_view) =
-                factory.create_colored_texture(cols, rows, true);
+            let (colored_texture, colored_view) = factory.create_colored_texture(cols, rows, true);
             self.colored_texture_view = Some(colored_view);
 
             let (compute_pipeline, compute_bind_group) = factory
@@ -185,8 +205,7 @@ impl Renderer {
             self.colored_texture = Some(colored_texture);
         } else {
             // WebGL2 path: create texture for CPU upload (no STORAGE_BINDING)
-            let (colored_texture, colored_view) =
-                factory.create_colored_texture(cols, rows, false);
+            let (colored_texture, colored_view) = factory.create_colored_texture(cols, rows, false);
             self.colored_texture_view = Some(colored_view);
             self.colored_texture = Some(colored_texture);
         }
@@ -231,6 +250,54 @@ impl Renderer {
         }
     }
 
+    /// Upload a region of CPU-colormapped RGBA data to the colored texture.
+    ///
+    /// Used for chunked WebGL2 uploads. `row_offset` specifies the starting
+    /// row in the texture, `chunk_rows` is the number of rows in this chunk.
+    pub fn upload_colored_texture_region(
+        &self,
+        rgba_data: &[u8],
+        cols: u32,
+        chunk_rows: u32,
+        row_offset: u32,
+    ) {
+        if let Some(ref texture) = self.colored_texture {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: row_offset,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba_data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(cols * 4),
+                    rows_per_image: Some(chunk_rows),
+                },
+                wgpu::Extent3d {
+                    width: cols,
+                    height: chunk_rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    /// Get the maximum buffer size supported by this device.
+    pub fn max_buffer_size(&self) -> u64 {
+        self.device.limits().max_buffer_size
+    }
+
+    /// Get the maximum 2D texture dimension supported by this device.
+    pub fn max_texture_dimension(&self) -> u32 {
+        self.max_texture_dimension
+    }
+
     /// Render a single frame.
     ///
     /// On WebGPU: compute pass (colormap) → render pass (textured quad).
@@ -264,8 +331,8 @@ impl Renderer {
                 label: Some("LeibnizFast Encoder"),
             });
 
-        // Compute pass: only on WebGPU path
-        if self.has_compute {
+        // Compute pass: only on WebGPU path, and only if colormap not pre-applied
+        if self.has_compute && !self.colormap_applied {
             if let (Some(compute_pipeline), Some(compute_bind_group)) =
                 (&self.compute_pipeline, &self.compute_bind_group)
             {
@@ -355,5 +422,122 @@ impl Renderer {
         output.present();
 
         Ok(())
+    }
+
+    /// Apply the colormap via compute shader for staged data.
+    ///
+    /// Processes the matrix in chunks through the staging buffer:
+    /// for each chunk, writes the data to the staging buffer, updates
+    /// the params uniform, and dispatches the compute shader.
+    pub fn apply_colormap_staged(
+        &mut self,
+        matrix: &MatrixView,
+        data: &[f32],
+        total_rows: u32,
+        cols: u32,
+        min_val: f32,
+        max_val: f32,
+    ) {
+        let staging_rows = matrix.staging_capacity_rows();
+        let mut current_row: u32 = 0;
+
+        while current_row < total_rows {
+            let chunk_rows = staging_rows.min(total_rows - current_row);
+            let start_idx = (current_row as usize) * (cols as usize);
+            let end_idx = start_idx + (chunk_rows as usize) * (cols as usize);
+            let chunk = &data[start_idx..end_idx];
+
+            // Write chunk data to staging buffer at offset 0
+            matrix.write_staging_chunk(&self.queue, chunk);
+
+            // Update params uniform for this chunk
+            matrix.update_chunk_params(&self.queue, chunk_rows, current_row, min_val, max_val);
+
+            // Dispatch compute shader for this chunk
+            if let (Some(ref compute_pipeline), Some(ref compute_bind_group)) =
+                (&self.compute_pipeline, &self.compute_bind_group)
+            {
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Staging Compute Encoder"),
+                        });
+
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Staging Colormap Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(compute_pipeline);
+                    compute_pass.set_bind_group(0, compute_bind_group, &[]);
+
+                    let workgroups_x = (cols + 15) / 16;
+                    let workgroups_y = (chunk_rows + 15) / 16;
+                    compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+                }
+
+                self.queue.submit(std::iter::once(encoder.finish()));
+            }
+
+            current_row += chunk_rows;
+        }
+
+        self.colormap_applied = true;
+    }
+
+    /// Apply the colormap via compute shader for staged data using streaming chunks.
+    ///
+    /// Unlike `apply_colormap_staged`, this processes a single chunk at a time
+    /// during the streaming upload (beginData/appendChunk/endData flow).
+    pub fn apply_colormap_staged_chunk(
+        &mut self,
+        matrix: &MatrixView,
+        chunk: &[f32],
+        chunk_rows: u32,
+        row_offset: u32,
+        cols: u32,
+        min_val: f32,
+        max_val: f32,
+    ) {
+        // Write chunk data to staging buffer at offset 0
+        matrix.write_staging_chunk(&self.queue, chunk);
+
+        // Update params uniform for this chunk
+        matrix.update_chunk_params(&self.queue, chunk_rows, row_offset, min_val, max_val);
+
+        // Dispatch compute shader for this chunk
+        if let (Some(ref compute_pipeline), Some(ref compute_bind_group)) =
+            (&self.compute_pipeline, &self.compute_bind_group)
+        {
+            let mut encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Staging Chunk Compute Encoder"),
+                    });
+
+            {
+                let mut compute_pass =
+                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Staging Chunk Colormap Compute Pass"),
+                        timestamp_writes: None,
+                    });
+                compute_pass.set_pipeline(compute_pipeline);
+                compute_pass.set_bind_group(0, compute_bind_group, &[]);
+
+                let workgroups_x = (cols + 15) / 16;
+                let workgroups_y = (chunk_rows + 15) / 16;
+                compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+    }
+
+    /// Set the colormap_applied flag.
+    ///
+    /// When true, render_frame will skip the compute pass (texture already has colors).
+    pub fn set_colormap_applied(&mut self, applied: bool) {
+        self.colormap_applied = applied;
     }
 }

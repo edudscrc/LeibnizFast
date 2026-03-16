@@ -35,3 +35,13 @@ export interface DataOptions {
  * @param value - The data value at (row, col)
  */
 export type HoverCallback = (row: number, col: number, value: number) => void;
+
+/**
+ * Options for streaming data upload via beginData/appendChunk/endData.
+ */
+export interface StreamingDataOptions {
+  /** Number of rows in the matrix. */
+  rows: number;
+  /** Number of columns in the matrix. */
+  cols: number;
+}

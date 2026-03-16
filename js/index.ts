@@ -21,10 +21,17 @@ import type {
   CreateOptions,
   DataOptions,
   HoverCallback,
+  StreamingDataOptions,
 } from './types';
 
 // Re-export types for consumers
-export type { ColormapName, CreateOptions, DataOptions, HoverCallback };
+export type {
+  ColormapName,
+  CreateOptions,
+  DataOptions,
+  HoverCallback,
+  StreamingDataOptions,
+};
 
 /** Cached WASM module — initialized once on first `create()` call. */
 let wasmModule: typeof import('../pkg/leibniz_fast') | null = null;
@@ -168,6 +175,57 @@ export class LeibnizFast {
    */
   onHover(callback: HoverCallback): void {
     this.inner.onHover(callback);
+  }
+
+  /**
+   * Begin a streaming data upload.
+   *
+   * Allocates buffers for the full matrix. Follow with `appendChunk()`
+   * calls and finalize with `endData()`.
+   *
+   * @param options - Matrix dimensions (rows, cols)
+   */
+  beginData(options: StreamingDataOptions): void {
+    this.inner.beginData(options.rows, options.cols);
+  }
+
+  /**
+   * Append a chunk of rows to the in-progress streaming upload.
+   *
+   * @param data - Float32Array containing a whole number of rows
+   * @param startRow - Zero-based index of the first row in this chunk
+   */
+  appendChunk(data: Float32Array, startRow: number): void {
+    this.inner.appendChunk(data, startRow);
+  }
+
+  /**
+   * Finalize a streaming upload. Computes data range, rebuilds
+   * pipelines, and renders.
+   */
+  endData(): void {
+    this.inner.endData();
+  }
+
+  /**
+   * Get the maximum number of matrix elements supported by this device.
+   *
+   * @returns Maximum number of f32 elements that fit in a single GPU buffer
+   */
+  getMaxMatrixElements(): number {
+    return this.inner.getMaxMatrixElements();
+  }
+
+  /**
+   * Get the maximum matrix dimension (rows or cols) this device supports.
+   *
+   * Matrices with rows or cols exceeding this value will fail to render
+   * because the output texture would exceed the GPU's texture size limit.
+   *
+   * @returns Maximum rows or cols value
+   */
+  getMaxTextureDimension(): number {
+    return this.inner.getMaxTextureDimension();
   }
 
   /**

@@ -24,6 +24,17 @@
       display: none;
       font-family: monospace;
     }
+    .error-banner {
+      width: 100%;
+      max-width: 820px;
+      padding: 8px 14px;
+      background: #5c1a1a;
+      color: #ffcccc;
+      border: 1px solid #c44;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      display: none;
+    }
   </style>
 </head>
 <body>
@@ -47,8 +58,14 @@
         <option value="2000">2000×2000</option>
         <option value="4000">4000×4000</option>
         <option value="8000">8000×8000</option>
+        <option value="16000">16000×16000</option>
+        <option value="32000">32000×32000</option>
       </select>
+      <label for="streaming">
+        <input type="checkbox" id="streaming" /> Streaming API
+      </label>
     </div>
+    <div class="error-banner" id="error-banner"></div>
     <canvas id="canvas" width="800" height="600"></canvas>
     <div class="tooltip" id="tooltip"></div>
   </div>
