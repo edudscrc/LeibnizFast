@@ -1,0 +1,188 @@
+/**
+ * LeibnizFast — GPU-accelerated 2D matrix visualization.
+ *
+ * Thin TypeScript wrapper around the Rust/WASM core.
+ * Handles WASM initialization, DOM event forwarding, and provides
+ * a clean typed API.
+ *
+ * @example
+ * ```ts
+ * import { LeibnizFast } from 'leibniz-fast';
+ *
+ * const canvas = document.getElementById('canvas') as HTMLCanvasElement;
+ * const viewer = await LeibnizFast.create(canvas, { colormap: 'viridis' });
+ * viewer.setData(new Float32Array(data), { rows: 1000, cols: 2000 });
+ * viewer.onHover((row, col, value) => console.log(row, col, value));
+ * ```
+ */
+
+import type {
+  ColormapName,
+  CreateOptions,
+  DataOptions,
+  HoverCallback,
+} from './types';
+
+// Re-export types for consumers
+export type { ColormapName, CreateOptions, DataOptions, HoverCallback };
+
+/** Cached WASM module — initialized once on first `create()` call. */
+let wasmModule: typeof import('../pkg/leibniz_fast') | null = null;
+
+/**
+ * Initialize the WASM module if not already loaded.
+ * Caches the result so subsequent calls are instant.
+ */
+async function ensureWasmLoaded(): Promise<
+  typeof import('../pkg/leibniz_fast')
+> {
+  if (!wasmModule) {
+    // Dynamic import of the wasm-pack generated module
+    wasmModule = await import('../pkg/leibniz_fast');
+  }
+  return wasmModule;
+}
+
+/**
+ * GPU-accelerated 2D matrix visualization viewer.
+ *
+ * Use the static `create()` method to instantiate — do not call the
+ * constructor directly.
+ */
+export class LeibnizFast {
+  /** Internal WASM instance */
+  private inner: any;
+  /** Canvas element this viewer is attached to */
+  private canvas: HTMLCanvasElement;
+  /** Bound event handlers for cleanup */
+  private boundHandlers: {
+    mousedown: (e: MouseEvent) => void;
+    mousemove: (e: MouseEvent) => void;
+    mouseup: (e: MouseEvent) => void;
+    wheel: (e: WheelEvent) => void;
+    resize: () => void;
+  };
+
+  private constructor(inner: any, canvas: HTMLCanvasElement) {
+    this.inner = inner;
+    this.canvas = canvas;
+
+    // Bind DOM event handlers
+    this.boundHandlers = {
+      mousedown: (e: MouseEvent) => {
+        const rect = canvas.getBoundingClientRect();
+        this.inner.onMouseDown(e.clientX - rect.left, e.clientY - rect.top);
+      },
+      mousemove: (e: MouseEvent) => {
+        const rect = canvas.getBoundingClientRect();
+        this.inner.onMouseMove(e.clientX - rect.left, e.clientY - rect.top);
+      },
+      mouseup: () => {
+        this.inner.onMouseUp();
+      },
+      wheel: (e: WheelEvent) => {
+        e.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+        this.inner.onWheel(
+          e.clientX - rect.left,
+          e.clientY - rect.top,
+          -e.deltaY,
+        );
+      },
+      resize: () => {
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        this.inner.resize(canvas.width, canvas.height);
+      },
+    };
+
+    // Register event listeners
+    canvas.addEventListener('mousedown', this.boundHandlers.mousedown);
+    canvas.addEventListener('mousemove', this.boundHandlers.mousemove);
+    window.addEventListener('mouseup', this.boundHandlers.mouseup);
+    canvas.addEventListener('wheel', this.boundHandlers.wheel, {
+      passive: false,
+    });
+    window.addEventListener('resize', this.boundHandlers.resize);
+  }
+
+  /**
+   * Create a new LeibnizFast viewer attached to the given canvas.
+   *
+   * Initializes WASM (if needed) and the GPU context.
+   *
+   * @param canvas - The HTML canvas element to render into
+   * @param options - Optional configuration (colormap, etc.)
+   * @returns A new LeibnizFast instance
+   */
+  static async create(
+    canvas: HTMLCanvasElement,
+    options?: CreateOptions,
+  ): Promise<LeibnizFast> {
+    const wasm = await ensureWasmLoaded();
+    const inner = await wasm.LeibnizFast.create(
+      canvas,
+      options?.colormap ?? undefined,
+    );
+    return new LeibnizFast(inner, canvas);
+  }
+
+  /**
+   * Set the matrix data to visualize.
+   *
+   * @param data - Flat Float32Array in row-major order
+   * @param options - Matrix dimensions (rows, cols)
+   */
+  setData(data: Float32Array, options: DataOptions): void {
+    this.inner.setData(data, options.rows, options.cols);
+  }
+
+  /**
+   * Change the colormap used for visualization.
+   *
+   * @param name - One of the available colormap names
+   */
+  setColormap(name: ColormapName): void {
+    this.inner.setColormap(name);
+  }
+
+  /**
+   * Set the data range for colormap mapping.
+   *
+   * Values at or below `min` map to the first colormap color,
+   * values at or above `max` map to the last.
+   *
+   * @param min - Minimum data value
+   * @param max - Maximum data value
+   */
+  setRange(min: number, max: number): void {
+    this.inner.setRange(min, max);
+  }
+
+  /**
+   * Register a callback for hover events.
+   *
+   * @param callback - Called with (row, col, value) on cell hover
+   */
+  onHover(callback: HoverCallback): void {
+    this.inner.onHover(callback);
+  }
+
+  /**
+   * Clean up all resources (GPU, event listeners, WASM).
+   * Must be called when the viewer is no longer needed.
+   */
+  destroy(): void {
+    // Remove event listeners
+    this.canvas.removeEventListener('mousedown', this.boundHandlers.mousedown);
+    this.canvas.removeEventListener('mousemove', this.boundHandlers.mousemove);
+    window.removeEventListener('mouseup', this.boundHandlers.mouseup);
+    this.canvas.removeEventListener('wheel', this.boundHandlers.wheel);
+    window.removeEventListener('resize', this.boundHandlers.resize);
+
+    // Destroy WASM instance (frees GPU resources)
+    this.inner.destroy();
+  }
+}

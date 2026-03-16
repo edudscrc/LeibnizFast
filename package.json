@@ -1,0 +1,48 @@
+{
+  "name": "leibniz-fast",
+  "version": "0.1.0",
+  "description": "GPU-accelerated 2D matrix visualization for the browser",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "pkg/"
+  ],
+  "scripts": {
+    "build:wasm": "wasm-pack build --target web --release",
+    "build:js": "npx tsup js/index.ts --format esm --dts --out-dir dist",
+    "build": "npm run build:wasm && npm run build:js",
+    "dev": "npm run build:wasm && npx http-server . -p 8080 -o /examples/basic/",
+    "lint:rs": "cargo fmt --check && cargo clippy -- -D warnings",
+    "lint:ts": "npx prettier --check js/ && npx eslint js/",
+    "lint": "npm run lint:rs && npm run lint:ts",
+    "test:rs": "cargo test",
+    "test": "npm run test:rs",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4",
+    "tsup": "^8.0",
+    "prettier": "^3.2",
+    "eslint": "^9.0",
+    "@typescript-eslint/parser": "^8.0",
+    "@typescript-eslint/eslint-plugin": "^8.0",
+    "typescript-eslint": "^8.0",
+    "http-server": "^14.1"
+  },
+  "keywords": [
+    "gpu",
+    "webgpu",
+    "wasm",
+    "matrix",
+    "visualization",
+    "heatmap",
+    "wgpu"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user/leibniz-fast"
+  }
+}

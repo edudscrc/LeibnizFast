@@ -1,0 +1,22 @@
+# Rust
+target/
+Cargo.lock
+
+# WASM
+pkg/
+dist/
+
+# Node
+node_modules/
+*.tgz
+
+# IDE / Tools
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
