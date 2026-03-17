@@ -22,58 +22,81 @@ JS (Float32Array) → WASM (Rust) → GPU buffers
 - CPU copy of matrix data for tooltip lookups (avoids async GPU readback)
 - Nearest-neighbor sampling for pixel-perfect cells at high zoom
 
-### Chunked upload flow (added for large matrix support)
+### Universal staging buffer architecture
 
-Both `setData` and the streaming API use the same internal upload path:
+All matrix sizes use the same upload path through a **staging buffer** (≤ 64 MB).
+No single GPU allocation exceeds 64 MB regardless of matrix size.
 
+**setData flow:**
 ```
-MatrixView::with_empty_buffer()        ← pre-allocates full STORAGE|COPY_DST buffer
-                                         (or staging buffer if data > max_buffer_size)
-ChunkedUploader (auto ~16 MB chunks, 16-row aligned)
-  └─ MatrixData::append_rows()         ← running min/max on CPU
-  └─ MatrixView::write_chunk()         ← queue.write_buffer() at byte offset
-MatrixData::finalize()                 ← handles all-NaN edge case
-MatrixView::update_params()            ← writes final min/max to uniform
-rebuild_pipelines() → render_frame()
-```
-
-### Staging buffer mode (for matrices > max_buffer_size)
-
-When the full matrix exceeds the GPU's `max_buffer_size` (e.g. 1 GB on Firefox),
-`MatrixView::with_empty_buffer()` automatically creates a **staging buffer** that
-holds as many rows as fit within the device limit, aligned to 16 rows.
-
-```
-MatrixView::with_empty_buffer()        ← detects data_size > max_buffer_size
-  └─ creates staging buffer (staging_rows × cols × 4 bytes)
-rebuild_pipelines() (early)            ← sets up compute pipeline for per-chunk dispatch
-for each chunk of data:
-  └─ write_staging_chunk()              ← overwrites staging buffer at offset 0
-  └─ update_chunk_params()              ← sets rows=chunk_rows, row_offset=current_row
-  └─ dispatch compute shader            ← writes colormapped pixels to texture region
-renderer.colormap_applied = true       ← render_frame skips compute pass
+MatrixData::append_rows()             ← CPU-side paged storage (64 MB pages) + running min/max
+MatrixData::finalize()                ← handles all-NaN edge case
+MatrixView::with_empty_buffer()       ← creates staging buffer (≤ 64 MB, 16-row aligned)
+rebuild_pipelines()                   ← per-tile textures, params buffers, bind groups
+Renderer::apply_colormap_tiled()      ← iterates tiles → chunks → staging → compute dispatch
+render_frame()                        ← draw quads (no compute — colormap already applied)
 ```
 
-Limitations of staging mode:
-- **No colormap changes** — raw data is not retained, so `setColormap()` returns an error
-- **No tooltip hover** — CPU data uses range-only mode (no `Vec` storage)
-- **CPU range-only** — `MatrixData::range_only()` tracks min/max without storing data,
-  required because WASM's 4 GB address space can't hold the full CPU-side `Vec<f32>`
+**Streaming flow (beginData/appendChunk/endData):**
+```
+begin_data()                          ← creates staging MatrixView + builds pipelines early
+append_chunk() × N                    ← each chunk: append to PagedStorage + immediate compute dispatch
+end_data()                            ← finalize min/max, mark colormap_applied, render
+```
+
+### PagedStorage (CPU-side data for tooltips)
+
+CPU-side matrix data is stored in `PagedStorage` — a collection of 64 MB pages
+(16M f32 elements each). This allows tooltip hover for matrices up to ~3.5 GB
+without any single allocation exceeding 64 MB.
+
+For matrices exceeding ~2 GB, `range_only` mode tracks only min/max (no tooltip).
+
+### setColormap re-dispatch
+
+Since CPU-side data is always retained (in PagedStorage), `setColormap()` can
+re-apply the colormap at any matrix size by re-dispatching from paged CPU data
+through the staging buffer. The only exception is range-only mode (>2 GB).
 
 ### Streaming API (for incremental / large-matrix ingestion)
 
 `LeibnizFast.begin_data(rows, cols)` → `append_chunk(chunk, start_row)` × N → `end_data()`
 
 - Tracked by `PendingUpload` struct on `LeibnizFast` (Rust side)
-- GPU buffer pre-allocated at full size in `begin_data`; no reallocation during appends
+- Staging buffer created in `begin_data`; pipelines built early for per-chunk compute dispatch
+- Each `append_chunk` immediately dispatches compute shader for the chunk's tiles
 - `start_row` parameter enforces sequential ordering (reserved for future ring-buffer waterfall)
 - `end_data` errors if any rows are missing
 
+### Texture tiling (for matrices > maxTextureDimension2D)
+
+When matrix dimensions exceed the device's `maxTextureDimension2D` (e.g. 8192 on
+Chrome WebGPU), the output texture is split into a grid of tiles using `TileGrid`.
+Each tile texture is at most `max_dim × max_dim` pixels.
+
+```
+TileGrid::new(rows, cols, max_dim)        ← computes tiles_x × tiles_y grid
+PipelineFactory::create_tiled_textures()  ← one texture per tile
+Per-tile params buffers                   ← row_offset, col_offset, texture_row_offset per tile
+Per-tile compute bind groups              ← each tile has its own bind group
+Per-tile camera buffers                   ← composed camera transform per tile
+render_frame():
+  Render pass only: draw one full-screen quad per tile
+    └─ discard fragments outside tile's UV region
+```
+
+Each tile has its own `MatrixParams` buffer with `col_offset`, `row_offset`, and
+`texture_row_offset` for correct data indexing and texture writes. The staging
+buffer is shared across all tiles. The render shader receives a per-tile composed
+camera uniform that maps screen UV → tile-local UV. Fragments outside the tile's
+[0,1] region are discarded.
+
 ### GPU limits
 - `Renderer` stores `max_texture_dimension` (from `device.limits().max_texture_dimension_2d`)
-- `rebuild_pipelines` validates rows/cols against this limit and returns a clear `Err` if exceeded
+- Matrices exceeding this limit are automatically tiled — no hard rejection
 - Typical limits: 8192 on WebGPU Chrome, 16384+ on desktop WebGPU/native
-- `MatrixView::with_empty_buffer()` auto-detects when data exceeds `max_buffer_size` and creates a staging buffer
+- GPU staging buffer is always ≤ 64 MB (capped by `MAX_STAGING_BYTES`), further limited by `max_buffer_size`
+- No single GPU or CPU allocation exceeds 64 MB regardless of matrix size
 - Exposed to JS as `getMaxTextureDimension()` and `getMaxMatrixElements()`
 
 ## Build & Test Commands
@@ -82,7 +105,7 @@ Limitations of staging mode:
 # Rust
 cargo fmt --check          # Check formatting
 cargo clippy -- -D warnings # Lint
-cargo test                  # Unit tests (42 tests: camera, colormap, interaction, matrix, chunked_upload)
+cargo test                  # Unit tests (55 tests: camera, colormap, interaction, matrix, chunked_upload, tile_grid)
 wasm-pack build --target web # Build WASM
 
 # TypeScript
@@ -120,7 +143,8 @@ npm run dev                 # Build + serve example
 - **Factory pattern**: `PipelineFactory` centralizes wgpu pipeline creation
 - **State pattern**: `InteractionState` enum for mouse events (Idle/Dragging)
 - **Pure/GPU split**: `CameraState`/`Camera`, `MatrixData`/`MatrixView` — pure math is testable, GPU wrapper adds buffers
-- **Staging buffer**: `MatrixView` auto-selects between full buffer and staging buffer based on `max_buffer_size`
+- **Universal staging**: `MatrixView` always uses a ≤64 MB staging buffer — no full-matrix GPU allocation
+- **Paged CPU storage**: `PagedStorage` stores data in 64 MB pages for tooltips at any matrix size
 
 ## File Structure
 
@@ -129,8 +153,9 @@ npm run dev                 # Build + serve example
 - `src/camera.rs` — CameraState (pure math) + Camera (GPU uniform)
 - `src/colormap.rs` — ColormapProvider trait + ColormapTexture
 - `src/colormap_data.rs` — Const 256-entry RGB tables
-- `src/matrix.rs` — MatrixData (CPU, supports incremental builds + range-only mode) + MatrixView (GPU buffer, supports chunked writes + staging buffer)
+- `src/matrix.rs` — PagedStorage (64 MB paged f32 storage), MatrixData (CPU, paged storage + range-only mode), MatrixView (GPU staging buffer ≤ 64 MB)
 - `src/chunked_upload.rs` — ChunkedUploader: pure-logic chunk boundary computation
+- `src/tile_grid.rs` — TileGrid: pure-logic tile layout for matrices exceeding maxTextureDimension2D
 - `src/interaction.rs` — InteractionState enum (Idle/Dragging)
 - `src/pipeline.rs` — PipelineFactory for compute + render pipelines
 - `src/shaders/colormap.wgsl` — Compute shader (supports row_offset for staging)

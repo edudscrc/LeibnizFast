@@ -65,9 +65,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Apply camera transform: map screen UV [0,1] to matrix UV region
     let matrix_uv = camera.uv_offset + input.uv * camera.uv_scale;
 
-    // Discard fragments outside the matrix bounds (shows background color)
+    // Discard fragments outside the texture bounds.
+    // With tiled rendering each tile draws a full-screen quad; fragments that
+    // don't belong to this tile must be discarded so they don't overwrite other
+    // tiles' output. The render pass clears to a dark background first.
     if matrix_uv.x < 0.0 || matrix_uv.x > 1.0 || matrix_uv.y < 0.0 || matrix_uv.y > 1.0 {
-        return vec4<f32>(0.1, 0.1, 0.1, 1.0); // Dark gray background
+        discard;
     }
 
     // Sample the colored matrix texture at the camera-adjusted UV coordinates.

@@ -10,38 +10,146 @@
 /// Uniform parameters for the compute shader.
 ///
 /// Contains matrix dimensions, data range, and chunk offset for normalization.
-/// Must match the WGSL struct layout exactly (24 bytes, padded to 16-byte alignment).
+/// Must match the WGSL struct layout exactly (32 bytes, 8 × u32/f32).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MatrixParams {
     /// Number of rows in this chunk (may be less than total matrix rows in staging mode)
     pub rows: u32,
-    /// Number of columns in the matrix (always the full width)
+    /// Number of columns in *this tile* (may be less than total_cols in tiling mode)
     pub cols: u32,
     /// Minimum data value (maps to first colormap color)
     pub min_val: f32,
     /// Maximum data value (maps to last colormap color)
     pub max_val: f32,
-    /// Row offset in the output texture (0 for single-buffer, >0 for staging chunks)
+    /// Row offset in the *full matrix* for this chunk/tile (0 for first chunk)
     pub row_offset: u32,
-    /// Padding to align struct to 8 bytes per field (uniform buffer requirement)
-    pub _pad: u32,
+    /// Column offset in the *full matrix* for this tile (0 for single-tile / non-tiled)
+    pub col_offset: u32,
+    /// Total number of columns in the full matrix (used for buffer indexing)
+    pub total_cols: u32,
+    /// Y offset when writing to tile texture (for multi-chunk-per-tile staging)
+    pub texture_row_offset: u32,
+}
+
+/// Page size for paged storage: 64 MB / 4 bytes per f32 = 16M elements.
+const PAGE_SIZE_ELEMENTS: usize = 16 * 1024 * 1024;
+
+/// Paged storage for large matrices.
+///
+/// Stores f32 data in fixed-size pages (64 MB each) so that no single
+/// allocation exceeds 64 MB. Supports appending and random access by index.
+pub struct PagedStorage {
+    pages: Vec<Vec<f32>>,
+    total_len: usize,
+}
+
+impl Default for PagedStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PagedStorage {
+    /// Create an empty paged storage.
+    pub fn new() -> Self {
+        Self {
+            pages: Vec::new(),
+            total_len: 0,
+        }
+    }
+
+    /// Append data, splitting across pages as needed.
+    pub fn append(&mut self, data: &[f32]) {
+        let mut offset = 0;
+        while offset < data.len() {
+            // Get or create current page
+            if self.pages.is_empty() || self.pages.last().unwrap().len() == PAGE_SIZE_ELEMENTS {
+                self.pages.push(Vec::with_capacity(
+                    PAGE_SIZE_ELEMENTS.min(data.len() - offset + self.current_page_len()),
+                ));
+            }
+            let page = self.pages.last_mut().unwrap();
+            let space = PAGE_SIZE_ELEMENTS - page.len();
+            let to_copy = space.min(data.len() - offset);
+            page.extend_from_slice(&data[offset..offset + to_copy]);
+            offset += to_copy;
+        }
+        self.total_len += data.len();
+    }
+
+    /// Get a value by flat index.
+    pub fn get(&self, index: usize) -> Option<f32> {
+        if index >= self.total_len {
+            return None;
+        }
+        let page_idx = index / PAGE_SIZE_ELEMENTS;
+        let offset = index % PAGE_SIZE_ELEMENTS;
+        self.pages
+            .get(page_idx)
+            .and_then(|p| p.get(offset))
+            .copied()
+    }
+
+    /// Total number of elements stored.
+    pub fn len(&self) -> usize {
+        self.total_len
+    }
+
+    /// Whether the storage is empty.
+    pub fn is_empty(&self) -> bool {
+        self.total_len == 0
+    }
+
+    /// Number of pages allocated.
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Get a reference to a specific page.
+    pub fn get_page(&self, page_idx: usize) -> Option<&[f32]> {
+        self.pages.get(page_idx).map(|p| p.as_slice())
+    }
+
+    /// Read a contiguous range of elements, potentially spanning pages.
+    /// Returns the data in the provided buffer. Panics if out of bounds.
+    pub fn read_range(&self, start: usize, buf: &mut [f32]) {
+        let mut offset = 0;
+        let mut global_idx = start;
+        while offset < buf.len() {
+            let page_idx = global_idx / PAGE_SIZE_ELEMENTS;
+            let page_offset = global_idx % PAGE_SIZE_ELEMENTS;
+            let page = &self.pages[page_idx];
+            let available = page.len() - page_offset;
+            let to_copy = available.min(buf.len() - offset);
+            buf[offset..offset + to_copy]
+                .copy_from_slice(&page[page_offset..page_offset + to_copy]);
+            offset += to_copy;
+            global_idx += to_copy;
+        }
+    }
+
+    fn current_page_len(&self) -> usize {
+        self.pages.last().map_or(0, |p| p.len())
+    }
 }
 
 /// CPU-side matrix data for tooltip lookups and range computation.
 ///
-/// Keeps a copy of the matrix data in memory to avoid async GPU readback
-/// when the user hovers over cells.
+/// Stores data in 64 MB pages via `PagedStorage` so no single allocation
+/// is too large. Supports tooltip hover for any matrix size within WASM's
+/// 4 GB address space. For matrices exceeding ~3.5 GB, uses range-only mode
+/// (no data stored, tooltip unavailable).
 pub struct MatrixData {
-    /// Row-major flat data (empty when `range_only` is true)
-    data: Vec<f32>,
+    /// Row-major paged data (empty when `range_only` is true)
+    data: PagedStorage,
     rows: u32,
     cols: u32,
     /// Data range for colormap normalization
     min_val: f32,
     max_val: f32,
     /// When true, only min/max are tracked — no data is stored.
-    /// This allows huge matrices (>2 GB) to work within WASM's 4 GB limit.
+    /// Required for matrices exceeding WASM's ~4 GB address space.
     range_only: bool,
     /// Number of rows appended so far (used instead of `data.len()` when `range_only`).
     rows_appended: u32,
@@ -54,8 +162,10 @@ impl MatrixData {
     pub fn new(data: Vec<f32>, rows: u32, cols: u32) -> Self {
         let (min_val, max_val) = Self::compute_range(&data);
         let rows_appended = rows;
+        let mut paged = PagedStorage::new();
+        paged.append(&data);
         Self {
-            data,
+            data: paged,
             rows,
             cols,
             min_val,
@@ -69,7 +179,7 @@ impl MatrixData {
     pub fn get_value(&self, row: u32, col: u32) -> Option<f32> {
         if row < self.rows && col < self.cols {
             let idx = (row * self.cols + col) as usize;
-            self.data.get(idx).copied()
+            self.data.get(idx)
         } else {
             None
         }
@@ -85,8 +195,8 @@ impl MatrixData {
         self.cols
     }
 
-    /// Get a reference to the raw data (for CPU colormap application).
-    pub fn raw_data(&self) -> &[f32] {
+    /// Get the paged storage (for iteration-based access).
+    pub fn paged_data(&self) -> &PagedStorage {
         &self.data
     }
 
@@ -101,13 +211,10 @@ impl MatrixData {
         self.max_val = max;
     }
 
-    /// Create a MatrixData with pre-allocated capacity for incremental building.
-    ///
-    /// Use `append_rows()` to add data, then `finalize()` when done.
+    /// Create a MatrixData for incremental building via `append_rows()`.
     pub fn with_capacity(rows: u32, cols: u32) -> Self {
-        let capacity = rows as usize * cols as usize;
         Self {
-            data: Vec::with_capacity(capacity),
+            data: PagedStorage::new(),
             rows,
             cols,
             min_val: f32::INFINITY,
@@ -119,11 +226,11 @@ impl MatrixData {
 
     /// Create a MatrixData that tracks only min/max without storing data.
     ///
-    /// Use this for matrices too large to fit in WASM memory (>2 GB).
+    /// Use this for matrices too large to fit in WASM memory (~3.5 GB+).
     /// Tooltip hover will be unavailable, but GPU rendering still works.
     pub fn range_only(rows: u32, cols: u32) -> Self {
         Self {
-            data: Vec::new(),
+            data: PagedStorage::new(),
             rows,
             cols,
             min_val: f32::INFINITY,
@@ -159,7 +266,7 @@ impl MatrixData {
         }
         // Only store data if not in range-only mode
         if !self.range_only {
-            self.data.extend_from_slice(chunk);
+            self.data.append(chunk);
         }
     }
 
@@ -205,76 +312,36 @@ impl MatrixData {
     }
 }
 
-/// GPU-side matrix view with storage buffer and parameters uniform.
+/// Maximum staging buffer size: 256 MB.
 ///
-/// Supports two modes:
-/// - **Full buffer**: one storage buffer holds the entire matrix (standard path)
-/// - **Staging buffer**: a smaller buffer that fits within `max_buffer_size`,
-///   used for chunked compute shader processing of large matrices
+/// This caps the largest single GPU allocation. A larger staging buffer means
+/// fewer compute dispatches per tile (better performance), but must stay within
+/// the device's `max_buffer_size` (typically 256 MB–1 GB on WebGPU).
+#[cfg(target_arch = "wasm32")]
+const MAX_STAGING_BYTES: u64 = 256 * 1024 * 1024;
+
+/// GPU-side matrix view with a staging buffer and parameters uniform.
+///
+/// Always uses a **staging buffer** (≤ 64 MB) that is reused per chunk. Data is
+/// written to the staging buffer at offset 0, then the compute shader processes
+/// it into tile textures. This eliminates the need for a full-matrix-sized GPU
+/// buffer and keeps GPU memory usage constant regardless of matrix size.
 ///
 /// Only available when compiling for WASM target.
 #[cfg(target_arch = "wasm32")]
 pub struct MatrixView {
-    /// Storage buffer containing the raw float data (full or staging-sized)
+    /// Staging buffer for compute shader input (reused per chunk)
     pub data_buffer: wgpu::Buffer,
     /// Uniform buffer containing matrix dimensions and range
     pub params_buffer: wgpu::Buffer,
     rows: u32,
     cols: u32,
-    min_val: f32,
-    max_val: f32,
-    /// Whether this is a staging buffer (smaller than the full matrix)
-    staging: bool,
-    /// Number of rows that fit in the staging buffer (only meaningful when staging=true)
+    /// Number of rows that fit in the staging buffer
     staging_rows: u32,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl MatrixView {
-    /// Create a new MatrixView, uploading data to GPU buffers.
-    pub fn new(
-        device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        data: &[f32],
-        rows: u32,
-        cols: u32,
-    ) -> Self {
-        use wgpu::util::DeviceExt;
-
-        let (min_val, max_val) = MatrixData::compute_range(data);
-
-        let data_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Matrix Data Buffer"),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let params = MatrixParams {
-            rows,
-            cols,
-            min_val,
-            max_val,
-            row_offset: 0,
-            _pad: 0,
-        };
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Matrix Params Buffer"),
-            contents: bytemuck::cast_slice(&[params]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        Self {
-            data_buffer,
-            params_buffer,
-            rows,
-            cols,
-            min_val,
-            max_val,
-            staging: false,
-            staging_rows: 0,
-        }
-    }
-
     /// Get the number of rows.
     pub fn rows(&self) -> u32 {
         self.rows
@@ -285,77 +352,51 @@ impl MatrixView {
         self.cols
     }
 
-    /// Whether this view uses a staging buffer (smaller than the full matrix).
-    pub fn is_staging(&self) -> bool {
-        self.staging
-    }
-
     /// Number of rows that fit in the staging buffer.
-    /// Only meaningful when `is_staging()` returns true.
     pub fn staging_capacity_rows(&self) -> u32 {
         self.staging_rows
     }
 
-    /// Update the data range and write to the GPU uniform buffer.
-    pub fn set_range(&mut self, min: f32, max: f32, queue: &wgpu::Queue) {
-        self.min_val = min;
-        self.max_val = max;
-        let params = MatrixParams {
-            rows: self.rows,
-            cols: self.cols,
-            min_val: self.min_val,
-            max_val: self.max_val,
-            row_offset: 0,
-            _pad: 0,
-        };
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[params]));
-    }
-
-    /// Create a MatrixView with an empty (uninitialized) GPU buffer.
+    /// Create a MatrixView with a staging buffer (≤ 64 MB).
     ///
-    /// If the full matrix fits in `max_buffer_size`, creates a full-sized buffer.
-    /// Otherwise, creates a **staging buffer** that holds as many rows as possible
-    /// within the device limit. Data must then be processed in chunks using
-    /// `write_staging_chunk()` + `update_chunk_params()`.
+    /// The staging buffer holds as many complete rows as fit within
+    /// `min(MAX_STAGING_BYTES, max_buffer_size)`, aligned to 16 rows.
+    /// Data is always processed in chunks through this buffer.
     pub fn with_empty_buffer(device: &wgpu::Device, rows: u32, cols: u32) -> Result<Self, String> {
         use wgpu::util::DeviceExt;
 
-        let data_size = (rows as u64) * (cols as u64) * 4; // f32 = 4 bytes
-        let max_size = device.limits().max_buffer_size;
+        if cols == 0 {
+            return Err("Cannot create staging buffer for 0-column matrix".to_string());
+        }
 
-        let (buffer_size, staging, staging_rows) = if data_size <= max_size {
-            // Full matrix fits in one buffer
-            (data_size, false, 0u32)
+        let data_size = (rows as u64) * (cols as u64) * 4;
+        let max_size = device.limits().max_buffer_size;
+        let budget = MAX_STAGING_BYTES.min(max_size);
+
+        let row_bytes = cols as u64 * 4;
+        let raw_rows = (budget / row_bytes).min(rows as u64);
+        // Align down to 16 rows (compute shader workgroup alignment), but allow
+        // fewer if the total matrix is < 16 rows
+        let aligned_rows = if rows <= 16 {
+            raw_rows as u32
         } else {
-            // Staging mode: compute how many rows fit, aligned to 16 (workgroup size)
-            if cols == 0 {
-                return Err("Cannot create staging buffer for 0-column matrix".to_string());
-            }
-            let row_bytes = cols as u64 * 4;
-            let raw_rows = max_size / row_bytes;
-            // Align down to 16 rows (compute shader workgroup alignment)
-            let aligned_rows = ((raw_rows as u32) / 16) * 16;
-            if aligned_rows == 0 {
-                return Err(format!(
-                    "A single row requires {} bytes but max_buffer_size is {}. \
-                     Cannot create staging buffer.",
-                    row_bytes, max_size
-                ));
-            }
-            let staging_size = aligned_rows as u64 * row_bytes;
-            log::info!(
-                "Staging buffer: {} rows × {} cols = {} bytes (full matrix: {} bytes, max: {} bytes)",
-                aligned_rows, cols, staging_size, data_size, max_size
-            );
-            (staging_size, true, aligned_rows)
+            ((raw_rows as u32) / 16) * 16
         };
+        if aligned_rows == 0 {
+            return Err(format!(
+                "A single row requires {} bytes but staging budget is {} bytes. \
+                 Cannot create staging buffer.",
+                row_bytes, budget
+            ));
+        }
+        let buffer_size = aligned_rows as u64 * row_bytes;
+        log::info!(
+            "Staging buffer: {} rows × {} cols = {} bytes (full matrix: {} bytes, budget: {} bytes)",
+            aligned_rows, cols, buffer_size, data_size, budget
+        );
 
         let data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(if staging {
-                "Matrix Data Buffer (staging)"
-            } else {
-                "Matrix Data Buffer (chunked)"
-            }),
+            label: Some("Matrix Staging Buffer"),
             size: buffer_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -367,7 +408,9 @@ impl MatrixView {
             min_val: 0.0,
             max_val: 1.0,
             row_offset: 0,
-            _pad: 0,
+            col_offset: 0,
+            total_cols: cols,
+            texture_row_offset: 0,
         };
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Matrix Params Buffer"),
@@ -380,56 +423,15 @@ impl MatrixView {
             params_buffer,
             rows,
             cols,
-            min_val: 0.0,
-            max_val: 1.0,
-            staging,
-            staging_rows,
+            staging_rows: aligned_rows,
         })
-    }
-
-    /// Write a chunk of row data to the GPU buffer at the correct byte offset.
-    ///
-    /// For full-buffer mode: `row_offset` positions the data within the buffer.
-    /// For staging mode: use `write_staging_chunk()` instead.
-    pub fn write_chunk(&self, queue: &wgpu::Queue, row_offset: u32, cols: u32, chunk: &[f32]) {
-        let byte_offset = (row_offset as u64) * (cols as u64) * 4;
-        queue.write_buffer(&self.data_buffer, byte_offset, bytemuck::cast_slice(chunk));
     }
 
     /// Write chunk data to the staging buffer at offset 0 (reusing the buffer).
     ///
-    /// In staging mode, the buffer is reused for each chunk — data always starts
-    /// at byte 0. The `row_offset` is tracked in the uniform params instead.
+    /// The staging buffer is reused for each chunk — data always starts at byte 0.
     pub fn write_staging_chunk(&self, queue: &wgpu::Queue, chunk: &[f32]) {
         queue.write_buffer(&self.data_buffer, 0, bytemuck::cast_slice(chunk));
-    }
-
-    /// Update the params uniform for a specific chunk in staging mode.
-    ///
-    /// Sets `rows` to the chunk's row count and `row_offset` for correct
-    /// texture positioning.
-    pub fn update_chunk_params(
-        &self,
-        queue: &wgpu::Queue,
-        chunk_rows: u32,
-        row_offset: u32,
-        min_val: f32,
-        max_val: f32,
-    ) {
-        let params = MatrixParams {
-            rows: chunk_rows,
-            cols: self.cols,
-            min_val,
-            max_val,
-            row_offset,
-            _pad: 0,
-        };
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[params]));
-    }
-
-    /// Update the min/max params uniform after all chunks are uploaded.
-    pub fn update_params(&mut self, min: f32, max: f32, queue: &wgpu::Queue) {
-        self.set_range(min, max, queue);
     }
 }
 
@@ -530,7 +532,10 @@ mod tests {
 
         assert_eq!(full.rows(), inc.rows());
         assert_eq!(full.cols(), inc.cols());
-        assert_eq!(full.raw_data(), inc.raw_data());
+        // Verify element-by-element via paged storage
+        for i in 0..data.len() {
+            assert_eq!(full.paged_data().get(i), inc.paged_data().get(i));
+        }
         let (fmin, fmax) = full.range();
         let (imin, imax) = inc.range();
         assert!((fmin - imin).abs() < 1e-6);
@@ -593,7 +598,7 @@ mod tests {
         assert!((m.range().1 - 9.99).abs() < 1e-6);
 
         // Data should NOT be stored
-        assert!(m.raw_data().is_empty());
+        assert!(m.paged_data().is_empty());
         assert_eq!(m.get_value(0, 0), None);
         assert_eq!(m.get_value(5, 50), None);
     }
@@ -622,5 +627,82 @@ mod tests {
         m.append_rows(&[10.0, 11.0, 12.0]); // 1 row
         assert_eq!(m.rows_loaded(), 4);
         m.finalize();
+    }
+
+    // --- PagedStorage tests ---
+
+    #[test]
+    fn test_paged_storage_basic() {
+        let mut ps = PagedStorage::new();
+        assert!(ps.is_empty());
+        assert_eq!(ps.len(), 0);
+
+        ps.append(&[1.0, 2.0, 3.0]);
+        assert_eq!(ps.len(), 3);
+        assert_eq!(ps.get(0), Some(1.0));
+        assert_eq!(ps.get(1), Some(2.0));
+        assert_eq!(ps.get(2), Some(3.0));
+        assert_eq!(ps.get(3), None);
+    }
+
+    #[test]
+    fn test_paged_storage_cross_page_boundary() {
+        let mut ps = PagedStorage::new();
+        // Fill almost one full page using vec![0.0; N] (fast even in debug)
+        let target = PAGE_SIZE_ELEMENTS - 2;
+        let mut filler = vec![0.0f32; target];
+        // Mark a few sentinel values near the boundary
+        filler[target - 1] = 42.0;
+        ps.append(&filler);
+        assert_eq!(ps.page_count(), 1);
+
+        // Cross the page boundary
+        ps.append(&[99.0, 100.0, 101.0, 102.0]);
+        assert_eq!(ps.page_count(), 2);
+        assert_eq!(ps.len(), PAGE_SIZE_ELEMENTS + 2);
+
+        // Check values around the boundary
+        assert_eq!(ps.get(PAGE_SIZE_ELEMENTS - 3), Some(42.0));
+        assert_eq!(ps.get(PAGE_SIZE_ELEMENTS - 2), Some(99.0));
+        assert_eq!(ps.get(PAGE_SIZE_ELEMENTS - 1), Some(100.0));
+        assert_eq!(ps.get(PAGE_SIZE_ELEMENTS), Some(101.0));
+        assert_eq!(ps.get(PAGE_SIZE_ELEMENTS + 1), Some(102.0));
+    }
+
+    #[test]
+    fn test_paged_storage_read_range() {
+        let mut ps = PagedStorage::new();
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        ps.append(&data);
+
+        let mut buf = [0.0f32; 10];
+        ps.read_range(5, &mut buf);
+        for i in 0..10 {
+            assert_eq!(buf[i], (i + 5) as f32);
+        }
+    }
+
+    #[test]
+    fn test_paged_storage_read_range_cross_page() {
+        let mut ps = PagedStorage::new();
+        // Fill one page using vec![0.0; N] (fast in debug), then set sentinel values
+        let mut page1 = vec![0.0f32; PAGE_SIZE_ELEMENTS];
+        // Set known values near the end of page 1
+        for i in 0..5 {
+            page1[PAGE_SIZE_ELEMENTS - 5 + i] = (PAGE_SIZE_ELEMENTS - 5 + i) as f32;
+        }
+        ps.append(&page1);
+        // Add 10 more elements on page 2 with known values
+        let tail: Vec<f32> = (PAGE_SIZE_ELEMENTS..PAGE_SIZE_ELEMENTS + 10)
+            .map(|i| i as f32)
+            .collect();
+        ps.append(&tail);
+
+        // Read across page boundary
+        let mut buf = [0.0f32; 15];
+        ps.read_range(PAGE_SIZE_ELEMENTS - 5, &mut buf);
+        for i in 0..15 {
+            assert_eq!(buf[i], (PAGE_SIZE_ELEMENTS - 5 + i) as f32);
+        }
     }
 }

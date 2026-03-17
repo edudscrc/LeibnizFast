@@ -3,16 +3,14 @@
 //! Centralizes creation of wgpu compute and render pipelines, bind group layouts,
 //! and bind groups. Keeps the Renderer clean and allows future swapping of
 //! pipeline configurations (e.g., WebGL2 fallback).
+//!
+//! Tiling support: for matrices larger than `maxTextureDimension2D`, we create
+//! multiple smaller textures (tiles) and render each as a separate quad.
 
-use crate::camera::Camera;
 use crate::colormap::ColormapTexture;
-use crate::matrix::MatrixView;
+use crate::tile_grid::TileGrid;
 
 /// Factory for creating wgpu pipelines and their associated resources.
-///
-/// Encapsulates the boilerplate of creating bind group layouts, bind groups,
-/// and pipeline objects for both compute (colormap application) and render
-/// (textured quad display) stages.
 pub struct PipelineFactory<'a> {
     device: &'a wgpu::Device,
 }
@@ -23,22 +21,16 @@ impl<'a> PipelineFactory<'a> {
         Self { device }
     }
 
-    /// Create the colored output texture.
-    ///
-    /// This is an RGBA8 texture with the same dimensions as the matrix.
-    /// - `needs_storage`: true on WebGPU (compute shader writes to it),
-    ///   false on WebGL2 (CPU uploads to it via `write_texture`).
-    pub fn create_colored_texture(
+    /// Create a single tile texture with the given dimensions.
+    fn create_tile_texture(
         &self,
         width: u32,
         height: u32,
         needs_storage: bool,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let usage = if needs_storage {
-            // WebGPU: compute shader writes, render shader reads
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING
         } else {
-            // WebGL2: CPU uploads via write_texture, render shader reads
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
         };
 
@@ -60,20 +52,29 @@ impl<'a> PipelineFactory<'a> {
         (texture, view)
     }
 
-    /// Create the compute pipeline and bind group for colormap application.
+    /// Create all tile textures for a tiled matrix.
     ///
-    /// Bindings:
-    /// - 0: Matrix data (storage buffer, read-only)
-    /// - 1: Output colored texture (storage texture, write-only)
-    /// - 2: Matrix params uniform (rows, cols, min, max)
-    /// - 3: Colormap LUT texture (256x1)
-    /// - 4: Colormap sampler
-    pub fn create_compute_pipeline_and_bindings(
+    /// Returns a flat `Vec` indexed by `tile_grid.tile_index(tx, ty)`.
+    pub fn create_tiled_textures(
         &self,
-        matrix: &MatrixView,
-        colormap: &ColormapTexture,
-        output_view: &wgpu::TextureView,
-    ) -> (wgpu::ComputePipeline, wgpu::BindGroup) {
+        tile_grid: &TileGrid,
+        needs_storage: bool,
+    ) -> Vec<(wgpu::Texture, wgpu::TextureView)> {
+        tile_grid
+            .iter_tiles()
+            .map(|(tx, ty)| {
+                let w = tile_grid.tile_width(tx);
+                let h = tile_grid.tile_height(ty);
+                self.create_tile_texture(w, h, needs_storage)
+            })
+            .collect()
+    }
+
+    /// Create the compute pipeline (shared across all tiles).
+    ///
+    /// Returns the pipeline and the bind group **layout** so per-tile bind groups
+    /// can be created separately via `create_compute_bind_group`.
+    pub fn create_compute_pipeline(&self) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
         let bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -90,7 +91,7 @@ impl<'a> PipelineFactory<'a> {
                             },
                             count: None,
                         },
-                        // Binding 1: Output colored texture (write-only storage texture)
+                        // Binding 1: Output tile texture (write-only storage texture)
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -101,7 +102,7 @@ impl<'a> PipelineFactory<'a> {
                             },
                             count: None,
                         },
-                        // Binding 2: Matrix params uniform (rows, cols, min_val, max_val)
+                        // Binding 2: Matrix params uniform
                         wgpu::BindGroupLayoutEntry {
                             binding: 2,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -112,7 +113,7 @@ impl<'a> PipelineFactory<'a> {
                             },
                             count: None,
                         },
-                        // Binding 3: Colormap LUT texture (256x1 RGBA)
+                        // Binding 3: Colormap LUT texture
                         wgpu::BindGroupLayoutEntry {
                             binding: 3,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -123,7 +124,7 @@ impl<'a> PipelineFactory<'a> {
                             },
                             count: None,
                         },
-                        // Binding 4: Colormap sampler (linear interpolation)
+                        // Binding 4: Colormap sampler
                         wgpu::BindGroupLayoutEntry {
                             binding: 4,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -159,21 +160,37 @@ impl<'a> PipelineFactory<'a> {
                 cache: None,
             });
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        (pipeline, bind_group_layout)
+    }
+
+    /// Create a compute bind group for one tile.
+    ///
+    /// Each tile gets its own `params_buffer` with correct `row_offset` and
+    /// `col_offset` for that tile's region. The `data_buffer` is shared across
+    /// all tiles (it holds the full matrix or staging data).
+    pub fn create_compute_bind_group(
+        &self,
+        layout: &wgpu::BindGroupLayout,
+        data_buffer: &wgpu::Buffer,
+        params_buffer: &wgpu::Buffer,
+        colormap: &ColormapTexture,
+        tile_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Compute Bind Group"),
-            layout: &bind_group_layout,
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: matrix.data_buffer.as_entire_binding(),
+                    resource: data_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(output_view),
+                    resource: wgpu::BindingResource::TextureView(tile_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: matrix.params_buffer.as_entire_binding(),
+                    resource: params_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -184,29 +201,22 @@ impl<'a> PipelineFactory<'a> {
                     resource: wgpu::BindingResource::Sampler(&colormap.sampler),
                 },
             ],
-        });
-
-        (pipeline, bind_group)
+        })
     }
 
-    /// Create the render pipeline and bind group for quad display.
+    /// Create the render pipeline (shared across tiles).
     ///
-    /// Bindings:
-    /// - 0: Colored texture (from compute output)
-    /// - 1: Nearest-neighbor sampler (pixel-perfect at high zoom)
-    /// - 2: Camera uniform (uv_offset, uv_scale)
-    pub fn create_render_pipeline_and_bindings(
+    /// Returns the pipeline and its bind group layout.
+    pub fn create_render_pipeline(
         &self,
-        colored_view: &wgpu::TextureView,
-        camera: &Camera,
         surface_format: wgpu::TextureFormat,
-    ) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
+    ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
         let bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("Render Bind Group Layout"),
                     entries: &[
-                        // Binding 0: Colored texture
+                        // Binding 0: Colored tile texture
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
                             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -217,14 +227,14 @@ impl<'a> PipelineFactory<'a> {
                             },
                             count: None,
                         },
-                        // Binding 1: Nearest-neighbor sampler for pixel-perfect display
+                        // Binding 1: Nearest-neighbor sampler
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
-                        // Binding 2: Camera uniform (uv_offset, uv_scale)
+                        // Binding 2: Camera uniform
                         wgpu::BindGroupLayoutEntry {
                             binding: 2,
                             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -252,16 +262,6 @@ impl<'a> PipelineFactory<'a> {
                 label: Some("Render Shader"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("shaders/render.wgsl").into()),
             });
-
-        // Nearest-neighbor sampler for pixel-perfect cell display at high zoom
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Nearest Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
 
         let pipeline = self
             .device
@@ -299,13 +299,33 @@ impl<'a> PipelineFactory<'a> {
                 cache: None,
             });
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        (pipeline, bind_group_layout)
+    }
+
+    /// Create a render bind group for one tile, using the tile's own texture view
+    /// and a per-tile camera buffer.
+    pub fn create_render_bind_group(
+        &self,
+        layout: &wgpu::BindGroupLayout,
+        tile_view: &wgpu::TextureView,
+        camera_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Nearest Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Render Bind Group"),
-            layout: &bind_group_layout,
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(colored_view),
+                    resource: wgpu::BindingResource::TextureView(tile_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -313,11 +333,13 @@ impl<'a> PipelineFactory<'a> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: camera.uniform_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: camera_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
                 },
             ],
-        });
-
-        (pipeline, bind_group)
+        })
     }
 }

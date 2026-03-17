@@ -56,22 +56,14 @@ async function main() {
   // Create the viewer
   const viewer = await LeibnizFast.create(canvas, colormapSelect.value);
 
-  // Query device limits and annotate the size dropdown
+  // Tiling handles matrices larger than maxTextureDimension — all sizes are selectable.
+  // Very large sizes (≥16000) auto-enable streaming to avoid OOM from JS allocation.
   const maxDim = viewer.getMaxTextureDimension();
+  console.log(`Device maxTextureDimension2D: ${maxDim} (tiling handles larger matrices)`);
   for (const option of sizeSelect.options) {
     const optSize = parseInt(option.value);
     if (optSize > maxDim) {
-      option.disabled = true;
-      option.text += ` (exceeds ${maxDim} limit)`;
-    }
-  }
-  // If the pre-selected option is now disabled, reset to largest allowed
-  if (sizeSelect.options[sizeSelect.selectedIndex].disabled) {
-    for (let i = sizeSelect.options.length - 1; i >= 0; i--) {
-      if (!sizeSelect.options[i].disabled) {
-        sizeSelect.selectedIndex = i;
-        break;
-      }
+      option.text += ' (tiled)';
     }
   }
 
@@ -89,12 +81,20 @@ async function main() {
    * one chunk rather than the full matrix. This is the only viable path for
    * very large matrices (e.g. 32000×32000 = 4 GB if allocated at once).
    *
-   * Both paths are blocked if the matrix exceeds the GPU texture dimension limit.
+   * Tiling handles matrices larger than the GPU's maxTextureDimension2D.
    *
    * @param {number} size
    * @param {boolean} useStreaming
    */
   function loadData(size, useStreaming) {
+    // Auto-enable streaming for large matrices to avoid JS OOM from single allocation
+    const matrixBytes = size * size * 4;
+    if (matrixBytes > 1e9 && !useStreaming) {
+      console.log(`Auto-enabling streaming for ${size}×${size} (${(matrixBytes / 1e9).toFixed(1)} GB)`);
+      useStreaming = true;
+      streamingCheckbox.checked = true;
+    }
+
     try {
       if (useStreaming) {
         // Streaming API: allocate GPU buffer upfront, then push 1000-row chunks

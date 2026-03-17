@@ -1,77 +1,84 @@
-// Compute shader: applies colormap to raw matrix data.
+// Compute shader: applies colormap to raw matrix data and writes to a tile texture.
 //
-// Reads each matrix cell value, normalizes it to [0,1] using the data range,
-// then samples the colormap LUT texture to produce an RGBA color.
-// Output is written to a storage texture for the render pass to display.
+// Supports both single-texture (small matrices) and tiled-texture (large matrices)
+// that exceed the device's maxTextureDimension2D limit.
 //
-// Supports chunked processing: when the matrix data exceeds the GPU buffer
-// size limit, data is uploaded in row-chunks. The `row_offset` field shifts
-// the texture write position so each chunk lands in the correct region.
+// Each invocation handles one cell of the *tile*. The global_invocation_id.x/y
+// are tile-relative coordinates. The absolute matrix position is obtained by
+// adding col_offset/row_offset before reading from the flat data buffer.
+//
+// Workgroup size 16×16 is tunable but must match the dispatch calculation on
+// the Rust side (ceiling division by 16).
 
-// Binding 0: Raw matrix data as a flat array of f32 values (row-major order).
-// May contain the full matrix or a chunk of rows (staging buffer mode).
+// Binding 0: Raw matrix data as a flat array of f32 values (row-major order,
+// full-matrix dimensions). The data is always indexed in full-matrix space.
 @group(0) @binding(0) var<storage, read> matrix_data: array<f32>;
 
-// Binding 1: Output RGBA texture — each pixel corresponds to one matrix cell
+// Binding 1: Output RGBA texture — one pixel per tile cell.
+// Size = tile_width × tile_height (≤ maxTextureDimension2D on both axes).
 @group(0) @binding(1) var output_texture: texture_storage_2d<rgba8unorm, write>;
 
-// Binding 2: Matrix parameters — dimensions, data range, and chunk offset
+// Binding 2: Per-dispatch parameters
 struct MatrixParams {
-    // Number of rows in *this chunk* (may be less than total matrix rows)
+    // Rows of this tile/chunk (≤ maxTextureDimension2D)
     rows: u32,
-    // Number of columns (always the full matrix width)
+    // Columns of this tile (≤ maxTextureDimension2D)
     cols: u32,
     // Data range for normalization
     min_val: f32,
     max_val: f32,
-    // Row offset in the output texture (0 for single-buffer mode,
-    // >0 for subsequent chunks in staging mode)
+    // Absolute row in the full matrix where this tile/chunk starts
     row_offset: u32,
-    // Padding to align struct to 16 bytes (required for uniform buffers)
-    _pad: u32,
+    // Absolute column in the full matrix where this tile starts
+    col_offset: u32,
+    // Total columns of the full matrix (used for flat buffer indexing)
+    total_cols: u32,
+    // Y offset when writing to tile texture (for multi-chunk-per-tile staging)
+    texture_row_offset: u32,
 }
 @group(0) @binding(2) var<uniform> params: MatrixParams;
 
-// Binding 3: Colormap lookup table — 256x1 RGBA texture
+// Binding 3: Colormap lookup table — 256×1 RGBA texture
 @group(0) @binding(3) var colormap_lut: texture_2d<f32>;
 
-// Binding 4: Sampler for the colormap LUT (linear interpolation between entries)
+// Binding 4: Sampler for the colormap LUT
 @group(0) @binding(4) var colormap_sampler: sampler;
 
-// Workgroup size: 16x16 threads per workgroup.
-// Each thread processes one matrix cell.
-// Chosen as a good balance between occupancy and register usage on most GPUs.
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let col = global_id.x;
-    let row = global_id.y;
+    // Tile-relative coordinates
+    let tile_col = global_id.x;
+    let tile_row = global_id.y;
 
-    // Bounds check: workgroup dispatch may overshoot chunk dimensions
-    if col >= params.cols || row >= params.rows {
+    // Bounds check against this tile's dimensions
+    if tile_col >= params.cols || tile_row >= params.rows {
         return;
     }
 
-    // Read the raw data value from the flat array (row-major indexing).
-    // In staging mode, row 0 in the buffer corresponds to row `row_offset`
-    // in the full matrix, but the buffer index is always relative to 0.
-    let idx = row * params.cols + col;
+    // Absolute position in the full matrix
+    let abs_row = tile_row + params.row_offset;
+    let abs_col = tile_col + params.col_offset;
+
+    // Read from the flat buffer using absolute coordinates and full-matrix width
+    let idx = abs_row * params.total_cols + abs_col;
     let value = matrix_data[idx];
 
-    // Normalize value to [0, 1] range using the data min/max
+    // Normalize to [0, 1]
     let range = params.max_val - params.min_val;
     var normalized: f32;
     if range > 0.0 {
         normalized = clamp((value - params.min_val) / range, 0.0, 1.0);
     } else {
-        // Constant data: map everything to the middle of the colormap
         normalized = 0.5;
     }
 
-    // Sample the colormap LUT texture at the normalized position.
-    // UV coordinates: u = normalized value, v = 0.5 (center of 1-pixel-tall texture)
-    let color = textureSampleLevel(colormap_lut, colormap_sampler, vec2<f32>(normalized, 0.5), 0.0);
+    // Sample the colormap LUT
+    let color = textureSampleLevel(
+        colormap_lut, colormap_sampler,
+        vec2<f32>(normalized, 0.5), 0.0
+    );
 
-    // Write the colored pixel to the output texture.
-    // row_offset shifts the write position for chunked processing.
-    textureStore(output_texture, vec2<i32>(i32(col), i32(row + params.row_offset)), color);
+    // Write to tile-relative coordinates in the output texture.
+    // texture_row_offset shifts Y when multiple chunks write to the same tile.
+    textureStore(output_texture, vec2<i32>(i32(tile_col), i32(tile_row + params.texture_row_offset)), color);
 }
