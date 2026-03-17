@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "postToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "command": "bash -c 'file=$(cat | jq -r \".tool_input.file_path // empty\"); if [[ \"$file\" == *.rs ]]; then cd /home/edudscrc/repos/LeibnizFast && cargo fmt --check 2>&1 && cargo clippy -- -D warnings 2>&1 && cargo test 2>&1; fi'",
+        "timeout": 60000
+      },
+      {
+        "matcher": "Edit|Write",
+        "command": "bash -c 'file=$(cat | jq -r \".tool_input.file_path // empty\"); if [[ \"$file\" == *.ts ]]; then cd /home/edudscrc/repos/LeibnizFast && npx prettier --check js/ 2>&1 && npx eslint js/ 2>&1; fi'",
+        "timeout": 15000
+      }
+    ]
+  }
+}

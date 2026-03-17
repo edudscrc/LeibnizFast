@@ -210,21 +210,15 @@ mod wasm_entry {
             self.set_colormap_internal(name)?;
 
             if let Some(ref jd) = self.js_data {
-                let (rows, cols) = (jd.rows(), jd.cols());
                 let (min_val, max_val) = jd.range();
                 self.renderer
-                    .rebuild_pipelines(
-                        &self.matrix,
-                        &self.colormap_texture,
-                        &self.camera,
-                        rows,
-                        cols,
-                    )
+                    .rebuild_compute_bind_groups(&self.matrix, &self.colormap_texture)
                     .map_err(|e| JsValue::from_str(&e))?;
 
                 // Re-dispatch colormap from JS-heap data
                 if self.renderer.has_compute {
                     if let Some(ref matrix_view) = self.matrix {
+                        let cols = jd.cols();
                         let read_fn = |start: usize, buf: &mut [f32]| {
                             jd.read_range(start, buf);
                         };

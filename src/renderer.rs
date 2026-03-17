@@ -353,6 +353,49 @@ impl Renderer {
         Ok(())
     }
 
+    /// Rebuild only the per-tile compute bind groups after a colormap change.
+    ///
+    /// Tile textures, params buffers, render bind groups, and pipelines are not
+    /// recreated. This avoids the 2× VRAM spike that `rebuild_pipelines` would
+    /// cause, enabling colormap changes on memory-constrained GPUs.
+    pub fn rebuild_compute_bind_groups(
+        &mut self,
+        matrix: &Option<MatrixView>,
+        colormap: &Option<ColormapTexture>,
+    ) -> Result<(), String> {
+        let colormap = colormap.as_ref().ok_or("No colormap set")?;
+        let matrix = matrix.as_ref().ok_or("No matrix data set")?;
+        let layout = self
+            .compute_bind_group_layout
+            .as_ref()
+            .ok_or("Pipelines not initialized")?;
+        let grid = self
+            .tile_grid
+            .as_ref()
+            .ok_or("No tile grid — call setData first")?
+            .clone();
+
+        self.colormap_applied = false;
+
+        let factory = PipelineFactory::new(&self.device);
+        let mut new_bind_groups = Vec::with_capacity(grid.tile_count() as usize);
+
+        for (tx, ty) in grid.iter_tiles() {
+            let idx = grid.tile_index(tx, ty);
+            let bg = factory.create_compute_bind_group(
+                layout,
+                &matrix.data_buffer,
+                &self.tile_params_buffers[idx],
+                colormap,
+                &self.tile_texture_views[idx],
+            );
+            new_bind_groups.push(bg);
+        }
+
+        self.tile_compute_bind_groups = new_bind_groups;
+        Ok(())
+    }
+
     /// Build per-tile camera buffers and render bind groups.
     ///
     /// For each tile (tx, ty) we compute the camera uniform that maps
