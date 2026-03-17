@@ -15,7 +15,7 @@
 
 use crate::camera::Camera;
 use crate::colormap::ColormapTexture;
-use crate::matrix::{MatrixParams, MatrixView, PagedStorage};
+use crate::matrix::{MatrixParams, MatrixView};
 use crate::pipeline::PipelineFactory;
 use crate::tile_grid::TileGrid;
 
@@ -498,18 +498,22 @@ impl Renderer {
         );
     }
 
-    /// Apply the colormap via compute shader, reading from paged CPU storage.
+    /// Apply the colormap via compute shader, reading data through a callback.
     ///
     /// This is the universal colormap application method. It iterates over all
-    /// tiles and chunks, reading data from `PagedStorage`, writing it to the
+    /// tiles and chunks, reading data via `read_fn`, writing it to the
     /// staging buffer, and dispatching the compute shader for each chunk.
+    ///
+    /// `read_fn(start_index, buffer)` fills `buffer` with f32 data starting
+    /// at the given flat index. This abstraction allows reading from either
+    /// `JsDataSource` (JS heap) or `PagedStorage` (WASM memory).
     ///
     /// `row_offset=0` because data starts at the staging buffer start.
     /// `texture_row_offset` advances within each tile texture.
     pub fn apply_colormap_tiled(
         &mut self,
         matrix: &MatrixView,
-        paged: &PagedStorage,
+        read_fn: &dyn Fn(usize, &mut [f32]),
         cols: u32,
         min_val: f32,
         max_val: f32,
@@ -538,11 +542,11 @@ impl Renderer {
                 let chunk_rows = staging_rows.min(tile_h - current_tile_row);
                 let abs_row_start = row_start + current_tile_row;
 
-                // Read full rows from paged storage for this chunk
+                // Read full rows from data source for this chunk
                 let chunk_len = (chunk_rows as usize) * (cols as usize);
                 let mut chunk = vec![0.0f32; chunk_len];
                 let start_idx = (abs_row_start as usize) * (cols as usize);
-                paged.read_range(start_idx, &mut chunk);
+                read_fn(start_idx, &mut chunk);
 
                 // Write chunk to staging buffer at offset 0
                 matrix.write_staging_chunk(&self.queue, &chunk);

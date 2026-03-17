@@ -137,22 +137,16 @@ impl PagedStorage {
 /// CPU-side matrix data for tooltip lookups and range computation.
 ///
 /// Stores data in 64 MB pages via `PagedStorage` so no single allocation
-/// is too large. Supports tooltip hover for any matrix size within WASM's
-/// 4 GB address space. For matrices exceeding ~3.5 GB, uses range-only mode
-/// (no data stored, tooltip unavailable).
+/// is too large. Used for native (non-WASM) tests. In WASM production,
+/// `JsDataSource` is used instead to keep data in the JS heap.
 pub struct MatrixData {
-    /// Row-major paged data (empty when `range_only` is true)
+    /// Row-major paged data
     data: PagedStorage,
     rows: u32,
     cols: u32,
     /// Data range for colormap normalization
     min_val: f32,
     max_val: f32,
-    /// When true, only min/max are tracked — no data is stored.
-    /// Required for matrices exceeding WASM's ~4 GB address space.
-    range_only: bool,
-    /// Number of rows appended so far (used instead of `data.len()` when `range_only`).
-    rows_appended: u32,
 }
 
 impl MatrixData {
@@ -161,7 +155,6 @@ impl MatrixData {
     /// Automatically computes min/max from the data.
     pub fn new(data: Vec<f32>, rows: u32, cols: u32) -> Self {
         let (min_val, max_val) = Self::compute_range(&data);
-        let rows_appended = rows;
         let mut paged = PagedStorage::new();
         paged.append(&data);
         Self {
@@ -170,8 +163,6 @@ impl MatrixData {
             cols,
             min_val,
             max_val,
-            range_only: false,
-            rows_appended,
         }
     }
 
@@ -219,30 +210,7 @@ impl MatrixData {
             cols,
             min_val: f32::INFINITY,
             max_val: f32::NEG_INFINITY,
-            range_only: false,
-            rows_appended: 0,
         }
-    }
-
-    /// Create a MatrixData that tracks only min/max without storing data.
-    ///
-    /// Use this for matrices too large to fit in WASM memory (~3.5 GB+).
-    /// Tooltip hover will be unavailable, but GPU rendering still works.
-    pub fn range_only(rows: u32, cols: u32) -> Self {
-        Self {
-            data: PagedStorage::new(),
-            rows,
-            cols,
-            min_val: f32::INFINITY,
-            max_val: f32::NEG_INFINITY,
-            range_only: true,
-            rows_appended: 0,
-        }
-    }
-
-    /// Returns true if this MatrixData is in range-only mode (no data stored).
-    pub fn is_range_only(&self) -> bool {
-        self.range_only
     }
 
     /// Append row data incrementally, updating the running min/max.
@@ -260,14 +228,7 @@ impl MatrixData {
                 }
             }
         }
-        // Track rows appended (for rows_loaded)
-        if self.cols > 0 {
-            self.rows_appended += (chunk.len() / self.cols as usize) as u32;
-        }
-        // Only store data if not in range-only mode
-        if !self.range_only {
-            self.data.append(chunk);
-        }
+        self.data.append(chunk);
     }
 
     /// Finalize after all rows are appended. Handles all-NaN edge case.
@@ -280,9 +241,6 @@ impl MatrixData {
 
     /// Get the number of complete rows loaded so far.
     pub fn rows_loaded(&self) -> u32 {
-        if self.range_only {
-            return self.rows_appended;
-        }
         if self.cols == 0 {
             return 0;
         }
@@ -435,6 +393,168 @@ impl MatrixView {
     }
 }
 
+/// Chunk size for scanning min/max from JS Float32Array: 4M elements = 16 MB.
+#[cfg(target_arch = "wasm32")]
+const SCAN_CHUNK_ELEMENTS: usize = 4 * 1024 * 1024;
+
+/// JS-heap-backed data source for matrix data.
+///
+/// Keeps matrix data as a `js_sys::Float32Array` in the JavaScript heap,
+/// avoiding WASM's 4 GB address space limit. Tooltips and colormap changes
+/// work at any matrix size since only metadata lives in WASM memory.
+#[cfg(target_arch = "wasm32")]
+pub struct JsDataSource {
+    /// Reference to the Float32Array in JS heap
+    data: js_sys::Float32Array,
+    rows: u32,
+    cols: u32,
+    min_val: f32,
+    max_val: f32,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl JsDataSource {
+    /// Create a new JsDataSource by scanning the Float32Array for min/max.
+    ///
+    /// The scan reads in small chunks (16 MB) to avoid large WASM temporaries.
+    /// The Float32Array stays in JS heap — no copy into WASM memory.
+    pub fn new(data: js_sys::Float32Array, rows: u32, cols: u32) -> Self {
+        let total = data.length() as usize;
+        let mut min_val = f32::INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
+        let chunk_size = SCAN_CHUNK_ELEMENTS.min(total);
+        if chunk_size > 0 {
+            let mut buf = vec![0.0f32; chunk_size];
+            let mut offset = 0;
+            while offset < total {
+                let end = (offset + chunk_size).min(total);
+                let len = end - offset;
+                data.subarray(offset as u32, end as u32)
+                    .copy_to(&mut buf[..len]);
+                for &v in &buf[..len] {
+                    if v.is_finite() {
+                        if v < min_val {
+                            min_val = v;
+                        }
+                        if v > max_val {
+                            max_val = v;
+                        }
+                    }
+                }
+                offset = end;
+            }
+        }
+        // Handle all-NaN or empty data
+        if min_val.is_infinite() {
+            min_val = 0.0;
+            max_val = 1.0;
+        }
+        Self {
+            data,
+            rows,
+            cols,
+            min_val,
+            max_val,
+        }
+    }
+
+    /// Create a JsDataSource with an empty JS Float32Array for streaming accumulation.
+    ///
+    /// Allocates `rows × cols` elements in JS heap. Use `write_range()` to fill
+    /// data during streaming, and `update_min_max()` to track the running range.
+    pub fn from_empty(rows: u32, cols: u32) -> Self {
+        let total = (rows as u32) * (cols as u32);
+        let data = js_sys::Float32Array::new_with_length(total);
+        Self {
+            data,
+            rows,
+            cols,
+            min_val: f32::INFINITY,
+            max_val: f32::NEG_INFINITY,
+        }
+    }
+
+    /// Get the value at (row, col). Returns `None` if out of bounds.
+    ///
+    /// Reads a single f32 from the JS Float32Array via `get_index()`.
+    /// This crosses the JS/WASM boundary once — negligible for hover events.
+    pub fn get_value(&self, row: u32, col: u32) -> Option<f32> {
+        if row < self.rows && col < self.cols {
+            let idx = row * self.cols + col;
+            Some(self.data.get_index(idx))
+        } else {
+            None
+        }
+    }
+
+    /// Read a contiguous range of elements into a buffer.
+    ///
+    /// Uses `subarray().copy_to()` for efficient bulk transfer from JS heap
+    /// to WASM memory. Used by colormap re-dispatch to fill staging buffers.
+    pub fn read_range(&self, start: usize, buf: &mut [f32]) {
+        let end = start + buf.len();
+        self.data.subarray(start as u32, end as u32).copy_to(buf);
+    }
+
+    /// Write data into the JS Float32Array at a given element offset.
+    ///
+    /// Used during streaming (`append_chunk`) to accumulate data in JS heap.
+    /// Creates a temporary JS view of the WASM slice — safe because the view
+    /// is consumed immediately by `set()` before any WASM memory growth.
+    pub fn write_range(&self, offset: u32, chunk: &[f32]) {
+        // SAFETY: Float32Array::view creates a JS typed array backed by WASM memory.
+        // This is safe as long as we don't grow WASM memory between creating
+        // the view and consuming it (the `set()` call copies the data immediately).
+        let src_view = unsafe { js_sys::Float32Array::view(chunk) };
+        self.data.set(&src_view, offset);
+    }
+
+    /// Update running min/max from a chunk of data (already in WASM memory).
+    ///
+    /// Called during streaming to track the data range incrementally.
+    pub fn update_min_max(&mut self, chunk: &[f32]) {
+        for &v in chunk {
+            if v.is_finite() {
+                if v < self.min_val {
+                    self.min_val = v;
+                }
+                if v > self.max_val {
+                    self.max_val = v;
+                }
+            }
+        }
+    }
+
+    /// Finalize after all data has been written. Handles all-NaN edge case.
+    pub fn finalize(&mut self) {
+        if self.min_val.is_infinite() {
+            self.min_val = 0.0;
+            self.max_val = 1.0;
+        }
+    }
+
+    /// Override the auto-computed range with explicit values.
+    pub fn set_range(&mut self, min: f32, max: f32) {
+        self.min_val = min;
+        self.max_val = max;
+    }
+
+    /// Get the number of rows.
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    /// Get the number of columns.
+    pub fn cols(&self) -> u32 {
+        self.cols
+    }
+
+    /// Get the current data range (min, max).
+    pub fn range(&self) -> (f32, f32) {
+        (self.min_val, self.max_val)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,50 +703,6 @@ mod tests {
         let (min, max) = m.range();
         assert!((min - 0.0).abs() < 1e-6);
         assert!((max - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_range_only_no_data_storage() {
-        let mut m = MatrixData::range_only(100, 100);
-        assert!(m.is_range_only());
-
-        // Append some data — should track range but NOT store elements
-        let chunk: Vec<f32> = (0..1000).map(|i| i as f32 * 0.01).collect();
-        m.append_rows(&chunk); // 10 rows of 100
-
-        assert!((m.range().0 - 0.0).abs() < 1e-6);
-        assert!((m.range().1 - 9.99).abs() < 1e-6);
-
-        // Data should NOT be stored
-        assert!(m.paged_data().is_empty());
-        assert_eq!(m.get_value(0, 0), None);
-        assert_eq!(m.get_value(5, 50), None);
-    }
-
-    #[test]
-    fn test_range_only_finalize() {
-        let mut m = MatrixData::range_only(2, 2);
-        m.append_rows(&[1.0, 2.0, 3.0, 4.0]);
-        m.finalize();
-        let (min, max) = m.range();
-        assert!((min - 1.0).abs() < 1e-6);
-        assert!((max - 4.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_range_only_rows_loaded() {
-        let mut m = MatrixData::range_only(4, 3);
-        assert_eq!(m.rows_loaded(), 0);
-
-        m.append_rows(&[1.0, 2.0, 3.0]); // 1 row
-        assert_eq!(m.rows_loaded(), 1);
-
-        m.append_rows(&[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]); // 2 rows
-        assert_eq!(m.rows_loaded(), 3);
-
-        m.append_rows(&[10.0, 11.0, 12.0]); // 1 row
-        assert_eq!(m.rows_loaded(), 4);
-        m.finalize();
     }
 
     // --- PagedStorage tests ---

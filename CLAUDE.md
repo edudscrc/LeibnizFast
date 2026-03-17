@@ -19,52 +19,56 @@ JS (Float32Array) → WASM (Rust) → GPU buffers
 - Compute shader pre-applies colormap to texture (only re-runs on data/colormap change, not on pan/zoom)
 - Camera is UV-space offset/scale in fragment shader
 - Events handled in JS, forwarded to Rust via wasm-bindgen
-- CPU copy of matrix data for tooltip lookups (avoids async GPU readback)
+- Matrix data kept in JS heap (Float32Array) for tooltip lookups — no WASM memory pressure
 - Nearest-neighbor sampling for pixel-perfect cells at high zoom
+
+### JS-heap data storage (JsDataSource)
+
+Matrix data is stored as a `js_sys::Float32Array` in the **JavaScript heap**, not in
+WASM linear memory. This bypasses WASM's 4 GB address space limit, enabling tooltips
+and dynamic colormap changes for matrices of any size (tested up to 32000×32000 = ~3.81 GB).
+
+- `JsDataSource::new(data, rows, cols)` — scans min/max in 16 MB chunks, keeps JS handle
+- `JsDataSource::from_empty(rows, cols)` — allocates JS Float32Array for streaming accumulation
+- `get_value(row, col)` — reads single f32 via `Float32Array.get_index()` (O(1), one JS/WASM crossing)
+- `read_range(start, buf)` — bulk reads via `subarray().copy_to()` for staging buffer fills
+- `write_range(offset, chunk)` — streaming writes via `Float32Array.set(view, offset)`
 
 ### Universal staging buffer architecture
 
-All matrix sizes use the same upload path through a **staging buffer** (≤ 64 MB).
-No single GPU allocation exceeds 64 MB regardless of matrix size.
+All matrix sizes use the same upload path through a **staging buffer** (≤ 256 MB).
+No single GPU allocation exceeds 256 MB regardless of matrix size.
 
 **setData flow:**
 ```
-MatrixData::append_rows()             ← CPU-side paged storage (64 MB pages) + running min/max
-MatrixData::finalize()                ← handles all-NaN edge case
-MatrixView::with_empty_buffer()       ← creates staging buffer (≤ 64 MB, 16-row aligned)
+JsDataSource::new(data, rows, cols)   ← scans min/max in 16 MB chunks, data stays in JS heap
+MatrixView::with_empty_buffer()       ← creates staging buffer (≤ 256 MB, 16-row aligned)
 rebuild_pipelines()                   ← per-tile textures, params buffers, bind groups
-Renderer::apply_colormap_tiled()      ← iterates tiles → chunks → staging → compute dispatch
+Renderer::apply_colormap_tiled()      ← iterates tiles → chunks → read from JS → staging → compute
 render_frame()                        ← draw quads (no compute — colormap already applied)
 ```
 
 **Streaming flow (beginData/appendChunk/endData):**
 ```
-begin_data()                          ← creates staging MatrixView + builds pipelines early
-append_chunk() × N                    ← each chunk: append to PagedStorage + immediate compute dispatch
+begin_data()                          ← creates JS-heap accumulator + staging MatrixView + builds pipelines
+append_chunk() × N                    ← each chunk: copy to JS accumulator + immediate compute dispatch
 end_data()                            ← finalize min/max, mark colormap_applied, render
 ```
 
-### PagedStorage (CPU-side data for tooltips)
-
-CPU-side matrix data is stored in `PagedStorage` — a collection of 64 MB pages
-(16M f32 elements each). This allows tooltip hover for matrices up to ~3.5 GB
-without any single allocation exceeding 64 MB.
-
-For matrices exceeding ~2 GB, `range_only` mode tracks only min/max (no tooltip).
-
 ### setColormap re-dispatch
 
-Since CPU-side data is always retained (in PagedStorage), `setColormap()` can
-re-apply the colormap at any matrix size by re-dispatching from paged CPU data
-through the staging buffer. The only exception is range-only mode (>2 GB).
+Since data is always retained in the JS heap (Float32Array), `setColormap()` can
+re-apply the colormap at any matrix size by reading chunks from JS through the
+staging buffer and re-dispatching compute. Works for all sizes — no exceptions.
 
 ### Streaming API (for incremental / large-matrix ingestion)
 
 `LeibnizFast.begin_data(rows, cols)` → `append_chunk(chunk, start_row)` × N → `end_data()`
 
 - Tracked by `PendingUpload` struct on `LeibnizFast` (Rust side)
+- JS-heap Float32Array accumulator created in `begin_data` for future tooltip/colormap
 - Staging buffer created in `begin_data`; pipelines built early for per-chunk compute dispatch
-- Each `append_chunk` immediately dispatches compute shader for the chunk's tiles
+- Each `append_chunk` copies data to JS accumulator + dispatches compute shader
 - `start_row` parameter enforces sequential ordering (reserved for future ring-buffer waterfall)
 - `end_data` errors if any rows are missing
 
@@ -95,8 +99,8 @@ camera uniform that maps screen UV → tile-local UV. Fragments outside the tile
 - `Renderer` stores `max_texture_dimension` (from `device.limits().max_texture_dimension_2d`)
 - Matrices exceeding this limit are automatically tiled — no hard rejection
 - Typical limits: 8192 on WebGPU Chrome, 16384+ on desktop WebGPU/native
-- GPU staging buffer is always ≤ 64 MB (capped by `MAX_STAGING_BYTES`), further limited by `max_buffer_size`
-- No single GPU or CPU allocation exceeds 64 MB regardless of matrix size
+- GPU staging buffer is always ≤ 256 MB (capped by `MAX_STAGING_BYTES`), further limited by `max_buffer_size`
+- No single GPU allocation exceeds 256 MB regardless of matrix size
 - Exposed to JS as `getMaxTextureDimension()` and `getMaxMatrixElements()`
 
 ## Build & Test Commands
@@ -105,7 +109,7 @@ camera uniform that maps screen UV → tile-local UV. Fragments outside the tile
 # Rust
 cargo fmt --check          # Check formatting
 cargo clippy -- -D warnings # Lint
-cargo test                  # Unit tests (55 tests: camera, colormap, interaction, matrix, chunked_upload, tile_grid)
+cargo test                  # Unit tests (52 tests: camera, colormap, interaction, matrix, chunked_upload, tile_grid)
 wasm-pack build --target web # Build WASM
 
 # TypeScript
@@ -139,12 +143,12 @@ npm run dev                 # Build + serve example
 ## Key Patterns
 
 - **TDD**: Write tests before implementation for pure-logic modules
-- **DI via traits**: `ColormapProvider` trait allows testing without GPU
+- **DI via traits/closures**: `ColormapProvider` trait, `apply_colormap_tiled` accepts `&dyn Fn` for data reading
 - **Factory pattern**: `PipelineFactory` centralizes wgpu pipeline creation
 - **State pattern**: `InteractionState` enum for mouse events (Idle/Dragging)
 - **Pure/GPU split**: `CameraState`/`Camera`, `MatrixData`/`MatrixView` — pure math is testable, GPU wrapper adds buffers
-- **Universal staging**: `MatrixView` always uses a ≤64 MB staging buffer — no full-matrix GPU allocation
-- **Paged CPU storage**: `PagedStorage` stores data in 64 MB pages for tooltips at any matrix size
+- **Universal staging**: `MatrixView` always uses a ≤256 MB staging buffer — no full-matrix GPU allocation
+- **JS-heap storage**: `JsDataSource` keeps data in JS heap (Float32Array) — tooltips and colormap changes at any size
 
 ## File Structure
 
@@ -153,7 +157,7 @@ npm run dev                 # Build + serve example
 - `src/camera.rs` — CameraState (pure math) + Camera (GPU uniform)
 - `src/colormap.rs` — ColormapProvider trait + ColormapTexture
 - `src/colormap_data.rs` — Const 256-entry RGB tables
-- `src/matrix.rs` — PagedStorage (64 MB paged f32 storage), MatrixData (CPU, paged storage + range-only mode), MatrixView (GPU staging buffer ≤ 64 MB)
+- `src/matrix.rs` — JsDataSource (JS-heap Float32Array wrapper), PagedStorage (for native tests), MatrixData (CPU), MatrixView (GPU staging buffer ≤ 256 MB)
 - `src/chunked_upload.rs` — ChunkedUploader: pure-logic chunk boundary computation
 - `src/tile_grid.rs` — TileGrid: pure-logic tile layout for matrices exceeding maxTextureDimension2D
 - `src/interaction.rs` — InteractionState enum (Idle/Dragging)

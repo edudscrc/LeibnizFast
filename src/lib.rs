@@ -53,8 +53,8 @@ mod wasm_entry {
 
     /// Tracks an in-progress streaming upload.
     struct PendingUpload {
-        /// CPU-side matrix being built incrementally
-        matrix_data: matrix::MatrixData,
+        /// JS-heap-backed data source being built incrementally
+        js_data: matrix::JsDataSource,
         /// GPU buffer (WebGPU only — `None` on WebGL2)
         matrix_view: Option<matrix::MatrixView>,
         /// Total rows expected
@@ -77,8 +77,8 @@ mod wasm_entry {
         matrix: Option<matrix::MatrixView>,
         colormap_texture: Option<colormap::ColormapTexture>,
         interaction: interaction::InteractionState,
-        /// CPU-side matrix data for tooltip lookups and WebGL2 fallback
-        matrix_data: Option<matrix::MatrixData>,
+        /// JS-heap-backed matrix data for tooltip lookups and colormap re-dispatch
+        js_data: Option<matrix::JsDataSource>,
         /// JavaScript callback for hover events
         hover_callback: Option<js_sys::Function>,
         /// Current colormap name
@@ -120,7 +120,7 @@ mod wasm_entry {
                 matrix: None,
                 colormap_texture: None,
                 interaction: interaction::InteractionState::new(),
-                matrix_data: None,
+                js_data: None,
                 hover_callback: None,
                 current_colormap: colormap_name,
                 current_colormap_lut: None,
@@ -130,48 +130,31 @@ mod wasm_entry {
 
         /// Set the matrix data to visualize.
         ///
-        /// `data` is a flat Float32Array in row-major order.
-        /// `rows` and `cols` specify the matrix dimensions.
-        /// Uses a staging buffer (≤ 64 MB) for all matrix sizes.
+        /// `data` is a Float32Array in row-major order (kept in JS heap — no copy
+        /// into WASM memory). `rows` and `cols` specify the matrix dimensions.
+        /// Min/max is scanned in small chunks. Tooltips and colormap changes work
+        /// at any matrix size.
         #[wasm_bindgen(js_name = setData)]
-        pub fn set_data(&mut self, data: &[f32], rows: u32, cols: u32) -> Result<(), JsValue> {
-            // Determine if CPU-side data should use range-only mode
-            const MAX_CPU_MATRIX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-            let data_bytes = (rows as u64) * (cols as u64) * 4;
-            let use_range_only = data_bytes > MAX_CPU_MATRIX_BYTES;
-
-            let mut matrix_data = if use_range_only {
-                if !self.renderer.has_compute {
-                    return Err(JsValue::from_str(
-                        "Matrix is too large for CPU-side storage and this device lacks \
-                         compute shaders (WebGL2 fallback). WebGPU is required.",
-                    ));
-                }
-                log::warn!(
-                    "setData: matrix {}×{} exceeds CPU limit, using range-only mode.",
+        pub fn set_data(
+            &mut self,
+            data: js_sys::Float32Array,
+            rows: u32,
+            cols: u32,
+        ) -> Result<(), JsValue> {
+            let expected_len = (rows as u32) * (cols as u32);
+            if data.length() != expected_len {
+                return Err(JsValue::from_str(&format!(
+                    "Data length {} does not match rows×cols = {}×{} = {}",
+                    data.length(),
                     rows,
-                    cols
-                );
-                matrix::MatrixData::range_only(rows, cols)
-            } else {
-                matrix::MatrixData::with_capacity(rows, cols)
-            };
-
-            // Build CPU-side data (computes min/max)
-            let mut uploader = chunked_upload::ChunkedUploader::new(
-                rows,
-                cols,
-                chunked_upload::ChunkConfig { chunk_rows: None },
-            );
-            while let Some((start_row, end_row)) = uploader.next_chunk_range() {
-                let start_idx = (start_row as usize) * (cols as usize);
-                let end_idx = (end_row as usize) * (cols as usize);
-                matrix_data.append_rows(&data[start_idx..end_idx]);
-                uploader.advance();
+                    cols,
+                    expected_len
+                )));
             }
-            matrix_data.finalize();
 
-            self.matrix_data = Some(matrix_data);
+            // Create JsDataSource — scans min/max in 16 MB chunks, data stays in JS heap
+            let js_data = matrix::JsDataSource::new(data, rows, cols);
+            self.js_data = Some(js_data);
 
             if self.colormap_texture.is_none() || self.current_colormap_lut.is_none() {
                 self.set_colormap_internal(&self.current_colormap.clone())?;
@@ -196,11 +179,14 @@ mod wasm_entry {
                     )
                     .map_err(|e| JsValue::from_str(&e))?;
 
-                if let (Some(ref matrix_view), Some(ref md)) = (&self.matrix, &self.matrix_data) {
-                    let (min_val, max_val) = md.range();
+                if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
+                    let (min_val, max_val) = jd.range();
+                    let read_fn = |start: usize, buf: &mut [f32]| {
+                        jd.read_range(start, buf);
+                    };
                     self.renderer.apply_colormap_tiled(
                         matrix_view,
-                        md.paged_data(),
+                        &read_fn,
                         cols,
                         min_val,
                         max_val,
@@ -217,21 +203,15 @@ mod wasm_entry {
         }
 
         /// Set the colormap used for visualization.
+        ///
+        /// Re-dispatches the colormap from JS-heap data — works at any matrix size.
         #[wasm_bindgen(js_name = setColormap)]
         pub fn set_colormap(&mut self, name: &str) -> Result<(), JsValue> {
             self.set_colormap_internal(name)?;
 
-            if let Some(ref md) = self.matrix_data {
-                // Range-only mode has no CPU data to re-apply colormap from
-                if md.is_range_only() {
-                    return Err(JsValue::from_str(
-                        "Cannot change colormap: matrix data exceeds CPU storage limit \
-                         (range-only mode). Reload the data after selecting the desired colormap.",
-                    ));
-                }
-
-                let (rows, cols) = (md.rows(), md.cols());
-                let (min_val, max_val) = md.range();
+            if let Some(ref jd) = self.js_data {
+                let (rows, cols) = (jd.rows(), jd.cols());
+                let (min_val, max_val) = jd.range();
                 self.renderer
                     .rebuild_pipelines(
                         &self.matrix,
@@ -242,12 +222,15 @@ mod wasm_entry {
                     )
                     .map_err(|e| JsValue::from_str(&e))?;
 
-                // Re-dispatch colormap from paged CPU data
+                // Re-dispatch colormap from JS-heap data
                 if self.renderer.has_compute {
                     if let Some(ref matrix_view) = self.matrix {
+                        let read_fn = |start: usize, buf: &mut [f32]| {
+                            jd.read_range(start, buf);
+                        };
                         self.renderer.apply_colormap_tiled(
                             matrix_view,
-                            md.paged_data(),
+                            &read_fn,
                             cols,
                             min_val,
                             max_val,
@@ -264,28 +247,24 @@ mod wasm_entry {
 
         /// Set the data range for colormap mapping.
         ///
-        /// Re-applies the colormap with the new range from paged CPU data.
+        /// Re-applies the colormap with the new range from JS-heap data.
         #[wasm_bindgen(js_name = setRange)]
         pub fn set_range(&mut self, min: f32, max: f32) -> Result<(), JsValue> {
-            if let Some(ref mut matrix_data) = self.matrix_data {
-                matrix_data.set_range(min, max);
+            if let Some(ref mut jd) = self.js_data {
+                jd.set_range(min, max);
             }
 
-            if let Some(ref md) = self.matrix_data {
-                if md.is_range_only() {
-                    return Err(JsValue::from_str(
-                        "Cannot change range: matrix data exceeds CPU storage limit \
-                         (range-only mode).",
-                    ));
-                }
-
+            if let Some(ref jd) = self.js_data {
                 // Re-apply colormap with new range
                 if self.renderer.has_compute {
                     if let Some(ref matrix_view) = self.matrix {
+                        let read_fn = |start: usize, buf: &mut [f32]| {
+                            jd.read_range(start, buf);
+                        };
                         self.renderer.apply_colormap_tiled(
                             matrix_view,
-                            md.paged_data(),
-                            md.cols(),
+                            &read_fn,
+                            jd.cols(),
                             min,
                             max,
                         );
@@ -301,9 +280,9 @@ mod wasm_entry {
 
         /// Begin a streaming data upload.
         ///
-        /// Allocates CPU and GPU staging buffers for `rows × cols` elements.
-        /// Builds pipelines early so the compute shader is available for
-        /// per-chunk processing in `append_chunk()`.
+        /// Allocates a JS-heap Float32Array for `rows × cols` elements and a GPU
+        /// staging buffer. Builds pipelines early so the compute shader is available
+        /// for per-chunk processing in `append_chunk()`.
         /// Use `append_chunk()` to upload data, then `end_data()` to finalize.
         /// Errors if an upload is already in progress.
         #[wasm_bindgen(js_name = beginData)]
@@ -314,32 +293,8 @@ mod wasm_entry {
                 ));
             }
 
-            // 2 GB threshold — beyond this, WASM's 4 GB address space can't hold
-            // the full CPU-side data plus other allocations.
-            const MAX_CPU_MATRIX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-            let data_bytes = (rows as u64) * (cols as u64) * 4;
-            let use_range_only = data_bytes > MAX_CPU_MATRIX_BYTES;
-
-            if use_range_only && !self.renderer.has_compute {
-                return Err(JsValue::from_str(
-                    "Matrix is too large for CPU-side storage and this device lacks \
-                     compute shaders (WebGL2 fallback). WebGPU is required for \
-                     matrices exceeding ~2 GB.",
-                ));
-            }
-
-            let matrix_data = if use_range_only {
-                log::warn!(
-                    "Matrix {}×{} ({} bytes) exceeds CPU storage limit. \
-                     Using range-only mode — tooltip hover will be unavailable.",
-                    rows,
-                    cols,
-                    data_bytes
-                );
-                matrix::MatrixData::range_only(rows, cols)
-            } else {
-                matrix::MatrixData::with_capacity(rows, cols)
-            };
+            // Allocate JS-heap accumulator — no WASM memory pressure
+            let js_data = matrix::JsDataSource::from_empty(rows, cols);
 
             let matrix_view = if self.renderer.has_compute {
                 Some(
@@ -371,7 +326,7 @@ mod wasm_entry {
                 // Move it back into PendingUpload
                 let matrix_view = self.matrix.take();
                 self.pending_upload = Some(PendingUpload {
-                    matrix_data,
+                    js_data,
                     matrix_view,
                     rows,
                     cols,
@@ -379,7 +334,7 @@ mod wasm_entry {
                 });
             } else {
                 self.pending_upload = Some(PendingUpload {
-                    matrix_data,
+                    js_data,
                     matrix_view,
                     rows,
                     cols,
@@ -395,9 +350,9 @@ mod wasm_entry {
         /// `chunk` must contain a whole number of rows. `start_row` must
         /// match the next expected row (sequential ordering required).
         ///
-        /// In staging mode, immediately dispatches the compute shader for
-        /// this chunk (applying the colormap on the fly). The min/max range
-        /// uses a running estimate that is finalized in `end_data()`.
+        /// Copies chunk data to the JS-heap accumulator (for tooltip/colormap)
+        /// and immediately dispatches the compute shader for this chunk.
+        /// The min/max range uses a running estimate finalized in `end_data()`.
         #[wasm_bindgen(js_name = appendChunk)]
         pub fn append_chunk(&mut self, chunk: &[f32], start_row: u32) -> Result<(), JsValue> {
             let pending = self.pending_upload.as_mut().ok_or_else(|| {
@@ -433,14 +388,17 @@ mod wasm_entry {
                 )));
             }
 
-            pending.matrix_data.append_rows(chunk);
+            // Copy chunk to JS-heap accumulator for future tooltip/colormap re-dispatch
+            let element_offset = start_row * pending.cols;
+            pending.js_data.write_range(element_offset, chunk);
+            pending.js_data.update_min_max(chunk);
 
             // Process this chunk through the compute shader immediately.
             // Use the running min/max (will be corrected at end_data if needed,
             // but for initial display the running values are good enough).
             if let Some(ref matrix_view) = pending.matrix_view {
                 let staging_cap = matrix_view.staging_capacity_rows();
-                let (min_val, max_val) = pending.matrix_data.range();
+                let (min_val, max_val) = pending.js_data.range();
 
                 if chunk_rows <= staging_cap {
                     // Chunk fits in staging buffer — single dispatch
@@ -483,7 +441,7 @@ mod wasm_entry {
 
         /// Finalize a streaming upload.
         ///
-        /// Computes final min/max, rebuilds pipelines, and renders.
+        /// Finalizes min/max, stores the JS-heap data source, and renders.
         /// Errors if the upload is incomplete (not all rows uploaded).
         #[wasm_bindgen(js_name = endData)]
         pub fn end_data(&mut self) -> Result<(), JsValue> {
@@ -504,9 +462,9 @@ mod wasm_entry {
             let rows = pending.rows;
             let cols = pending.cols;
 
-            pending.matrix_data.finalize();
+            pending.js_data.finalize();
 
-            self.matrix_data = Some(pending.matrix_data);
+            self.js_data = Some(pending.js_data);
             self.matrix = pending.matrix_view;
 
             if self.colormap_texture.is_none() || self.current_colormap_lut.is_none() {
@@ -520,13 +478,7 @@ mod wasm_entry {
             self.renderer.set_colormap_applied(true);
 
             // CPU colormap upload for WebGL2 fallback
-            if !self
-                .matrix_data
-                .as_ref()
-                .map_or(false, |md| md.is_range_only())
-            {
-                self.upload_cpu_colormap_if_needed();
-            }
+            self.upload_cpu_colormap_if_needed();
 
             self.render_frame()?;
 
@@ -602,7 +554,7 @@ mod wasm_entry {
                 .resize(width, height)
                 .map_err(|e| JsValue::from_str(&e))?;
             self.camera.update_uniform(&self.renderer.queue);
-            if self.matrix_data.is_some() {
+            if self.js_data.is_some() {
                 self.render_frame()?;
             }
             Ok(())
@@ -642,18 +594,16 @@ mod wasm_entry {
         ///
         /// Only runs when compute shaders are unavailable. Uses chunked uploads
         /// for large matrices to avoid allocating the full RGBA buffer at once.
+        /// Reads from JS-heap data via `JsDataSource::read_range()`.
         fn upload_cpu_colormap_if_needed(&self) {
             if self.renderer.has_compute {
                 return; // WebGPU path uses compute shader instead
             }
 
-            if let (Some(ref matrix_data), Some(lut)) =
-                (&self.matrix_data, self.current_colormap_lut)
-            {
-                let (min_val, max_val) = matrix_data.range();
-                let rows = matrix_data.rows();
-                let cols = matrix_data.cols();
-                let paged = matrix_data.paged_data();
+            if let (Some(ref jd), Some(lut)) = (&self.js_data, self.current_colormap_lut) {
+                let (min_val, max_val) = jd.range();
+                let rows = jd.rows();
+                let cols = jd.cols();
 
                 let mut uploader = chunked_upload::ChunkedUploader::new(
                     rows,
@@ -665,7 +615,7 @@ mod wasm_entry {
                     let start_idx = (start_row as usize) * (cols as usize);
                     let chunk_len = (end_row - start_row) as usize * (cols as usize);
                     let mut chunk_buf = vec![0.0f32; chunk_len];
-                    paged.read_range(start_idx, &mut chunk_buf);
+                    jd.read_range(start_idx, &mut chunk_buf);
                     let rgba = colormap::apply_colormap_cpu(&chunk_buf, min_val, max_val, lut);
                     let chunk_rows = end_row - start_row;
                     self.renderer
@@ -683,20 +633,17 @@ mod wasm_entry {
         }
 
         /// Handle hover by looking up the matrix value at the given screen position.
+        ///
+        /// Reads a single f32 from the JS-heap Float32Array — negligible overhead
+        /// for hover events (~one JS/WASM boundary crossing per mouse move).
         fn handle_hover(&self, x: f32, y: f32) -> Result<(), JsValue> {
-            if let (Some(ref callback), Some(ref matrix_data)) =
-                (&self.hover_callback, &self.matrix_data)
-            {
-                // Skip lookup in range-only mode (no CPU data stored)
-                if matrix_data.is_range_only() {
-                    return Ok(());
-                }
+            if let (Some(ref callback), Some(ref jd)) = (&self.hover_callback, &self.js_data) {
                 if let Some((row, col)) =
                     self.camera
                         .state
-                        .screen_to_matrix(x, y, matrix_data.rows(), matrix_data.cols())
+                        .screen_to_matrix(x, y, jd.rows(), jd.cols())
                 {
-                    if let Some(value) = matrix_data.get_value(row, col) {
+                    if let Some(value) = jd.get_value(row, col) {
                         let this = JsValue::NULL;
                         let _ = callback.call3(
                             &this,
