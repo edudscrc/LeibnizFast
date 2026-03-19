@@ -320,8 +320,15 @@ impl MatrixView {
     /// The staging buffer holds as many complete rows as fit within
     /// `min(MAX_STAGING_BYTES, max_buffer_size)`, aligned to 16 rows.
     /// Data is always processed in chunks through this buffer.
-    pub fn with_empty_buffer(device: &wgpu::Device, rows: u32, cols: u32) -> Result<Self, String> {
+    pub fn with_empty_buffer(
+        device: &wgpu::Device,
+        rows: u32,
+        cols: u32,
+        debug: bool,
+    ) -> Result<Self, String> {
+        use crate::perf::PerfTimer;
         use wgpu::util::DeviceExt;
+        let _timer = PerfTimer::new("MatrixView::with_empty_buffer", debug);
 
         if cols == 0 {
             return Err("Cannot create staging buffer for 0-column matrix".to_string());
@@ -418,7 +425,9 @@ impl JsDataSource {
     ///
     /// The scan reads in small chunks (16 MB) to avoid large WASM temporaries.
     /// The Float32Array stays in JS heap — no copy into WASM memory.
-    pub fn new(data: js_sys::Float32Array, rows: u32, cols: u32) -> Self {
+    pub fn new(data: js_sys::Float32Array, rows: u32, cols: u32, debug: bool) -> Self {
+        use crate::perf::PerfTimer;
+        let _timer = PerfTimer::new("JsDataSource::new", debug);
         let total = data.length() as usize;
         let mut min_val = f32::INFINITY;
         let mut max_val = f32::NEG_INFINITY;

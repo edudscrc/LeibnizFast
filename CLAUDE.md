@@ -48,6 +48,14 @@ Each `append_chunk` copies to JS accumulator and dispatches compute immediately.
 
 **Texture tiling**: matrices exceeding `maxTextureDimension2D` are split into a `TileGrid` of tiles. Each tile has its own texture, params buffer, compute bind group, camera buffer, and render bind group. Fragments outside a tile's UV region are discarded in the fragment shader.
 
+### Performance instrumentation
+
+**Debug flag**: `CreateOptions.debug` (JS) / `debug: Option<bool>` (WASM `create()`). When enabled, logs `[perf] label: X.XXms` to the browser console for all key operations. Zero overhead when disabled (single branch per call site).
+
+**PerfTimer** (`src/perf.rs`): WASM-only utility using `web_sys::Performance::now()`. Instantiate with `PerfTimer::new(label, debug)`, consume with `.finish()` or `.finish_with(extra)`. The `debug` flag propagates from `LeibnizFast` → `Renderer` → `PipelineFactory`.
+
+**JS-side**: `LeibnizFast` class stores `debug` and provides `timeSync(label, fn)` helper. The basic example has a "Debug timing" checkbox that controls JS-side logging and passes the flag to WASM on viewer creation.
+
 ### GPU limits
 - Auto-tiled when matrix dims exceed `max_texture_dimension` (8192 on Chrome, 16384+ on desktop)
 - Staging buffer capped at `MAX_STAGING_BYTES` (256 MB), further limited by `max_buffer_size`
@@ -90,6 +98,7 @@ npm run dev                                                      # Build + serve
 | `src/chunked_upload.rs` | `ChunkedUploader`: pure chunk boundary logic |
 | `src/tile_grid.rs` | `TileGrid`: pure tile layout |
 | `src/interaction.rs` | `InteractionState` (Idle/Dragging) |
+| `src/perf.rs` | `PerfTimer`: debug-gated performance timing (WASM-only) |
 | `src/pipeline.rs` | `PipelineFactory` |
 | `src/shaders/colormap.wgsl` | Compute shader |
 | `src/shaders/render.wgsl` | Vertex + fragment shader |

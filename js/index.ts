@@ -61,6 +61,8 @@ export class LeibnizFast {
   private inner: any;
   /** Canvas element this viewer is attached to */
   private canvas: HTMLCanvasElement;
+  /** Performance timing enabled */
+  private debug: boolean;
   /** Bound event handlers for cleanup */
   private boundHandlers: {
     mousedown: (e: MouseEvent) => void;
@@ -70,9 +72,10 @@ export class LeibnizFast {
     resize: () => void;
   };
 
-  private constructor(inner: any, canvas: HTMLCanvasElement) {
+  private constructor(inner: any, canvas: HTMLCanvasElement, debug: boolean) {
     this.inner = inner;
     this.canvas = canvas;
+    this.debug = debug;
 
     // Bind DOM event handlers
     this.boundHandlers = {
@@ -128,12 +131,28 @@ export class LeibnizFast {
     canvas: HTMLCanvasElement,
     options?: CreateOptions,
   ): Promise<LeibnizFast> {
+    const debug = options?.debug ?? false;
+    const t0 = debug ? performance.now() : 0;
     const wasm = await ensureWasmLoaded();
+    if (debug)
+      console.log(
+        `[perf] ensureWasmLoaded: ${(performance.now() - t0).toFixed(2)}ms`,
+      );
+    const t1 = debug ? performance.now() : 0;
     const inner = await wasm.LeibnizFast.create(
       canvas,
       options?.colormap ?? undefined,
+      debug,
     );
-    return new LeibnizFast(inner, canvas);
+    if (debug)
+      console.log(
+        `[perf] LeibnizFast.create (WASM): ${(performance.now() - t1).toFixed(2)}ms`,
+      );
+    if (debug)
+      console.log(
+        `[perf] LeibnizFast.create (total): ${(performance.now() - t0).toFixed(2)}ms`,
+      );
+    return new LeibnizFast(inner, canvas, debug);
   }
 
   /**
@@ -142,8 +161,19 @@ export class LeibnizFast {
    * @param data - Flat Float32Array in row-major order
    * @param options - Matrix dimensions (rows, cols)
    */
+  /** Time a synchronous call, logging duration when debug is enabled. */
+  private timeSync<T>(label: string, fn: () => T): T {
+    if (!this.debug) return fn();
+    const t0 = performance.now();
+    const result = fn();
+    console.log(`[perf] ${label}: ${(performance.now() - t0).toFixed(2)}ms`);
+    return result;
+  }
+
   setData(data: Float32Array, options: DataOptions): void {
-    this.inner.setData(data, options.rows, options.cols);
+    this.timeSync('JS setData', () =>
+      this.inner.setData(data, options.rows, options.cols),
+    );
   }
 
   /**
@@ -152,7 +182,7 @@ export class LeibnizFast {
    * @param name - One of the available colormap names
    */
   setColormap(name: ColormapName): void {
-    this.inner.setColormap(name);
+    this.timeSync('JS setColormap', () => this.inner.setColormap(name));
   }
 
   /**
@@ -186,7 +216,9 @@ export class LeibnizFast {
    * @param options - Matrix dimensions (rows, cols)
    */
   beginData(options: StreamingDataOptions): void {
-    this.inner.beginData(options.rows, options.cols);
+    this.timeSync('JS beginData', () =>
+      this.inner.beginData(options.rows, options.cols),
+    );
   }
 
   /**
@@ -196,7 +228,9 @@ export class LeibnizFast {
    * @param startRow - Zero-based index of the first row in this chunk
    */
   appendChunk(data: Float32Array, startRow: number): void {
-    this.inner.appendChunk(data, startRow);
+    this.timeSync('JS appendChunk', () =>
+      this.inner.appendChunk(data, startRow),
+    );
   }
 
   /**
@@ -204,7 +238,7 @@ export class LeibnizFast {
    * pipelines, and renders.
    */
   endData(): void {
-    this.inner.endData();
+    this.timeSync('JS endData', () => this.inner.endData());
   }
 
   /**

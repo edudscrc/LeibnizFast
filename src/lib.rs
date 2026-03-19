@@ -30,6 +30,8 @@ pub mod tile_grid;
 
 // GPU/WASM modules — only compiled for wasm32 target
 #[cfg(target_arch = "wasm32")]
+mod perf;
+#[cfg(target_arch = "wasm32")]
 mod pipeline;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
@@ -43,6 +45,7 @@ mod wasm_entry {
     use crate::colormap;
     use crate::interaction;
     use crate::matrix;
+    use crate::perf::PerfTimer;
     use crate::renderer;
 
     /// Initialize panic hook for better error messages in the browser console.
@@ -87,6 +90,8 @@ mod wasm_entry {
         current_colormap_lut: Option<&'static [[u8; 3]; 256]>,
         /// In-progress streaming upload, if any
         pending_upload: Option<PendingUpload>,
+        /// Enable performance timing logs
+        debug: bool,
     }
 
     #[wasm_bindgen]
@@ -96,13 +101,16 @@ mod wasm_entry {
         pub async fn create(
             canvas: web_sys::HtmlCanvasElement,
             colormap: Option<String>,
+            debug: Option<bool>,
         ) -> Result<LeibnizFast, JsValue> {
             init_logging();
+            let debug = debug.unwrap_or(false);
+            let _timer = PerfTimer::new("LeibnizFast::create", debug);
             log::info!("LeibnizFast: initializing...");
 
             let colormap_name = colormap.unwrap_or_else(|| "viridis".to_string());
 
-            let renderer = renderer::Renderer::new(&canvas)
+            let renderer = renderer::Renderer::new(&canvas, debug)
                 .await
                 .map_err(|e| JsValue::from_str(&e))?;
 
@@ -125,6 +133,7 @@ mod wasm_entry {
                 current_colormap: colormap_name,
                 current_colormap_lut: None,
                 pending_upload: None,
+                debug,
             })
         }
 
@@ -141,6 +150,7 @@ mod wasm_entry {
             rows: u32,
             cols: u32,
         ) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("set_data", self.debug);
             let expected_len = (rows as u32) * (cols as u32);
             if data.length() != expected_len {
                 return Err(JsValue::from_str(&format!(
@@ -153,7 +163,7 @@ mod wasm_entry {
             }
 
             // Create JsDataSource — scans min/max in 16 MB chunks, data stays in JS heap
-            let js_data = matrix::JsDataSource::new(data, rows, cols);
+            let js_data = matrix::JsDataSource::new(data, rows, cols, self.debug);
             self.js_data = Some(js_data);
 
             if self.colormap_texture.is_none() || self.current_colormap_lut.is_none() {
@@ -164,9 +174,13 @@ mod wasm_entry {
 
             // WebGPU path: create staging buffer, build pipelines, apply colormap
             if self.renderer.has_compute {
-                let matrix_view =
-                    matrix::MatrixView::with_empty_buffer(&self.renderer.device, rows, cols)
-                        .map_err(|e| JsValue::from_str(&e))?;
+                let matrix_view = matrix::MatrixView::with_empty_buffer(
+                    &self.renderer.device,
+                    rows,
+                    cols,
+                    self.debug,
+                )
+                .map_err(|e| JsValue::from_str(&e))?;
                 self.matrix = Some(matrix_view);
 
                 self.renderer
@@ -207,6 +221,7 @@ mod wasm_entry {
         /// Re-dispatches the colormap from JS-heap data — works at any matrix size.
         #[wasm_bindgen(js_name = setColormap)]
         pub fn set_colormap(&mut self, name: &str) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("set_colormap", self.debug);
             self.set_colormap_internal(name)?;
 
             if let Some(ref jd) = self.js_data {
@@ -244,6 +259,7 @@ mod wasm_entry {
         /// Re-applies the colormap with the new range from JS-heap data.
         #[wasm_bindgen(js_name = setRange)]
         pub fn set_range(&mut self, min: f32, max: f32) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("set_range", self.debug);
             if let Some(ref mut jd) = self.js_data {
                 jd.set_range(min, max);
             }
@@ -281,6 +297,7 @@ mod wasm_entry {
         /// Errors if an upload is already in progress.
         #[wasm_bindgen(js_name = beginData)]
         pub fn begin_data(&mut self, rows: u32, cols: u32) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("begin_data", self.debug);
             if self.pending_upload.is_some() {
                 return Err(JsValue::from_str(
                     "A streaming upload is already in progress. Call endData() first.",
@@ -292,8 +309,13 @@ mod wasm_entry {
 
             let matrix_view = if self.renderer.has_compute {
                 Some(
-                    matrix::MatrixView::with_empty_buffer(&self.renderer.device, rows, cols)
-                        .map_err(|e| JsValue::from_str(&e))?,
+                    matrix::MatrixView::with_empty_buffer(
+                        &self.renderer.device,
+                        rows,
+                        cols,
+                        self.debug,
+                    )
+                    .map_err(|e| JsValue::from_str(&e))?,
                 )
             } else {
                 None
@@ -349,6 +371,7 @@ mod wasm_entry {
         /// The min/max range uses a running estimate finalized in `end_data()`.
         #[wasm_bindgen(js_name = appendChunk)]
         pub fn append_chunk(&mut self, chunk: &[f32], start_row: u32) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("append_chunk", self.debug);
             let pending = self.pending_upload.as_mut().ok_or_else(|| {
                 JsValue::from_str("No streaming upload in progress. Call beginData() first.")
             })?;
@@ -439,6 +462,7 @@ mod wasm_entry {
         /// Errors if the upload is incomplete (not all rows uploaded).
         #[wasm_bindgen(js_name = endData)]
         pub fn end_data(&mut self) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("end_data", self.debug);
             let mut pending = self.pending_upload.take().ok_or_else(|| {
                 JsValue::from_str("No streaming upload in progress. Call beginData() first.")
             })?;

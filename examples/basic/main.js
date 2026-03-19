@@ -7,8 +7,12 @@ const canvas = document.getElementById('canvas');
 const colormapSelect = document.getElementById('colormap');
 const sizeSelect = document.getElementById('size');
 const streamingCheckbox = document.getElementById('streaming');
+const debugCheckbox = document.getElementById('debug');
 const tooltip = document.getElementById('tooltip');
 const errorBanner = document.getElementById('error-banner');
+
+/** Whether debug timing is enabled. */
+let debugEnabled = debugCheckbox.checked;
 
 /**
  * Show an error message in the banner for a few seconds.
@@ -51,10 +55,14 @@ function generateSineWave(rows, cols, rowOffset = 0, totalRows = rows) {
 
 async function main() {
   // Initialize WASM module
+  let t0 = performance.now();
   await init();
+  if (debugEnabled) console.log(`[perf] WASM init: ${(performance.now() - t0).toFixed(2)}ms`);
 
-  // Create the viewer
-  const viewer = await LeibnizFast.create(canvas, colormapSelect.value);
+  // Create the viewer (passes debug flag to WASM)
+  t0 = performance.now();
+  const viewer = await LeibnizFast.create(canvas, colormapSelect.value, debugEnabled);
+  if (debugEnabled) console.log(`[perf] LeibnizFast.create: ${(performance.now() - t0).toFixed(2)}ms`);
 
   // Tiling handles matrices larger than maxTextureDimension — all sizes are selectable.
   // Very large sizes (≥16000) auto-enable streaming to avoid OOM from JS allocation.
@@ -96,6 +104,7 @@ async function main() {
     }
 
     try {
+      const tLoad = debugEnabled ? performance.now() : 0;
       if (useStreaming) {
         // Streaming API: allocate GPU buffer upfront, then push 1000-row chunks
         viewer.beginData(size, size);
@@ -103,15 +112,20 @@ async function main() {
         for (let startRow = 0; startRow < size; startRow += chunkRows) {
           const endRow = Math.min(startRow + chunkRows, size);
           const rows = endRow - startRow;
+          const tGen = debugEnabled ? performance.now() : 0;
           const chunk = generateSineWave(rows, size, startRow, size);
+          if (debugEnabled) console.log(`[perf] generateSineWave (${rows}×${size}): ${(performance.now() - tGen).toFixed(2)}ms`);
           viewer.appendChunk(chunk, startRow);
         }
         viewer.endData();
       } else {
         // Standard path: allocates the full Float32Array at once in JS
+        const tGen = debugEnabled ? performance.now() : 0;
         const data = generateSineWave(size, size, 0, size);
+        if (debugEnabled) console.log(`[perf] generateSineWave (${size}×${size}): ${(performance.now() - tGen).toFixed(2)}ms`);
         viewer.setData(data, size, size);
       }
+      if (debugEnabled) console.log(`[perf] loadData total (${size}×${size}): ${(performance.now() - tLoad).toFixed(2)}ms`);
     } catch (err) {
       showError(`Failed to load ${size}×${size}: ${err}`);
     }
@@ -161,7 +175,9 @@ async function main() {
 
   // Colormap change
   colormapSelect.addEventListener('change', () => {
+    const t = debugEnabled ? performance.now() : 0;
     viewer.setColormap(colormapSelect.value);
+    if (debugEnabled) console.log(`[perf] setColormap: ${(performance.now() - t).toFixed(2)}ms`);
   });
 
   // Size change
@@ -173,6 +189,13 @@ async function main() {
   // Streaming toggle — reload current data through chosen path
   streamingCheckbox.addEventListener('change', () => {
     loadData(size, streamingCheckbox.checked);
+  });
+
+  // Debug toggle — note: changing debug requires recreating the viewer
+  // to pass the flag to WASM, so we just update the JS-side flag
+  debugCheckbox.addEventListener('change', () => {
+    debugEnabled = debugCheckbox.checked;
+    console.log(`[perf] Debug timing ${debugEnabled ? 'enabled' : 'disabled'}`);
   });
 }
 

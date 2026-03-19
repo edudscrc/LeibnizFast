@@ -8,17 +8,20 @@
 //! multiple smaller textures (tiles) and render each as a separate quad.
 
 use crate::colormap::ColormapTexture;
+use crate::perf::PerfTimer;
 use crate::tile_grid::TileGrid;
 
 /// Factory for creating wgpu pipelines and their associated resources.
 pub struct PipelineFactory<'a> {
     device: &'a wgpu::Device,
+    /// Enable performance timing logs.
+    debug: bool,
 }
 
 impl<'a> PipelineFactory<'a> {
     /// Create a new pipeline factory for the given device.
-    pub fn new(device: &'a wgpu::Device) -> Self {
-        Self { device }
+    pub fn new(device: &'a wgpu::Device, debug: bool) -> Self {
+        Self { device, debug }
     }
 
     /// Create a single tile texture with the given dimensions.
@@ -60,6 +63,7 @@ impl<'a> PipelineFactory<'a> {
         tile_grid: &TileGrid,
         needs_storage: bool,
     ) -> Vec<(wgpu::Texture, wgpu::TextureView)> {
+        let _timer = PerfTimer::new("create_tiled_textures", self.debug);
         tile_grid
             .iter_tiles()
             .map(|(tx, ty)| {
@@ -75,6 +79,7 @@ impl<'a> PipelineFactory<'a> {
     /// Returns the pipeline and the bind group **layout** so per-tile bind groups
     /// can be created separately via `create_compute_bind_group`.
     pub fn create_compute_pipeline(&self) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+        let _timer = PerfTimer::new("create_compute_pipeline", self.debug);
         let bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -211,6 +216,7 @@ impl<'a> PipelineFactory<'a> {
         &self,
         surface_format: wgpu::TextureFormat,
     ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+        let _timer = PerfTimer::new("create_render_pipeline", self.debug);
         let bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

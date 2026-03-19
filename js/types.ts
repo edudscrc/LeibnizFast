@@ -15,6 +15,8 @@ export type ColormapName =
 export interface CreateOptions {
   /** Initial colormap to use. Defaults to 'viridis'. */
   colormap?: ColormapName;
+  /** Enable performance timing logs in the browser console. Defaults to false. */
+  debug?: boolean;
 }
 
 /**

@@ -16,6 +16,7 @@
 use crate::camera::Camera;
 use crate::colormap::ColormapTexture;
 use crate::matrix::{MatrixParams, MatrixView};
+use crate::perf::PerfTimer;
 use crate::pipeline::PipelineFactory;
 use crate::tile_grid::TileGrid;
 
@@ -118,11 +119,14 @@ pub struct Renderer {
 
     /// Whether the colormap has already been applied to the textures (staged path).
     colormap_applied: bool,
+    /// Enable performance timing logs.
+    debug: bool,
 }
 
 impl Renderer {
     /// Create a new Renderer from an HTML canvas element.
-    pub async fn new(canvas: &web_sys::HtmlCanvasElement) -> Result<Self, String> {
+    pub async fn new(canvas: &web_sys::HtmlCanvasElement, debug: bool) -> Result<Self, String> {
+        let _timer = PerfTimer::new("Renderer::new", debug);
         let width = canvas.width();
         let height = canvas.height();
 
@@ -135,6 +139,7 @@ impl Renderer {
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
             .map_err(|e| format!("Failed to create surface: {e}"))?;
 
+        let t_adapter = PerfTimer::new("request_adapter", debug);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -143,10 +148,12 @@ impl Renderer {
             })
             .await
             .ok_or("Failed to find a suitable GPU adapter")?;
+        t_adapter.finish();
 
         log::info!("Adapter: {:?}", adapter.get_info().name);
 
         // Request device with the adapter's own limits.
+        let t_device = PerfTimer::new("request_device", debug);
         let adapter_limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(
@@ -160,6 +167,7 @@ impl Renderer {
             )
             .await
             .map_err(|e| format!("Failed to create device: {e}"))?;
+        t_device.finish();
 
         let device_limits = device.limits();
         let has_compute = device_limits.max_storage_buffers_per_shader_stage > 0;
@@ -216,6 +224,7 @@ impl Renderer {
             matrix_rows: 0,
             matrix_cols: 0,
             colormap_applied: false,
+            debug,
         })
     }
 
@@ -251,6 +260,7 @@ impl Renderer {
         rows: u32,
         cols: u32,
     ) -> Result<(), String> {
+        let _timer = PerfTimer::new("rebuild_pipelines", self.debug);
         let colormap = colormap.as_ref().ok_or("No colormap set")?;
 
         self.matrix_rows = rows;
@@ -267,7 +277,7 @@ impl Renderer {
             grid.tile_count()
         );
 
-        let factory = PipelineFactory::new(&self.device);
+        let factory = PipelineFactory::new(&self.device, self.debug);
 
         // --- Shared pipelines (recreate on each rebuild) ---
         let (compute_pipeline, compute_layout) = factory.create_compute_pipeline();
@@ -363,6 +373,7 @@ impl Renderer {
         matrix: &Option<MatrixView>,
         colormap: &Option<ColormapTexture>,
     ) -> Result<(), String> {
+        let _timer = PerfTimer::new("rebuild_compute_bind_groups", self.debug);
         let colormap = colormap.as_ref().ok_or("No colormap set")?;
         let matrix = matrix.as_ref().ok_or("No matrix data set")?;
         let layout = self
@@ -377,7 +388,7 @@ impl Renderer {
 
         self.colormap_applied = false;
 
-        let factory = PipelineFactory::new(&self.device);
+        let factory = PipelineFactory::new(&self.device, self.debug);
         let mut new_bind_groups = Vec::with_capacity(grid.tile_count() as usize);
 
         for (tx, ty) in grid.iter_tiles() {
@@ -410,7 +421,7 @@ impl Renderer {
         tile_views: &[wgpu::TextureView],
     ) -> (Vec<wgpu::Buffer>, Vec<wgpu::BindGroup>) {
         use wgpu::util::DeviceExt;
-        let factory = PipelineFactory::new(&self.device);
+        let factory = PipelineFactory::new(&self.device, self.debug);
 
         grid.iter_tiles()
             .map(|(tx, ty)| {
@@ -561,6 +572,7 @@ impl Renderer {
         min_val: f32,
         max_val: f32,
     ) {
+        let _timer = PerfTimer::new("apply_colormap_tiled", self.debug);
         let grid = match &self.tile_grid {
             Some(g) => g.clone(),
             None => return,
@@ -649,6 +661,7 @@ impl Renderer {
         min_val: f32,
         max_val: f32,
     ) {
+        let _timer = PerfTimer::new("apply_colormap_staged_chunk", self.debug);
         let grid = match &self.tile_grid {
             Some(g) => g.clone(),
             None => return,
@@ -731,6 +744,7 @@ impl Renderer {
         _colormap: &Option<ColormapTexture>,
         camera: &Camera,
     ) -> Result<(), String> {
+        let _timer = PerfTimer::new("render_frame", self.debug);
         // Update tile camera buffers for current camera state
         if let Some(ref grid) = self.tile_grid {
             self.update_tile_camera_buffers(grid, camera);
