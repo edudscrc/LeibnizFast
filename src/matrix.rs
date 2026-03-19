@@ -421,7 +421,27 @@ pub struct JsDataSource {
 
 #[cfg(target_arch = "wasm32")]
 impl JsDataSource {
-    /// Create a new JsDataSource by scanning the Float32Array for min/max.
+    /// Create a JsDataSource with a pre-supplied range, skipping the min/max scan.
+    ///
+    /// Use this when the caller already knows the desired range (e.g. manual range
+    /// mode in real-time streaming). The Float32Array stays in JS heap — no copy.
+    pub fn new_with_range(
+        data: js_sys::Float32Array,
+        rows: u32,
+        cols: u32,
+        min_val: f32,
+        max_val: f32,
+    ) -> Self {
+        Self {
+            data,
+            rows,
+            cols,
+            min_val,
+            max_val,
+        }
+    }
+
+    /// Create a JsDataSource by scanning the Float32Array for min/max.
     ///
     /// The scan reads in small chunks (16 MB) to avoid large WASM temporaries.
     /// The Float32Array stays in JS heap — no copy into WASM memory.

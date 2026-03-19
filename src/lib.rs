@@ -90,6 +90,11 @@ mod wasm_entry {
         current_colormap_lut: Option<&'static [[u8; 3]; 256]>,
         /// In-progress streaming upload, if any
         pending_upload: Option<PendingUpload>,
+        /// Fixed range for colormap mapping set via setRange().
+        ///
+        /// When Some, `set_data` skips the min/max scan and uses this range
+        /// directly, eliminating both the scan cost and the second GPU dispatch.
+        sticky_range: Option<(f32, f32)>,
         /// Enable performance timing logs
         debug: bool,
     }
@@ -133,6 +138,7 @@ mod wasm_entry {
                 current_colormap: colormap_name,
                 current_colormap_lut: None,
                 pending_upload: None,
+                sticky_range: None,
                 debug,
             })
         }
@@ -143,6 +149,10 @@ mod wasm_entry {
         /// into WASM memory). `rows` and `cols` specify the matrix dimensions.
         /// Min/max is scanned in small chunks. Tooltips and colormap changes work
         /// at any matrix size.
+        ///
+        /// When called repeatedly with the same dimensions (e.g. real-time streaming),
+        /// the GPU pipeline is reused and only the colormap compute shader is
+        /// re-dispatched — no resource allocation or pipeline rebuild occurs.
         #[wasm_bindgen(js_name = setData)]
         pub fn set_data(
             &mut self,
@@ -151,7 +161,7 @@ mod wasm_entry {
             cols: u32,
         ) -> Result<(), JsValue> {
             let _timer = PerfTimer::new("set_data", self.debug);
-            let expected_len = (rows as u32) * (cols as u32);
+            let expected_len = rows * cols;
             if data.length() != expected_len {
                 return Err(JsValue::from_str(&format!(
                     "Data length {} does not match rows×cols = {}×{} = {}",
@@ -162,37 +172,28 @@ mod wasm_entry {
                 )));
             }
 
-            // Create JsDataSource — scans min/max in 16 MB chunks, data stays in JS heap
-            let js_data = matrix::JsDataSource::new(data, rows, cols, self.debug);
+            // Create JsDataSource.
+            // When a sticky range is set (manual range mode), skip the min/max scan and
+            // use the pre-supplied range directly — saves ~70ms per frame for large matrices.
+            let js_data = if let Some((min, max)) = self.sticky_range {
+                matrix::JsDataSource::new_with_range(data, rows, cols, min, max)
+            } else {
+                matrix::JsDataSource::new(data, rows, cols, self.debug)
+            };
             self.js_data = Some(js_data);
 
-            if self.colormap_texture.is_none() || self.current_colormap_lut.is_none() {
-                self.set_colormap_internal(&self.current_colormap.clone())?;
-            }
+            // Fast path: if the GPU pipeline already exists for the same dimensions,
+            // skip MatrixView allocation and rebuild_pipelines(). Just re-dispatch the
+            // colormap compute shader with the new data. This eliminates per-frame GPU
+            // resource churn that causes visible flickering in real-time streaming.
+            let same_dims = self.renderer.has_compute
+                && self
+                    .matrix
+                    .as_ref()
+                    .map_or(false, |m| m.rows() == rows && m.cols() == cols);
 
-            self.camera.state.set_matrix_size(rows, cols);
-
-            // WebGPU path: create staging buffer, build pipelines, apply colormap
-            if self.renderer.has_compute {
-                let matrix_view = matrix::MatrixView::with_empty_buffer(
-                    &self.renderer.device,
-                    rows,
-                    cols,
-                    self.debug,
-                )
-                .map_err(|e| JsValue::from_str(&e))?;
-                self.matrix = Some(matrix_view);
-
-                self.renderer
-                    .rebuild_pipelines(
-                        &self.matrix,
-                        &self.colormap_texture,
-                        &self.camera,
-                        rows,
-                        cols,
-                    )
-                    .map_err(|e| JsValue::from_str(&e))?;
-
+            if same_dims {
+                // Fast path: colormap re-dispatch only — no pipeline rebuild
                 if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
                     let (min_val, max_val) = jd.range();
                     let read_fn = |start: usize, buf: &mut [f32]| {
@@ -205,6 +206,49 @@ mod wasm_entry {
                         min_val,
                         max_val,
                     );
+                }
+            } else {
+                // Slow path: first call or dimension change — full pipeline rebuild
+                if self.colormap_texture.is_none() || self.current_colormap_lut.is_none() {
+                    self.set_colormap_internal(&self.current_colormap.clone())?;
+                }
+
+                self.camera.state.set_matrix_size(rows, cols);
+
+                // WebGPU path: create staging buffer, build pipelines, apply colormap
+                if self.renderer.has_compute {
+                    let matrix_view = matrix::MatrixView::with_empty_buffer(
+                        &self.renderer.device,
+                        rows,
+                        cols,
+                        self.debug,
+                    )
+                    .map_err(|e| JsValue::from_str(&e))?;
+                    self.matrix = Some(matrix_view);
+
+                    self.renderer
+                        .rebuild_pipelines(
+                            &self.matrix,
+                            &self.colormap_texture,
+                            &self.camera,
+                            rows,
+                            cols,
+                        )
+                        .map_err(|e| JsValue::from_str(&e))?;
+
+                    if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
+                        let (min_val, max_val) = jd.range();
+                        let read_fn = |start: usize, buf: &mut [f32]| {
+                            jd.read_range(start, buf);
+                        };
+                        self.renderer.apply_colormap_tiled(
+                            matrix_view,
+                            &read_fn,
+                            cols,
+                            min_val,
+                            max_val,
+                        );
+                    }
                 }
             }
 
@@ -260,6 +304,8 @@ mod wasm_entry {
         #[wasm_bindgen(js_name = setRange)]
         pub fn set_range(&mut self, min: f32, max: f32) -> Result<(), JsValue> {
             let _timer = PerfTimer::new("set_range", self.debug);
+            // Persist as sticky range so future setData calls use it without rescanning
+            self.sticky_range = Some((min, max));
             if let Some(ref mut jd) = self.js_data {
                 jd.set_range(min, max);
             }
