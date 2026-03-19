@@ -2,15 +2,30 @@
  * main.js — WebSocket client for the cpp-stream example.
  *
  * Connects to the Python bridge (bridge.py) over WebSocket, receives
- * binary frames produced by the C++ wave simulator, parses the header,
- * and feeds each frame to LeibnizFast for live GPU rendering.
+ * binary frames produced by the C++ wave simulator, and feeds each frame
+ * to LeibnizFast for live GPU rendering.
  *
- * Binary frame format (little-endian, all uint32):
- *   Offset  0: magic    = 0x4C465A00  ("LFZ\0")
- *   Offset  4: rows
+ * Supports two on-wire protocols from the generator:
+ *
+ * Protocol v1 — plain float32 chunks (magic 0x4C465A01, 32-byte header):
+ *   Offset  0: magic        = 0x4C465A01
+ *   Offset  4: total_rows
  *   Offset  8: cols
  *   Offset 12: frame_id
- *   Offset 16: float32[rows × cols]  row-major grid data
+ *   Offset 16: chunk_index
+ *   Offset 20: total_chunks
+ *   Offset 24: row_start
+ *   Offset 28: chunk_rows
+ *   Offset 32: float32[chunk_rows × cols]  row-major grid data
+ *
+ * Protocol v2 — compressed / delta chunks (magic 0x4C465A02, 40-byte header):
+ *   Offset  0: magic          = 0x4C465A02
+ *   Offset  4..28: same as v1
+ *   Offset 32: flags          bit0=compressed  bit1=int8_delta  bit2=keyframe
+ *   Offset 36: payload_bytes  byte count of data following this header
+ *   Offset 40: zlib deflate-raw compressed payload
+ *              keyframe → float32[chunk_rows × cols]
+ *              delta    → int8[chunk_rows × cols]  (reconstruct: prev + delta * 1/128)
  *
  * Resize flow (browser → C++ generator):
  *   browser sends JSON text  {"type":"resize","size":N}
@@ -33,8 +48,19 @@ const tooltip         = document.getElementById('tooltip');
 const errorBanner     = document.getElementById('error-banner');
 
 // ---- Constants -------------------------------------------------------
+
+// Protocol v1: plain float32 chunks
 const CHUNK_MAGIC        = 0x4C465A01;
 const CHUNK_HEADER_BYTES = 32;     // 8 × uint32
+
+// Protocol v2: compressed / delta chunks
+const ENHANCED_MAGIC        = 0x4C465A02;
+const ENHANCED_HEADER_BYTES = 40;  // 10 × uint32
+const FLAG_COMPRESSED = 0x1;       // payload is zlib deflate-raw compressed
+const FLAG_DELTA      = 0x2;       // payload is int8 delta (after decompression)
+const FLAG_KEYFRAME   = 0x4;       // full float32 resync frame
+const DELTA_SCALE     = 1.0 / 128.0; // int8 → float32: float = prev + int8 * DELTA_SCALE
+
 const WS_URL       = 'ws://localhost:8765';
 const RECONNECT_MS = 2000;   // retry interval on disconnect
 const FPS_WINDOW   = 10;     // rolling FPS average over last N frames
@@ -52,8 +78,13 @@ let debugEnabled = debugCheckbox.checked;
 // FPS tracking: timestamps (ms) of the last FPS_WINDOW frames
 const frameTimes = [];
 
-// Chunk accumulation: frameId → { totalChunks, totalRows, cols, full: Float32Array, received }
+// Chunk accumulation: frameId → pending frame entry (structure depends on protocol version)
 const pendingFrames = new Map();
+
+// Reconstructed previous frame for delta decoding (protocol v2 --delta mode).
+// Reset to null on reconnect/resize so the first keyframe initialises it cleanly.
+/** @type {Float32Array|null} */
+let prevFrame = null;
 
 // ---- Utilities -------------------------------------------------------
 
@@ -98,26 +129,25 @@ function updateFps() {
 // ---- Binary protocol -------------------------------------------------
 
 /**
- * Parse the 32-byte chunk message header.
- * Returns null if magic is wrong or the buffer is too short.
+ * Parse a chunk message header (v1 or v2).
+ * Returns null if magic is unrecognised or the buffer is too short.
  *
  * @param {ArrayBuffer} buf
- * @returns {{ totalRows: number, cols: number, frameId: number,
- *             chunkIndex: number, totalChunks: number,
- *             rowStart: number, chunkRows: number }|null}
+ * @returns {{ version: number, totalRows: number, cols: number, frameId: number,
+ *             chunkIndex: number, totalChunks: number, rowStart: number,
+ *             chunkRows: number,
+ *             // v2 only:
+ *             flags?: number, payloadBytes?: number }|null}
  */
 function parseChunkHeader(buf) {
   if (buf.byteLength < CHUNK_HEADER_BYTES) return null;
 
-  // DataView reads little-endian fields portably regardless of CPU endianness.
+  // DataView reads little-endian fields portably regardless of host endianness.
   const view  = new DataView(buf);
   const magic = view.getUint32(0, /* littleEndian */ true);
 
-  if (magic !== CHUNK_MAGIC) {
-    console.warn(
-      `[cpp-stream] Bad magic: 0x${magic.toString(16)} ` +
-      `(expected 0x${CHUNK_MAGIC.toString(16)})`
-    );
+  if (magic !== CHUNK_MAGIC && magic !== ENHANCED_MAGIC) {
+    console.warn(`[cpp-stream] Unknown magic: 0x${magic.toString(16)}`);
     return null;
   }
 
@@ -129,6 +159,19 @@ function parseChunkHeader(buf) {
   const rowStart    = view.getUint32(24, true);
   const chunkRows   = view.getUint32(28, true);
 
+  if (magic === ENHANCED_MAGIC) {
+    if (buf.byteLength < ENHANCED_HEADER_BYTES) return null;
+    const flags        = view.getUint32(32, true);
+    const payloadBytes = view.getUint32(36, true);
+    if (buf.byteLength < ENHANCED_HEADER_BYTES + payloadBytes) {
+      console.warn(`[cpp-stream] Enhanced chunk too short: ${buf.byteLength} bytes`);
+      return null;
+    }
+    return { version: 2, totalRows, cols, frameId, chunkIndex, totalChunks,
+             rowStart, chunkRows, flags, payloadBytes };
+  }
+
+  // v1: validate payload size
   const expectedBytes = CHUNK_HEADER_BYTES + chunkRows * cols * 4;
   if (buf.byteLength < expectedBytes) {
     console.warn(
@@ -137,8 +180,8 @@ function parseChunkHeader(buf) {
     );
     return null;
   }
-
-  return { totalRows, cols, frameId, chunkIndex, totalChunks, rowStart, chunkRows };
+  return { version: 1, totalRows, cols, frameId, chunkIndex, totalChunks,
+           rowStart, chunkRows };
 }
 
 // ---- Frame processing ------------------------------------------------
@@ -156,12 +199,120 @@ function applyRange() {
 }
 
 /**
+ * Decompress a zlib-format payload (RFC 1950, as produced by zlib compress2)
+ * using the native browser DecompressionStream API.
+ *
+ * Reading and writing run concurrently to avoid backpressure deadlock on
+ * large frames — the readable must be consumed while writing, otherwise the
+ * stream's internal queue fills up and writer.write() never resolves.
+ *
+ * @param {Uint8Array} data
+ * @returns {Promise<ArrayBuffer>}
+ */
+async function inflate(data) {
+  const ds     = new DecompressionStream('deflate');
+  const writer = ds.writable.getWriter();
+  const reader = ds.readable.getReader();
+
+  // Start consuming the readable before writing so backpressure never blocks.
+  const readAll = (async () => {
+    const parts = [];
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+    }
+    return parts;
+  })();
+
+  // Write input, close to signal EOF, then wait for all output.
+  await writer.write(data);
+  await writer.close();
+  const parts = await readAll;
+
+  // Always copy into a fresh buffer to guarantee byteOffset === 0.
+  const total  = parts.reduce((n, p) => n + p.byteLength, 0);
+  const result = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { result.set(p, off); off += p.byteLength; }
+  return result.buffer;
+}
+
+/**
+ * Assemble a complete v2 frame: decompress each chunk, reconstruct delta if needed,
+ * then call setData(). Called fire-and-forget once all chunks have arrived.
+ *
+ * @param {{ totalChunks: number, totalRows: number, cols: number,
+ *           full: Float32Array, flags: number,
+ *           rawChunks: Uint8Array[], rowStarts: number[], chunkRowCounts: number[] }} pending
+ * @param {number} frameId  (used only for stale-frame cleanup)
+ */
+async function assembleFrame(pending, frameId) {
+  const isKeyframe = !!(pending.flags & FLAG_KEYFRAME);
+  const isDelta    = !!(pending.flags & FLAG_DELTA);
+
+  if (debugEnabled) console.log(`[v2] assembleFrame frameId=${frameId} flags=0x${pending.flags.toString(16)} isKeyframe=${isKeyframe} isDelta=${isDelta} totalChunks=${pending.totalChunks}`);
+
+  for (let c = 0; c < pending.totalChunks; c++) {
+    let payload = pending.rawChunks[c]; // Uint8Array of compressed bytes
+
+    if (pending.flags & FLAG_COMPRESSED) {
+      const inputBytes = payload.byteLength;
+      payload = new Uint8Array(await inflate(payload));
+      if (debugEnabled) console.log(`[v2] chunk ${c}: inflate ${inputBytes}B → ${payload.byteLength}B`);
+    }
+
+    const rowOff    = pending.rowStarts[c] * pending.cols;
+    const cellCount = pending.chunkRowCounts[c] * pending.cols;
+
+    if (isDelta && !isKeyframe) {
+      // Delta frame: reconstruct float = prevFrame + int8 * DELTA_SCALE.
+      if (!prevFrame || prevFrame.length !== pending.full.length) {
+        // Guard: delta arrived before any keyframe (shouldn't happen since
+        // frame_id=0 is always a keyframe, but be defensive).
+        console.warn('[cpp-stream] Delta frame arrived before keyframe — discarding');
+        return;
+      }
+      const int8s = new Int8Array(payload.buffer, payload.byteOffset, cellCount);
+      for (let i = 0; i < cellCount; i++) {
+        pending.full[rowOff + i] = prevFrame[rowOff + i] + int8s[i] * DELTA_SCALE;
+      }
+    } else {
+      // Keyframe or compress-only: float32 payload.
+      const f32 = new Float32Array(payload.buffer, payload.byteOffset, cellCount);
+      pending.full.set(f32, rowOff);
+    }
+  }
+
+  // Update prevFrame for the next delta (keyframe or fully-reconstructed delta).
+  if (!prevFrame || prevFrame.length !== pending.full.length) {
+    prevFrame = new Float32Array(pending.full);
+  } else {
+    prevFrame.set(pending.full);
+  }
+
+  if (debugEnabled) {
+    const t0 = performance.now();
+    viewer.setData(pending.full, pending.totalRows, pending.cols);
+    console.log(`[perf] setData (${pending.totalRows}×${pending.cols}): ${(performance.now() - t0).toFixed(2)}ms`);
+  } else {
+    viewer.setData(pending.full, pending.totalRows, pending.cols);
+  }
+  updateFps();
+
+  // Discard any incomplete frames older than this one.
+  for (const [id] of pendingFrames) {
+    if (id < frameId) pendingFrames.delete(id);
+  }
+}
+
+/**
  * Handle one received binary WebSocket message (a single frame chunk).
  *
- * Chunks are accumulated by frameId. When all chunks for a frame arrive,
- * the rows are already assembled in-place (each chunk is copied into its
- * correct position as it arrives), so no second pass is needed.
- * setData() is called once per complete frame.
+ * Protocol v1: chunks are assembled in-place (sync, fast path).
+ * Protocol v2: compressed raw bytes are stored per-chunk; assembleFrame()
+ * is called asynchronously once all chunks have arrived.
  *
  * @param {ArrayBuffer} buf
  */
@@ -171,43 +322,79 @@ function processFrame(buf) {
   const h = parseChunkHeader(buf);
   if (!h) return;
 
-  // Look up or create the accumulation entry for this frame.
-  let pending = pendingFrames.get(h.frameId);
-  if (!pending) {
-    pending = {
-      totalChunks: h.totalChunks,
-      totalRows:   h.totalRows,
-      cols:        h.cols,
-      // Pre-allocate the full assembled buffer once on the first chunk.
-      full:        new Float32Array(h.totalRows * h.cols),
-      received:    0,
-    };
-    pendingFrames.set(h.frameId, pending);
-  }
+  if (h.version === 1) {
+    // ---- Protocol v1: plain float32, sync in-place assembly ----------
 
-  // Copy this chunk's rows into the right position in the assembled buffer.
-  // CHUNK_HEADER_BYTES = 32 is 4-byte aligned — TypedArray requirement satisfied.
-  const src = new Float32Array(buf, CHUNK_HEADER_BYTES, h.chunkRows * h.cols);
-  pending.full.set(src, h.rowStart * h.cols);
-  pending.received++;
-
-  // All chunks received: render the complete frame and clean up.
-  if (pending.received === pending.totalChunks) {
-    pendingFrames.delete(h.frameId);
-
-    if (debugEnabled) {
-      const t0 = performance.now();
-      viewer.setData(pending.full, h.totalRows, h.cols);
-      console.log(`[perf] setData (${h.totalRows}×${h.cols}): ${(performance.now() - t0).toFixed(2)}ms`);
-    } else {
-      viewer.setData(pending.full, h.totalRows, h.cols);
+    let pending = pendingFrames.get(h.frameId);
+    if (!pending) {
+      pending = {
+        version:     1,
+        totalChunks: h.totalChunks,
+        totalRows:   h.totalRows,
+        cols:        h.cols,
+        full:        new Float32Array(h.totalRows * h.cols),
+        received:    0,
+      };
+      pendingFrames.set(h.frameId, pending);
     }
 
-    updateFps();
+    // CHUNK_HEADER_BYTES = 32 is 4-byte aligned — TypedArray requirement met.
+    const src = new Float32Array(buf, CHUNK_HEADER_BYTES, h.chunkRows * h.cols);
+    pending.full.set(src, h.rowStart * h.cols);
+    pending.received++;
 
-    // Discard any incomplete frames older than this one (lost chunks).
-    for (const [id] of pendingFrames) {
-      if (id < h.frameId) pendingFrames.delete(id);
+    if (pending.received === pending.totalChunks) {
+      pendingFrames.delete(h.frameId);
+      if (debugEnabled) {
+        const t0 = performance.now();
+        viewer.setData(pending.full, h.totalRows, h.cols);
+        console.log(`[perf] setData (${h.totalRows}×${h.cols}): ${(performance.now() - t0).toFixed(2)}ms`);
+      } else {
+        viewer.setData(pending.full, h.totalRows, h.cols);
+      }
+      updateFps();
+      for (const [id] of pendingFrames) {
+        if (id < h.frameId) pendingFrames.delete(id);
+      }
+    }
+
+  } else {
+    // ---- Protocol v2: compressed / delta, async assembly -------------
+
+    let pending = pendingFrames.get(h.frameId);
+    if (!pending) {
+      pending = {
+        version:        2,
+        totalChunks:    h.totalChunks,
+        totalRows:      h.totalRows,
+        cols:           h.cols,
+        full:           new Float32Array(h.totalRows * h.cols),
+        flags:          h.flags,
+        rawChunks:      new Array(h.totalChunks).fill(null),
+        rowStarts:      new Array(h.totalChunks).fill(0),
+        chunkRowCounts: new Array(h.totalChunks).fill(0),
+        received:       0,
+      };
+      pendingFrames.set(h.frameId, pending);
+    }
+
+    // Store this chunk's compressed payload (copy from the WS message buffer).
+    if (pending.rawChunks[h.chunkIndex] === null) {
+      pending.rawChunks[h.chunkIndex]      = new Uint8Array(buf, ENHANCED_HEADER_BYTES, h.payloadBytes).slice();
+      pending.rowStarts[h.chunkIndex]      = h.rowStart;
+      pending.chunkRowCounts[h.chunkIndex] = h.chunkRows;
+      pending.received++;
+      if (debugEnabled) console.log(`[v2] stored chunk ${h.chunkIndex}/${h.totalChunks} frameId=${h.frameId} payloadBytes=${h.payloadBytes} flags=0x${h.flags.toString(16)}`);
+    }
+
+    if (pending.received === pending.totalChunks) {
+      pendingFrames.delete(h.frameId);
+      // Fire-and-forget: assembleFrame decompresses and calls setData asynchronously.
+      // JS is single-threaded so microtask ordering ensures no concurrent mutation.
+      assembleFrame(pending, h.frameId).catch((err) => {
+        console.error('[cpp-stream] assembleFrame error:', err);
+        showError(`Frame decode error: ${err?.message ?? String(err)}`);
+      });
     }
   }
 }
@@ -235,9 +422,11 @@ function connect() {
 
   ws.addEventListener('open', () => {
     setStatus('connected');
-    // Clear stale FPS history from any previous connection session.
+    // Clear stale FPS history and delta state from any previous session.
     frameTimes.length = 0;
     fpsCounter.textContent = '-- FPS';
+    pendingFrames.clear();
+    prevFrame = null; // ensure first v2 keyframe initialises delta reconstruction
     // Sync the size selector with the generator on reconnect
     sendResize(parseInt(sizeSelect.value));
   });
@@ -330,8 +519,11 @@ async function main() {
     if (debugEnabled) console.log(`[perf] setColormap: ${(performance.now() - t).toFixed(2)}ms`);
   });
 
-  // Size selector: send resize command to C++ generator
+  // Size selector: send resize command to C++ generator.
+  // Reset delta state since grid dimensions will change.
   sizeSelect.addEventListener('change', () => {
+    prevFrame = null;
+    pendingFrames.clear();
     sendResize(parseInt(sizeSelect.value));
   });
 

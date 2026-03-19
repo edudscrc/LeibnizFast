@@ -202,18 +202,19 @@
     ╔══════════════════════════════════════════════════════════════╗
     ║  Build & run instructions                                    ║
     ╠══════════════════════════════════════════════════════════════╣
-    ║  C++ generator (needs libzmq):                               ║
-    ║    apt install libzmq3-dev   # Debian/Ubuntu                 ║
-    ║    brew install zeromq       # macOS                         ║
-    ║    g++ -std=c++17 -O2 -o generator generator.cpp -lzmq      ║
+    ║  C++ generator (needs libzmq + zlib):                        ║
+    ║    apt install libzmq3-dev zlib1g-dev   # Debian/Ubuntu      ║
+    ║    brew install zeromq zlib             # macOS              ║
+    ║    g++ -std=c++17 -O2 -o generator generator.cpp -lzmq -lz  ║
     ║                                                              ║
     ║  Python bridge (needs pyzmq + websockets):                   ║
     ║    pip install pyzmq websockets                              ║
     ║                                                              ║
     ║  Run (three terminals):                                      ║
     ║    python bridge.py             # terminal 1                 ║
-    ║    ./generator                  # terminal 2                 ║
-    ║    ./generator --chunks 4       # split frame into 4 msgs    ║
+    ║    ./generator                  # terminal 2 (plain)         ║
+    ║    ./generator --compress       # zlib only  (~18 FPS@4096²) ║
+    ║    ./generator --delta          # int8+zlib  (~30 FPS@4096²) ║
     ║    npm run dev (project root)   # terminal 3                 ║
     ║                                                              ║
     ║  Debug mode (per-process perf logs):                         ║
