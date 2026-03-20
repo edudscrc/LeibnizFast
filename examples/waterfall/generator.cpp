@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <iomanip>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -298,9 +299,20 @@ int main(int argc, char* argv[]) {
 
   std::cout << "Streaming... (Ctrl+C to stop)\n" << std::flush;
 
-  auto next_send_time = std::chrono::steady_clock::now();
+  using clk = std::chrono::steady_clock;
+  using dur_ms = std::chrono::duration<double, std::milli>;
+
+  // Helper: milliseconds between two time points
+  auto ms_between = [](clk::time_point a, clk::time_point b) -> double {
+    return std::chrono::duration_cast<dur_ms>(b - a).count();
+  };
+
+  auto next_send_time = clk::now();
+  auto t_last_iter    = clk::now();  // tracks when the previous iteration ended
 
   while (g_running) {
+    auto t_iter_start = clk::now();  // wall time at start of this iteration
+
     // ---- Check for control messages (non-blocking) -------------------
 
     uint8_t ctrl_buf[4];
@@ -333,6 +345,8 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Generate column data ------------------------------------------
+
+    auto t_gen_start = clk::now();
 
     for (int c = 0; c < cols_per_msg; c++) {
       float* col = col_buf.data() + static_cast<size_t>(c) * rows;
@@ -396,6 +410,8 @@ int main(int argc, char* argv[]) {
 
     col_index += cols_per_msg;
 
+    auto t_gen_end = clk::now();
+
     // ---- Build message -------------------------------------------------
 
     const size_t payload_bytes =
@@ -411,30 +427,48 @@ int main(int argc, char* argv[]) {
     memcpy(send_buf.data(), header, HEADER_BYTES);
     memcpy(send_buf.data() + HEADER_BYTES, col_buf.data(), payload_bytes);
 
+    auto t_build_end = clk::now();
+
     // ---- Send ----------------------------------------------------------
 
     const size_t total_bytes = HEADER_BYTES + payload_bytes;
     int rc = zmq_send(sock_data, send_buf.data(), total_bytes, ZMQ_DONTWAIT);
 
-    if (debug && rc >= 0) {
-      std::cout << "[perf] msg_id=" << (msg_id - 1)
-                << " rows=" << rows
-                << " cols=" << cols_per_msg
-                << " bytes=" << total_bytes
-                << " interval=" << (msg_interval_ns / 1.0e6) << "ms\n"
-                << std::flush;
-    }
+    auto t_send_end = clk::now();
 
     // ---- Throttle to target rate ---------------------------------------
 
     next_send_time += std::chrono::nanoseconds(msg_interval_ns);
-    auto now = std::chrono::steady_clock::now();
-    if (next_send_time > now) {
+    if (next_send_time > t_send_end) {
       std::this_thread::sleep_until(next_send_time);
     } else {
       // Falling behind — reset to avoid burst catchup
-      next_send_time = now;
+      next_send_time = t_send_end;
     }
+
+    auto t_sleep_end = clk::now();
+
+    if (debug) {
+      const double gap_ms      = ms_between(t_last_iter, t_iter_start);
+      const double gen_ms      = ms_between(t_gen_start, t_gen_end);
+      const double build_ms    = ms_between(t_gen_end, t_build_end);
+      const double zmq_send_ms = ms_between(t_build_end, t_send_end);
+      const double sleep_ms    = ms_between(t_send_end, t_sleep_end);
+      const double total_ms    = ms_between(t_iter_start, t_sleep_end);
+      std::cout << "[perf] msg_id=" << (msg_id - 1)
+                << std::fixed << std::setprecision(2)
+                << " gap=" << gap_ms << "ms"
+                << " gen=" << gen_ms << "ms"
+                << " build=" << build_ms << "ms"
+                << " zmq_send=" << zmq_send_ms << "ms"
+                << " sleep=" << sleep_ms << "ms"
+                << " total=" << total_ms << "ms"
+                << " bytes=" << total_bytes
+                << (rc < 0 ? " [DROPPED]" : "")
+                << "\n" << std::flush;
+    }
+
+    t_last_iter = t_sleep_end;
   }
 
   // ---- Cleanup ---------------------------------------------------------

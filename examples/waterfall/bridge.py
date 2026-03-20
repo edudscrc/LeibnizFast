@@ -93,35 +93,53 @@ def make_ws_handler(ctrl_sock: zmq.asyncio.Socket):
 
 # ---- ZMQ data receive loop -------------------------------------------
 
+def _parse_msg_id(raw: bytes) -> int | None:
+    """Extract msg_id (uint32 LE at offset 12) from a waterfall v1 message."""
+    if len(raw) >= 16:
+        return struct.unpack_from("<I", raw, 12)[0]
+    return None
+
+
 async def zmq_loop(data_sock: zmq.asyncio.Socket) -> None:
     """Pull messages from ZMQ and broadcast binary payload to all clients."""
     log.info("ZMQ PULL connected to %s", ZMQ_DATA_ADDR)
 
+    t_last_recv: float | None = None  # monotonic time of previous message arrival
+
     try:
         while True:
-            t_recv = time.monotonic()
+            t_recv_start = time.monotonic()
             raw: bytes = await data_sock.recv()
-            recv_ms = (time.monotonic() - t_recv) * 1000
+            t_recv_end = time.monotonic()
+
+            recv_ms = (t_recv_end - t_recv_start) * 1000
+            gap_ms  = (t_recv_start - t_last_recv) * 1000 if t_last_recv is not None else 0.0
+            t_last_recv = t_recv_start
 
             if not clients:
                 if DEBUG:
-                    log.info("[perf] recv=%.1fms  size=%dB  no clients", recv_ms, len(raw))
+                    log.info("[perf] gap=%.1fms  recv=%.1fms  size=%dB  no clients",
+                             gap_ms, recv_ms, len(raw))
                 continue  # nobody listening; discard
 
             # Broadcast to all connected clients concurrently.
             # return_exceptions=True ensures a single slow/closed client
             # never blocks delivery to the others.
-            t_bcast = time.monotonic()
+            n_clients = len(clients)
+            t_bcast_start = time.monotonic()
             results = await asyncio.gather(
                 *(ws.send(raw) for ws in list(clients)),
                 return_exceptions=True,
             )
-            bcast_ms = (time.monotonic() - t_bcast) * 1000
+            bcast_ms = (time.monotonic() - t_bcast_start) * 1000
 
             if DEBUG:
+                msg_id = _parse_msg_id(raw)
+                per_client_ms = bcast_ms / n_clients if n_clients > 0 else 0.0
                 log.info(
-                    "[perf] recv=%.1fms  broadcast=%.1fms  size=%dB  clients=%d",
-                    recv_ms, bcast_ms, len(raw), len(clients),
+                    "[perf] msg_id=%s  gap=%.1fms  recv=%.1fms  broadcast=%.1fms"
+                    "  per_client=%.1fms  size=%dB  clients=%d",
+                    msg_id, gap_ms, recv_ms, bcast_ms, per_client_ms, len(raw), n_clients,
                 )
 
             for result in results:

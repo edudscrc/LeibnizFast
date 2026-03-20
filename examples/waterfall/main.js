@@ -106,6 +106,9 @@ const frameTimes = [];
 let bytesThisSecond = 0;
 let lastRateUpdate = performance.now();
 
+// Inter-message arrival tracking for debug timing
+let tLastMessage = 0;  // performance.now() of the last processMessage call
+
 // Waterfall buffer
 let displayCols = parseInt(displayColsSel.value);
 let spatialDownsample = parseInt(spatialDsInput.value);
@@ -254,8 +257,14 @@ function parseHeader(buf) {
 function processMessage(buf) {
   if (!viewer || !buffer) return;
 
+  const tRecv = performance.now();
+  const gapMs = tLastMessage > 0 ? tRecv - tLastMessage : 0;
+  tLastMessage = tRecv;
+
   const h = parseHeader(buf);
   if (!h) return;
+
+  const tAfterParse = performance.now();
 
   // If generator rows changed (e.g. via resize), recreate buffer
   if (h.rows !== buffer.rows) {
@@ -270,10 +279,20 @@ function processMessage(buf) {
   buffer.pushColumns(colData, h.newCols);
   dirty = true;
 
+  const tAfterPush = performance.now();
+
   updateDataRate(buf.byteLength);
 
   if (debugEnabled) {
-    console.log(`[waterfall] msg_id=${h.msgId} rows=${h.rows} newCols=${h.newCols} bytes=${buf.byteLength}`);
+    const parseMs = tAfterParse - tRecv;
+    const pushMs  = tAfterPush - tAfterParse;
+    console.log(
+      `[perf] msg_id=${h.msgId}` +
+      `  gap=${gapMs.toFixed(2)}ms` +
+      `  parse=${parseMs.toFixed(2)}ms` +
+      `  push=${pushMs.toFixed(2)}ms` +
+      `  bytes=${buf.byteLength}`
+    );
   }
 }
 
@@ -284,7 +303,11 @@ function renderLoop() {
     if (debugEnabled) {
       const t0 = performance.now();
       viewer.setData(buffer.data, buffer.rows, buffer.cols);
-      console.log(`[perf] setData (${buffer.rows}x${buffer.cols}): ${(performance.now() - t0).toFixed(2)}ms`);
+      const setDataMs = performance.now() - t0;
+      console.log(
+        `[perf] render` +
+        `  setData(${buffer.rows}×${buffer.cols})=${setDataMs.toFixed(2)}ms`
+      );
     } else {
       viewer.setData(buffer.data, buffer.rows, buffer.cols);
     }
