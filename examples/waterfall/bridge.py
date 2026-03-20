@@ -167,7 +167,19 @@ async def main() -> None:
 
     # Start WebSocket server with the handler that has ctrl_sock in scope
     handler = make_ws_handler(ctrl_sock)
-    server = await websockets.serve(handler, WS_HOST, WS_PORT)
+    server = await websockets.serve(
+        handler,
+        WS_HOST,
+        WS_PORT,
+        # Disable per-message deflate compression.
+        # Float32 data is essentially incompressible; without this flag the
+        # websockets library will spend seconds trying to zlib-compress each
+        # 60 MB frame and produce output of the same size.
+        compression=None,
+        # Raise the write buffer limit (default 64 KB) so asyncio doesn't
+        # yield hundreds of times while draining a large frame.
+        write_limit=1 << 22,  # 4 MB
+    )
     log.info("WebSocket server listening on ws://%s:%d", WS_HOST, WS_PORT)
 
     # Register clean shutdown handlers for SIGINT and SIGTERM

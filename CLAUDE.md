@@ -111,10 +111,10 @@ npm run dev                                                      # Build + serve
 | `src/shaders/render.wgsl` | Vertex + fragment shader |
 | `js/index.ts` | TypeScript wrapper |
 | `js/types.ts` | Type definitions |
-| `examples/waterfall/generator.cpp` | C++ DAS data generator → ZMQ PUSH (waterfall protocol) |
-| `examples/waterfall/bridge.py` | ZMQ PULL → WebSocket broadcast bridge (copy of cpp-stream) |
-| `examples/waterfall/main.js` | WebSocket waterfall client: FIFO buffer + `setData` fast path |
-| `examples/waterfall/index.html` | DAS waterfall example page with controls |
+| `examples/waterfall/generator.cpp` | C++ DAS generator: physics-based params (fiber range, sampling/repetition rate, spatial downsample, time buffer) → ZMQ PUSH |
+| `examples/waterfall/bridge.py` | ZMQ PULL → WebSocket broadcast bridge; `compression=None` required — float32 data is incompressible and default deflate adds ~3-4 s/msg |
+| `examples/waterfall/main.js` | WebSocket waterfall client: FIFO buffer + `setData` fast path; physics constants mirror generator defaults |
+| `examples/waterfall/index.html` | DAS waterfall example page: Spatial DS control, computed stats bar (rows / cols-per-msg / rate) |
 
 ## Common Tasks
 
@@ -140,8 +140,22 @@ frame dropping via `abortData`.
 Use `setData` fast path with a pre-allocated `Float32Array(rows × displayCols)`. On each new batch:
 per-row `copyWithin` shifts left, new columns written at right edge. Render decoupled via `requestAnimationFrame`.
 See `examples/waterfall/main.js` for the complete pattern including the `WaterfallBuffer` class.
-Generator rate is controlled by `--sampling-rate` (MHz) and `--downsample` (factor):
-`output_rate = sampling_rate × 4 / downsample` MB/s.
+
+Generator uses physics-based DAS parameters:
+```
+./generator --fiber-start 10000 --fiber-end 20000  # meters
+            --sampling-rate 400                     # MHz
+            --repetition-rate 10000                 # Hz (pulses/s)
+            --spatial-downsample 5                  # integer step
+            --time-buffer 0.2                       # seconds per message
+```
+Derived automatically: `rows = ceil(round(sr_MHz × 1e6 × 2 × fiber_len / v_fiber) / ds)`,
+`cols_per_msg = round(rep_rate × time_buffer)`, `msg_interval = time_buffer`.
+With defaults: ~7831 rows, 2000 cols/msg, ~313 MB/s, one 60 MB message every 200 ms.
+
+**Bridge**: always run with `compression=None` (set in `websockets.serve()`). The websockets
+library negotiates permessage-deflate by default; compressing incompressible float32 data adds
+~3–4 s per message. With compression disabled, broadcast latency drops to ~100 ms for 60 MB.
 
 ### Extend streaming API for waterfall/ring-buffer
 `start_row` on `append_chunk` is reserved for out-of-order support. To add rolling window:
