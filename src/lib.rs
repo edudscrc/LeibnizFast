@@ -407,6 +407,77 @@ mod wasm_entry {
             Ok(())
         }
 
+        /// Begin a streaming update, reusing GPU resources when dimensions match.
+        ///
+        /// This is the fast path for real-time streaming: when called with the
+        /// same dimensions as the previous frame, it reuses the existing
+        /// `JsDataSource` (Float32Array in JS heap) and `MatrixView` (GPU staging
+        /// buffer), avoiding per-frame allocation and pipeline rebuild.
+        ///
+        /// Falls back to `begin_data()` on first use or when dimensions change.
+        /// Follow with `append_chunk()` calls and finalize with `end_data()`.
+        #[wasm_bindgen(js_name = beginUpdate)]
+        pub fn begin_update(&mut self, rows: u32, cols: u32) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("begin_update", self.debug);
+            if self.pending_upload.is_some() {
+                return Err(JsValue::from_str(
+                    "A streaming upload is already in progress. Call endData() or abortData() first.",
+                ));
+            }
+
+            let same_dims = self.renderer.has_compute
+                && self
+                    .matrix
+                    .as_ref()
+                    .map_or(false, |m| m.rows() == rows && m.cols() == cols)
+                && self.js_data.is_some();
+
+            if same_dims {
+                // Fast path: reuse existing resources — no allocation, no pipeline rebuild
+                let mut js_data = self.js_data.take().unwrap();
+                if let Some((min, max)) = self.sticky_range {
+                    js_data.set_range(min, max);
+                } else {
+                    js_data.reset_range();
+                }
+                let matrix_view = self.matrix.take();
+                self.pending_upload = Some(PendingUpload {
+                    js_data,
+                    matrix_view,
+                    rows,
+                    cols,
+                    next_row: 0,
+                });
+                Ok(())
+            } else {
+                // Slow path: first call or dimension change — full setup
+                self.begin_data(rows, cols)
+            }
+        }
+
+        /// Abort an in-progress streaming upload.
+        ///
+        /// Discards the pending upload and restores reusable resources
+        /// (`JsDataSource`, `MatrixView`) back to the viewer so the next
+        /// `begin_update()` can reuse them. No-op if no upload is in progress.
+        #[wasm_bindgen(js_name = abortData)]
+        pub fn abort_data(&mut self) {
+            if let Some(pending) = self.pending_upload.take() {
+                self.js_data = Some(pending.js_data);
+                self.matrix = pending.matrix_view;
+            }
+        }
+
+        /// Render a single frame without modifying data.
+        ///
+        /// Useful for decoupled rendering: ingest data via `append_chunk()`
+        /// at the data source rate, then call `render()` at the display
+        /// refresh rate via `requestAnimationFrame`.
+        #[wasm_bindgen]
+        pub fn render(&mut self) -> Result<(), JsValue> {
+            self.render_frame()
+        }
+
         /// Append a chunk of rows to the in-progress streaming upload.
         ///
         /// `chunk` must contain a whole number of rows. `start_row` must
@@ -451,51 +522,12 @@ mod wasm_entry {
                 )));
             }
 
-            // Copy chunk to JS-heap accumulator for future tooltip/colormap re-dispatch
+            // Copy chunk to JS-heap accumulator and track running min/max.
+            // Colormap is applied once in end_data() with the final range,
+            // ensuring consistent coloring across all chunks.
             let element_offset = start_row * pending.cols;
             pending.js_data.write_range(element_offset, chunk);
             pending.js_data.update_min_max(chunk);
-
-            // Process this chunk through the compute shader immediately.
-            // Use the running min/max (will be corrected at end_data if needed,
-            // but for initial display the running values are good enough).
-            if let Some(ref matrix_view) = pending.matrix_view {
-                let staging_cap = matrix_view.staging_capacity_rows();
-                let (min_val, max_val) = pending.js_data.range();
-
-                if chunk_rows <= staging_cap {
-                    // Chunk fits in staging buffer — single dispatch
-                    self.renderer.apply_colormap_staged_chunk(
-                        matrix_view,
-                        chunk,
-                        chunk_rows,
-                        start_row,
-                        pending.cols,
-                        min_val,
-                        max_val,
-                    );
-                } else {
-                    // Chunk exceeds staging buffer — sub-chunk it
-                    let cols_usize = pending.cols as usize;
-                    let mut sub_offset: u32 = 0;
-                    while sub_offset < chunk_rows {
-                        let sub_rows = staging_cap.min(chunk_rows - sub_offset);
-                        let sub_start = (sub_offset as usize) * cols_usize;
-                        let sub_end = sub_start + (sub_rows as usize) * cols_usize;
-                        let sub_chunk = &chunk[sub_start..sub_end];
-                        self.renderer.apply_colormap_staged_chunk(
-                            matrix_view,
-                            sub_chunk,
-                            sub_rows,
-                            start_row + sub_offset,
-                            pending.cols,
-                            min_val,
-                            max_val,
-                        );
-                        sub_offset += sub_rows;
-                    }
-                }
-            }
 
             pending.next_row = start_row + chunk_rows;
 
@@ -537,9 +569,24 @@ mod wasm_entry {
 
             self.camera.state.set_matrix_size(rows, cols);
 
-            // Pipelines already built in begin_data, colormap already applied
-            // per-chunk during append_chunk. Mark as applied.
-            self.renderer.set_colormap_applied(true);
+            // Apply colormap in a single pass with the final min/max range.
+            // This ensures consistent coloring across all rows (no per-chunk
+            // range drift). Pipelines were already built in begin_data().
+            if self.renderer.has_compute {
+                if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
+                    let (min_val, max_val) = jd.range();
+                    let read_fn = |start: usize, buf: &mut [f32]| {
+                        jd.read_range(start, buf);
+                    };
+                    self.renderer.apply_colormap_tiled(
+                        matrix_view,
+                        &read_fn,
+                        cols,
+                        min_val,
+                        max_val,
+                    );
+                }
+            }
 
             // CPU colormap upload for WebGL2 fallback
             self.upload_cpu_colormap_if_needed();

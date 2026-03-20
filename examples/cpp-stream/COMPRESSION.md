@@ -52,7 +52,8 @@ which adds two extra fields to the chunk header:
 | 36     | `payload_bytes` | exact byte count of compressed data that follows |
 
 The receiver reads `payload_bytes` to know how many bytes to decompress,
-then inflates them back to raw float32 before calling `setData`.
+then inflates them back to raw float32 before feeding them through the
+streaming API (`beginUpdate` → `appendChunk` × N → `endData`).
 
 ---
 

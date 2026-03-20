@@ -202,6 +202,15 @@ impl MatrixData {
         self.max_val = max;
     }
 
+    /// Reset min/max to uninitialized state for a new streaming frame.
+    ///
+    /// After calling this, `update_min_max()` will recompute the range
+    /// from incoming chunks.
+    pub fn reset_range(&mut self) {
+        self.min_val = f32::INFINITY;
+        self.max_val = f32::NEG_INFINITY;
+    }
+
     /// Create a MatrixData for incremental building via `append_rows()`.
     pub fn with_capacity(rows: u32, cols: u32) -> Self {
         Self {
@@ -590,6 +599,16 @@ impl JsDataSource {
         self.max_val = max;
     }
 
+    /// Reset min/max to uninitialized state for a new streaming frame.
+    ///
+    /// Called by `begin_update()` to reuse the same Float32Array buffer
+    /// across frames. The range will be recomputed incrementally via
+    /// `update_min_max()` during `append_chunk()` calls.
+    pub fn reset_range(&mut self) {
+        self.min_val = f32::INFINITY;
+        self.max_val = f32::NEG_INFINITY;
+    }
+
     /// Get the number of rows.
     pub fn rows(&self) -> u32 {
         self.rows
@@ -754,6 +773,24 @@ mod tests {
         let (min, max) = m.range();
         assert!((min - 0.0).abs() < 1e-6);
         assert!((max - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_reset_range_and_recompute() {
+        let data = vec![1.0, 5.0, 3.0, 7.0];
+        let mut m = MatrixData::new(data, 2, 2);
+        assert!((m.range().0 - 1.0).abs() < 1e-6);
+        assert!((m.range().1 - 7.0).abs() < 1e-6);
+
+        // Reset range — simulates start of a new streaming frame
+        m.reset_range();
+        assert!(m.range().0.is_infinite()); // +INFINITY
+        assert!(m.range().1.is_infinite()); // -INFINITY
+
+        // Set a new explicit range (simulates sticky_range or new data scan)
+        m.set_range(2.0, 6.0);
+        assert!((m.range().0 - 2.0).abs() < 1e-6);
+        assert!((m.range().1 - 6.0).abs() < 1e-6);
     }
 
     // --- PagedStorage tests ---

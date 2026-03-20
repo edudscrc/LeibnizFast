@@ -151,7 +151,7 @@ struct SimState {
 
 int main(int argc, char* argv[]) {
   int initial_N = 512;
-  int n_chunks = 1;
+  int n_chunks = 4;
   bool compress = false;
   bool g_debug = false;
 

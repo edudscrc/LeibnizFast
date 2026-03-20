@@ -80,6 +80,17 @@ const pendingFrames = new Map();
 // promise so frames are always processed in arrival order.
 let frameAssemblyChain = Promise.resolve();
 
+// Reusable Float32Array for frame accumulation (avoids per-frame allocation).
+// Recreated only when matrix dimensions change.
+/** @type {Float32Array|null} */
+let frameBuffer = null;
+let frameBufferRows = 0;
+let frameBufferCols = 0;
+// Current frame being accumulated (v1 path)
+let accumFrameId = null;
+let accumReceived = 0;
+let accumTotalChunks = 0;
+
 // ---- Utilities -------------------------------------------------------
 
 /**
@@ -246,6 +257,13 @@ async function inflate(data) {
 async function assembleFrame(pending, frameId) {
   if (debugEnabled) console.log(`[v2] assembleFrame frameId=${frameId} totalChunks=${pending.totalChunks}`);
 
+  // Reuse frame buffer when dimensions match
+  if (!frameBuffer || frameBufferRows !== pending.totalRows || frameBufferCols !== pending.cols) {
+    frameBuffer = new Float32Array(pending.totalRows * pending.cols);
+    frameBufferRows = pending.totalRows;
+    frameBufferCols = pending.cols;
+  }
+
   for (let c = 0; c < pending.totalChunks; c++) {
     let payload = pending.rawChunks[c]; // Uint8Array of compressed bytes
 
@@ -255,18 +273,17 @@ async function assembleFrame(pending, frameId) {
       if (debugEnabled) console.log(`[v2] chunk ${c}: inflate ${inputBytes}B → ${payload.byteLength}B`);
     }
 
-    const rowOff    = pending.rowStarts[c] * pending.cols;
     const cellCount = pending.chunkRowCounts[c] * pending.cols;
     const f32 = new Float32Array(payload.buffer, payload.byteOffset, cellCount);
-    pending.full.set(f32, rowOff);
+    frameBuffer.set(f32, pending.rowStarts[c] * pending.cols);
   }
 
   if (debugEnabled) {
     const t0 = performance.now();
-    viewer.setData(pending.full, pending.totalRows, pending.cols);
+    viewer.setData(frameBuffer, pending.totalRows, pending.cols);
     console.log(`[perf] setData (${pending.totalRows}×${pending.cols}): ${(performance.now() - t0).toFixed(2)}ms`);
   } else {
-    viewer.setData(pending.full, pending.totalRows, pending.cols);
+    viewer.setData(frameBuffer, pending.totalRows, pending.cols);
   }
   updateFps();
 
@@ -279,9 +296,10 @@ async function assembleFrame(pending, frameId) {
 /**
  * Handle one received binary WebSocket message (a single frame chunk).
  *
- * Protocol v1: chunks are assembled in-place (sync, fast path).
+ * Protocol v1: chunks are accumulated into a reusable Float32Array, then
+ * setData() is called once per complete frame (fast path reuses GPU pipelines).
  * Protocol v2: compressed raw bytes are stored per-chunk; assembleFrame()
- * is called asynchronously once all chunks have arrived.
+ * decompresses, accumulates into a reusable Float32Array, then calls setData().
  *
  * @param {ArrayBuffer} buf
  */
@@ -292,39 +310,47 @@ function processFrame(buf) {
   if (!h) return;
 
   if (h.version === 1) {
-    // ---- Protocol v1: plain float32, sync in-place assembly ----------
+    // ---- Protocol v1: plain float32, accumulate + setData path -------
 
-    let pending = pendingFrames.get(h.frameId);
-    if (!pending) {
-      pending = {
-        version:     1,
-        totalChunks: h.totalChunks,
-        totalRows:   h.totalRows,
-        cols:        h.cols,
-        full:        new Float32Array(h.totalRows * h.cols),
-        received:    0,
-      };
-      pendingFrames.set(h.frameId, pending);
+    // Frame dropping: if a newer frame starts while accumulating, discard the old one.
+    if (accumFrameId !== null && h.frameId > accumFrameId) {
+      if (debugEnabled) console.log(`[v1] dropping incomplete frame ${accumFrameId} for ${h.frameId}`);
+      accumFrameId = null;
     }
 
-    // CHUNK_HEADER_BYTES = 32 is 4-byte aligned — TypedArray requirement met.
-    const src = new Float32Array(buf, CHUNK_HEADER_BYTES, h.chunkRows * h.cols);
-    pending.full.set(src, h.rowStart * h.cols);
-    pending.received++;
+    // Skip chunks from old/stale frames
+    if (accumFrameId !== null && h.frameId < accumFrameId) return;
 
-    if (pending.received === pending.totalChunks) {
-      pendingFrames.delete(h.frameId);
+    // Start accumulating a new frame
+    if (accumFrameId === null || h.frameId !== accumFrameId) {
+      // Reuse the Float32Array when dimensions match (avoids 64MB alloc per frame)
+      if (!frameBuffer || frameBufferRows !== h.totalRows || frameBufferCols !== h.cols) {
+        frameBuffer = new Float32Array(h.totalRows * h.cols);
+        frameBufferRows = h.totalRows;
+        frameBufferCols = h.cols;
+      }
+      accumFrameId = h.frameId;
+      accumReceived = 0;
+      accumTotalChunks = h.totalChunks;
+    }
+
+    // Copy chunk into the reusable frame buffer
+    const chunkData = new Float32Array(buf, CHUNK_HEADER_BYTES, h.chunkRows * h.cols);
+    frameBuffer.set(chunkData, h.rowStart * h.cols);
+    accumReceived++;
+
+    if (accumReceived === accumTotalChunks) {
+      // Full frame ready — setData uses the fast path for same dimensions
+      // (reuses GPU pipelines, only re-dispatches the colormap compute shader).
       if (debugEnabled) {
         const t0 = performance.now();
-        viewer.setData(pending.full, h.totalRows, h.cols);
+        viewer.setData(frameBuffer, h.totalRows, h.cols);
         console.log(`[perf] setData (${h.totalRows}×${h.cols}): ${(performance.now() - t0).toFixed(2)}ms`);
       } else {
-        viewer.setData(pending.full, h.totalRows, h.cols);
+        viewer.setData(frameBuffer, h.totalRows, h.cols);
       }
+      accumFrameId = null;
       updateFps();
-      for (const [id] of pendingFrames) {
-        if (id < h.frameId) pendingFrames.delete(id);
-      }
     }
 
   } else {
@@ -337,7 +363,6 @@ function processFrame(buf) {
         totalChunks:    h.totalChunks,
         totalRows:      h.totalRows,
         cols:           h.cols,
-        full:           new Float32Array(h.totalRows * h.cols),
         flags:          h.flags,
         rawChunks:      new Array(h.totalChunks).fill(null),
         rowStarts:      new Array(h.totalChunks).fill(0),
@@ -399,6 +424,8 @@ function connect() {
     fpsCounter.textContent = '-- FPS';
     pendingFrames.clear();
     frameAssemblyChain = Promise.resolve();
+    // Reset accumulation state
+    accumFrameId = null;
     // Sync the size selector with the generator on reconnect
     sendResize(parseInt(sizeSelect.value));
   });
@@ -495,6 +522,8 @@ async function main() {
   sizeSelect.addEventListener('change', () => {
     pendingFrames.clear();
     frameAssemblyChain = Promise.resolve();
+    // Reset accumulation state before resize
+    accumFrameId = null;
     sendResize(parseInt(sizeSelect.value));
   });
 

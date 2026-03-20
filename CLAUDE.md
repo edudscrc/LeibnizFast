@@ -40,11 +40,17 @@ apply_colormap_tiled()    ← re-dispatches compute from JS heap
 ```
 > Tile textures are NOT recreated on colormap change — only bind groups update. `setRange()` follows the same pattern.
 
-**Streaming flow:**
+**Streaming flow (initial load):**
 ```
 begin_data()  → append_chunk() × N  → end_data()
 ```
 Each `append_chunk` copies to JS accumulator and dispatches compute immediately.
+
+**Streaming update flow (real-time, same dimensions):**
+```
+begin_update()  → append_chunk() × N  → end_data()
+```
+`begin_update()` reuses the existing `JsDataSource` (JS Float32Array) and `MatrixView` (GPU staging buffer) — zero allocation, zero pipeline rebuild. Falls back to `begin_data()` on first call or dimension change. `abort_data()` cancels an in-progress upload and restores resources for reuse (enables frame dropping). `render()` exposes frame rendering independently from data upload for rAF-decoupled rendering.
 
 **Texture tiling**: matrices exceeding `maxTextureDimension2D` are split into a `TileGrid` of tiles. Each tile has its own texture, params buffer, compute bind group, camera buffer, and render bind group. Fragments outside a tile's UV region are discarded in the fragment shader.
 
@@ -64,7 +70,7 @@ Each `append_chunk` copies to JS accumulator and dispatches compute immediately.
 ## Build & Test
 
 ```bash
-cargo fmt --check && cargo clippy -- -D warnings && cargo test  # Rust checks (52 tests)
+cargo fmt --check && cargo clippy -- -D warnings && cargo test  # Rust checks (56 tests)
 wasm-pack build --target web                                     # Build WASM
 npx prettier --check js/ && npx eslint js/                       # TS checks
 npm run build                                                    # Full bundle
@@ -84,6 +90,7 @@ npm run dev                                                      # Build + serve
 - **Factory pattern**: `PipelineFactory` centralizes wgpu pipeline creation
 - **Pure/GPU split**: `CameraState`/`Camera`, `MatrixData`/`MatrixView` — pure math is testable
 - **In-place colormap**: `rebuild_compute_bind_groups()` reuses tile textures; no 2× VRAM spike
+- **Zero-alloc streaming updates**: `begin_update()` reuses JsDataSource + MatrixView for same-dimension frames; `abort_data()` restores resources on frame drop
 
 ## File Structure
 
@@ -104,6 +111,10 @@ npm run dev                                                      # Build + serve
 | `src/shaders/render.wgsl` | Vertex + fragment shader |
 | `js/index.ts` | TypeScript wrapper |
 | `js/types.ts` | Type definitions |
+| `examples/waterfall/generator.cpp` | C++ DAS data generator → ZMQ PUSH (waterfall protocol) |
+| `examples/waterfall/bridge.py` | ZMQ PULL → WebSocket broadcast bridge (copy of cpp-stream) |
+| `examples/waterfall/main.js` | WebSocket waterfall client: FIFO buffer + `setData` fast path |
+| `examples/waterfall/index.html` | DAS waterfall example page with controls |
 
 ## Common Tasks
 
@@ -118,6 +129,19 @@ npm run dev                                                      # Build + serve
 2. Add transitions in `mouse_down`/`mouse_move`/`mouse_up`
 3. Write tests for all new transitions
 4. Wire up in `src/lib.rs` event handlers
+
+### Real-time streaming (same-dimension updates)
+Use `beginUpdate` → `appendChunk` × N → `endData` instead of `setData` for real-time feeds.
+`beginUpdate` reuses GPU resources (zero allocation); `appendChunk` dispatches compute per-chunk
+(no full-matrix staging). See `examples/cpp-stream/main.js` for the complete pattern including
+frame dropping via `abortData`.
+
+### Waterfall / FIFO streaming (right-to-left scroll)
+Use `setData` fast path with a pre-allocated `Float32Array(rows × displayCols)`. On each new batch:
+per-row `copyWithin` shifts left, new columns written at right edge. Render decoupled via `requestAnimationFrame`.
+See `examples/waterfall/main.js` for the complete pattern including the `WaterfallBuffer` class.
+Generator rate is controlled by `--sampling-rate` (MHz) and `--downsample` (factor):
+`output_rate = sampling_rate × 4 / downsample` MB/s.
 
 ### Extend streaming API for waterfall/ring-buffer
 `start_row` on `append_chunk` is reserved for out-of-order support. To add rolling window:

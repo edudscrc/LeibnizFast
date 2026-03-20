@@ -222,6 +222,42 @@ export class LeibnizFast {
   }
 
   /**
+   * Begin a streaming update, reusing GPU resources when dimensions match.
+   *
+   * Fast path for real-time streaming: reuses the existing Float32Array
+   * and GPU staging buffer when called with the same dimensions as the
+   * previous frame, avoiding per-frame allocation and pipeline rebuild.
+   * Falls back to `beginData()` on first use or when dimensions change.
+   *
+   * @param options - Matrix dimensions (rows, cols)
+   */
+  beginUpdate(options: StreamingDataOptions): void {
+    this.timeSync('JS beginUpdate', () =>
+      this.inner.beginUpdate(options.rows, options.cols),
+    );
+  }
+
+  /**
+   * Abort an in-progress streaming upload.
+   *
+   * Restores reusable resources for the next `beginUpdate()` call.
+   * No-op if no upload is in progress.
+   */
+  abortData(): void {
+    this.inner.abortData();
+  }
+
+  /**
+   * Render a single frame without modifying data.
+   *
+   * Useful for decoupled rendering: ingest data at the source rate,
+   * then call `render()` at display refresh rate via requestAnimationFrame.
+   */
+  render(): void {
+    this.inner.render();
+  }
+
+  /**
    * Append a chunk of rows to the in-progress streaming upload.
    *
    * @param data - Float32Array containing a whole number of rows
