@@ -75,7 +75,7 @@ def make_ws_handler(ctrl_sock: zmq.asyncio.Socket):
                         data = json.loads(message)
                         if data.get("type") == "resize":
                             new_rows = int(data["rows"])
-                            if 4 <= new_rows <= 8192:
+                            if 4 <= new_rows <= 65536:
                                 # Send as 4-byte little-endian uint32 to generator
                                 await ctrl_sock.send(struct.pack("<I", new_rows))
                                 log.info("Forwarded resize → rows=%d", new_rows)

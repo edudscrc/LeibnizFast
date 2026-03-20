@@ -153,9 +153,10 @@
     <h1>LeibnizFast — DAS Waterfall</h1>
     <p class="note">
       Simulated DAS (Distributed Acoustic Sensing) acquisition streamed from
-      a C++ generator over ZeroMQ to a Python WebSocket bridge. New data
-      appears on the right; old data scrolls left. Pan and zoom to explore;
-      hover for per-cell values.
+      a C++ generator over ZeroMQ to a Python WebSocket bridge. The generator
+      models a fiber segment with physics-based parameters (sampling rate,
+      repetition rate, spatial downsampling). New data appears on the right;
+      old data scrolls left. Pan and zoom to explore; hover for per-cell values.
     </p>
 
     <!-- Connection status + FPS + Data rate -->
@@ -179,13 +180,8 @@
         <option value="grayscale">Grayscale</option>
       </select>
 
-      <label for="rows">Rows:</label>
-      <select id="rows">
-        <option value="128">128</option>
-        <option value="256">256</option>
-        <option value="512" selected>512</option>
-        <option value="1024">1024</option>
-      </select>
+      <label for="spatial-downsample">Spatial DS:</label>
+      <input type="number" id="spatial-downsample" value="5" min="1" max="1000" step="1" style="width:64px" />
 
       <label for="display-cols">Time window:</label>
       <select id="display-cols">
@@ -193,6 +189,7 @@
         <option value="1000" selected>1000</option>
         <option value="2000">2000</option>
         <option value="4000">4000</option>
+        <option value="8000">8000</option>
       </select>
 
       <div class="range-inputs">
@@ -205,6 +202,12 @@
       <label for="debug">
         <input type="checkbox" id="debug" /> Debug timing
       </label>
+    </div>
+
+    <div id="das-stats" style="display:flex; gap:20px; font-size:0.82rem; color:#aab; font-family:monospace; padding:2px 0">
+      <span id="stat-rows">Rows: –</span>
+      <span id="stat-cols">Cols/msg: –</span>
+      <span id="stat-rate">Rate: – MB/s</span>
     </div>
 
     <div class="error-banner" id="error-banner"></div>
@@ -224,9 +227,11 @@
       pip install pyzmq websockets
 
     Run (three terminals):
-      python bridge.py             # terminal 1
-      ./generator                  # terminal 2 (defaults: 100 MHz, ds=5, 512 rows)
-      npm run dev (project root)   # terminal 3
+      python bridge.py                                              # terminal 1
+      ./generator                                                   # terminal 2 (defaults: 400 MHz, 10–20 km fiber, ds=5)
+      ./generator --fiber-start 10000 --fiber-end 20000            # explicit fiber range
+      ./generator --spatial-downsample 10                          # lower resolution (fewer rows)
+      npm run dev (project root)                                    # terminal 3
 
     Then open: http://localhost:8080/examples/waterfall/
   -->
