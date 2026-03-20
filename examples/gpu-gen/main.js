@@ -248,7 +248,11 @@ async function main() {
 
       if (useStreaming) {
         viewer.beginData(size, size);
-        const chunkRows = Math.min(1000, size);
+        // Cap chunk rows so the generator's storage buffer stays within
+        // maxStorageBufferBindingSize (often 128 MB on Chrome/WebGPU).
+        const maxBindingBytes = gpuDevice.limits.maxStorageBufferBindingSize;
+        const maxRowsByBinding = Math.floor(maxBindingBytes / (size * 4));
+        const chunkRows = Math.max(1, Math.min(1000, size, maxRowsByBinding));
         for (let startRow = 0; startRow < size; startRow += chunkRows) {
           const rows = Math.min(chunkRows, size - startRow);
           const tGen = debugEnabled ? performance.now() : 0;

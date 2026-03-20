@@ -274,9 +274,28 @@ impl MatrixData {
 ///
 /// This caps the largest single GPU allocation. A larger staging buffer means
 /// fewer compute dispatches per tile (better performance), but must stay within
-/// the device's `max_buffer_size` (typically 256 MB–1 GB on WebGPU).
-#[cfg(target_arch = "wasm32")]
+/// both the device's `max_buffer_size` (buffer creation limit) **and**
+/// `max_storage_buffer_binding_size` (compute shader binding limit, often 128 MB).
+#[cfg(any(target_arch = "wasm32", test))]
 const MAX_STAGING_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Compute the effective staging buffer byte budget given device limits.
+///
+/// The budget is the minimum of:
+/// - `MAX_STAGING_BYTES` — our own cap
+/// - `max_buffer_size` — device limit on buffer creation size
+/// - `max_storage_buffer_binding_size` — device limit on storage buffer binding size
+///   (often 128 MB on Chrome/WebGPU, independent of `max_buffer_size`)
+///
+/// Keeping the staging buffer within `max_storage_buffer_binding_size` ensures
+/// that `as_entire_binding()` never exceeds the binding limit when the buffer is
+/// bound to the compute shader.
+#[cfg(any(target_arch = "wasm32", test))]
+fn compute_staging_budget(max_buffer_size: u64, max_storage_buffer_binding_size: u32) -> u64 {
+    MAX_STAGING_BYTES
+        .min(max_buffer_size)
+        .min(max_storage_buffer_binding_size as u64)
+}
 
 /// GPU-side matrix view with a staging buffer and parameters uniform.
 ///
@@ -315,11 +334,11 @@ impl MatrixView {
         self.staging_rows
     }
 
-    /// Create a MatrixView with a staging buffer (≤ 64 MB).
+    /// Create a MatrixView with a staging buffer sized to device limits.
     ///
     /// The staging buffer holds as many complete rows as fit within
-    /// `min(MAX_STAGING_BYTES, max_buffer_size)`, aligned to 16 rows.
-    /// Data is always processed in chunks through this buffer.
+    /// `min(MAX_STAGING_BYTES, max_buffer_size, max_storage_buffer_binding_size)`,
+    /// aligned to 16 rows. Data is always processed in chunks through this buffer.
     pub fn with_empty_buffer(
         device: &wgpu::Device,
         rows: u32,
@@ -335,8 +354,11 @@ impl MatrixView {
         }
 
         let data_size = (rows as u64) * (cols as u64) * 4;
-        let max_size = device.limits().max_buffer_size;
-        let budget = MAX_STAGING_BYTES.min(max_size);
+        let limits = device.limits();
+        let budget = compute_staging_budget(
+            limits.max_buffer_size,
+            limits.max_storage_buffer_binding_size,
+        );
 
         let row_bytes = cols as u64 * 4;
         let raw_rows = (budget / row_bytes).min(rows as u64);
@@ -809,5 +831,36 @@ mod tests {
         for i in 0..15 {
             assert_eq!(buf[i], (PAGE_SIZE_ELEMENTS - 5 + i) as f32);
         }
+    }
+
+    // --- compute_staging_budget tests ---
+
+    #[test]
+    fn staging_budget_respects_binding_limit() {
+        // Simulates a device where max_storage_buffer_binding_size (128 MB) is
+        // smaller than max_buffer_size (1 GB). The budget must be capped at 128 MB
+        // so the staging buffer can actually be bound to the compute shader.
+        let max_buffer_size: u64 = 1024 * 1024 * 1024; // 1 GB
+        let max_binding: u32 = 128 * 1024 * 1024; // 128 MB (typical Chrome/WebGPU)
+        let budget = compute_staging_budget(max_buffer_size, max_binding);
+        assert_eq!(budget, max_binding as u64);
+    }
+
+    #[test]
+    fn staging_budget_respects_max_buffer_size() {
+        // Device where max_buffer_size is the tightest constraint.
+        let max_buffer_size: u64 = 64 * 1024 * 1024; // 64 MB
+        let max_binding: u32 = 256 * 1024 * 1024; // 256 MB
+        let budget = compute_staging_budget(max_buffer_size, max_binding);
+        assert_eq!(budget, max_buffer_size);
+    }
+
+    #[test]
+    fn staging_budget_respects_our_cap() {
+        // Device is generous; our own 256 MB cap is the tightest constraint.
+        let max_buffer_size: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+        let max_binding: u32 = u32::MAX; // effectively unlimited
+        let budget = compute_staging_budget(max_buffer_size, max_binding);
+        assert_eq!(budget, MAX_STAGING_BYTES);
     }
 }
