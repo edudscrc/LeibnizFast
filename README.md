@@ -1,243 +1,173 @@
 # LeibnizFast
 
-GPU-accelerated 2D matrix visualization for the browser.
+GPU-accelerated 2D matrix visualization for the browser. Renders interactive heatmaps with zoom, pan, and cell-level hover inspection — powered by WebGPU (with WebGL2 fallback) via Rust and WASM.
 
-Render matrices of millions to billions of pixels as interactive heatmaps with smooth zoom, pan, and cell-level tooltip inspection — powered by WebGPU via Rust and WASM.
+## Prerequisites
 
-## Features
+- **Rust** (stable) + `wasm32-unknown-unknown` target
+- **wasm-pack**
+- **Node.js 18+**
 
-- **GPU-accelerated rendering** — compute shader applies colormaps, fragment shader handles zoom/pan
-- **Chunked data loading** — large matrices are uploaded to the GPU in ~16 MB slices, avoiding single-shot allocation failures
-- **Staging buffer** — matrices exceeding the GPU's `max_buffer_size` (e.g. 1 GB on Firefox) are processed through a smaller staging buffer with chunked compute shader dispatch
-- **Streaming API** — `beginData` / `appendChunk` / `endData` lets the caller feed data row-by-row without ever allocating the full matrix in JavaScript
-- **Interactive** — scroll to zoom (cursor-anchored), drag to pan, hover for cell values
-- **Multiple colormaps** — viridis, inferno, magma, plasma, cividis, grayscale
-- **Device-aware limits** — queries and enforces GPU texture dimension and buffer size limits with clear error messages
-- **Pixel-perfect** — nearest-neighbor sampling shows individual cells at high zoom
-- **TypeScript API** — clean typed wrapper over Rust/WASM core
+```bash
+# Install Rust (if needed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-## Browser Requirements
+# Add WASM target and wasm-pack
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
 
-WebGPU support required for the compute shader path:
-- Chrome 113+ / Edge 113+
-- Firefox Nightly (behind flag)
-- Safari Technology Preview
+# Install Node dependencies
+npm install
+```
 
-Falls back to WebGL2 (CPU colormap + texture upload). The streaming API works on both paths.
+## Build
 
-## GPU Limits
+```bash
+npm run build:wasm     # Rust → WASM (outputs to pkg/)
+npm run build:js       # TypeScript → ESM bundle (outputs to dist/)
+npm run build          # Both
+npm run dev            # Build + serve at localhost:8080/examples/basic/
+```
 
-The maximum renderable matrix size depends on the GPU:
+## Test & Lint
 
-| Limit | Typical value | What it means |
-|-------|--------------|---------------|
-| `max_texture_dimension_2d` | 8 192 (WebGPU Chrome) – 32 768 (desktop) | Max rows **and** cols |
-| `max_buffer_size` | 256 MB – 2 GB | Max raw data in a single GPU buffer |
+```bash
+npm run test:rs        # cargo test
+npm run lint:rs        # cargo fmt --check && cargo clippy -- -D warnings
+npm run lint:ts        # prettier --check && eslint
+npm run lint           # All linting
+```
 
-When the matrix exceeds `max_buffer_size`, a **staging buffer** is used automatically. Data is processed chunk-by-chunk through the compute shader. This allows rendering matrices up to `max_texture_dimension²` (e.g. 32 000×32 000 on capable GPUs) regardless of the buffer size limit.
-
-Call `viewer.getMaxTextureDimension()` and `viewer.getMaxMatrixElements()` after `create()` to query the current device. The example app automatically disables size options that exceed the texture limit.
-
-## Installation
+## Install (as a library)
 
 ```bash
 npm install leibniz-fast
 ```
 
-## Quick Start
+## Usage
 
 ```typescript
-import { LeibnizFast } from 'leibniz-fast';
+import { LeibnizFast } from "leibniz-fast";
 
-const canvas = document.getElementById('canvas') as HTMLCanvasElement;
-const viewer = await LeibnizFast.create(canvas, { colormap: 'viridis' });
+const canvas = document.getElementById("canvas") as HTMLCanvasElement;
+const viewer = await LeibnizFast.create(canvas, { colormap: "viridis" });
 
-// Standard path — one allocation, best for matrices up to ~8192×8192
-const data = new Float32Array(1000 * 2000);
-// ... fill data ...
-viewer.setData(data, { rows: 1000, cols: 2000 });
+const rows = 1000,
+  cols = 2000;
+const data = new Float32Array(rows * cols);
+// ... fill data in row-major order ...
 
-// Change colormap
-viewer.setColormap('inferno');
+viewer.setData(data, { rows, cols });
 
-// Set custom data range
+// Change colormap at any time
+viewer.setColormap("inferno");
+
+// Override auto-detected data range
 viewer.setRange(0.0, 1.0);
 
-// Hover tooltip
+// Cell hover callback
 viewer.onHover((row, col, value) => {
   console.log(`[${row}, ${col}] = ${value}`);
 });
 
-// Cleanup
+// Clean up when done
 viewer.destroy();
 ```
 
+Zoom, pan, and hover are handled automatically by the TypeScript wrapper.
+
 ### Streaming API
 
-Use `beginData` / `appendChunk` / `endData` when the full matrix is too large to hold in a single JavaScript `Float32Array` (roughly > 2 GB = ~23 000×23 000), or when data arrives incrementally (e.g. live waterfall feeds).
+For very large matrices or incremental data:
 
 ```typescript
-const rows = 8000, cols = 8000;
-const chunkRows = 1000; // generate/upload 1000 rows at a time
+viewer.beginData({ rows: 8000, cols: 8000 });
 
-viewer.beginData({ rows, cols });
-
-for (let startRow = 0; startRow < rows; startRow += chunkRows) {
-  const endRow = Math.min(startRow + chunkRows, rows);
-  const chunk = computeRows(startRow, endRow, cols); // Float32Array
+for (let startRow = 0; startRow < 8000; startRow += 1000) {
+  const chunk = generateRows(startRow, 1000, 8000); // Float32Array
   viewer.appendChunk(chunk, startRow);
 }
 
-viewer.endData(); // finalises min/max, rebuilds pipelines, renders
+viewer.endData();
 ```
 
-Key properties:
-- Peak JS memory ∘ one chunk, not the full matrix
-- GPU buffer is pre-allocated at full size in `beginData` (or as a staging buffer if data exceeds `max_buffer_size`)
-- For staged matrices, each chunk is immediately processed through the compute shader
-- `appendChunk` validates sequential ordering; out-of-order calls return an error
-- `endData` errors if not all rows have been uploaded
+### Colormaps
 
-> **Note:** Staged matrices (exceeding `max_buffer_size`) have two limitations:
-> tooltip hover is unavailable, and colormap changes require reloading the data.
+`viridis` `inferno` `magma` `plasma` `cividis` `grayscale`
 
-## API Reference
+## Examples
 
-### `LeibnizFast.create(canvas, options?)`
-Async factory. Initialises WebGPU/WebGL2 and returns a viewer instance.
-- `options.colormap`: `ColormapName` (default `'viridis'`)
-
-### `viewer.setData(data, options)`
-Set matrix data in one shot.
-- `data`: `Float32Array` row-major
-- `options.rows`, `options.cols`: matrix dimensions
-
-Internally uploads in ~16 MB chunks. Uses a staging buffer if data exceeds `max_buffer_size`. Errors if dimensions exceed `max_texture_dimension_2d`.
-
-### `viewer.beginData(options)`
-Begin a streaming upload. Allocates GPU buffer (full or staging-sized).
-- `options.rows`, `options.cols`: final matrix dimensions
-
-### `viewer.appendChunk(data, startRow)`
-Append rows to an in-progress upload.
-- `data`: `Float32Array` containing a whole number of rows
-- `startRow`: zero-based starting row index (must be sequential)
-
-### `viewer.endData()`
-Finalise a streaming upload. Errors if not all rows have been appended.
-
-### `viewer.setColormap(name)`
-Change colormap. Options: `'viridis'` `'inferno'` `'magma'` `'plasma'` `'cividis'` `'grayscale'`.
-
-Errors if the current matrix was loaded via staged upload (reload data after changing colormap).
-
-### `viewer.setRange(min, max)`
-Override auto-detected data range.
-
-### `viewer.onHover(callback)`
-Register `(row, col, value) => void` for hover events.
-
-### `viewer.getMaxTextureDimension(): number`
-Maximum rows or cols this device supports. Matrices exceeding this fail at pipeline build time.
-
-### `viewer.getMaxMatrixElements(): number`
-Maximum total elements (rows × cols) fitting in a single GPU buffer.
-
-### `viewer.destroy()`
-Clean up GPU resources and event listeners.
-
-## Available Colormaps
-
-| Name | Description |
-|------|-------------|
-| `viridis` | Perceptually uniform, colorblind-friendly (purple → teal → yellow) |
-| `inferno` | Dark to bright (black → purple → orange → yellow) |
-| `magma` | Dark to bright (black → purple → pink → light yellow) |
-| `plasma` | Blue → purple → orange → yellow |
-| `cividis` | Optimised for colour vision deficiency (blue → gray-green → yellow) |
-| `grayscale` | Simple black to white |
-
-## Development Setup
-
-### 1. Install Prerequisites
-
-**Rust** (if not already installed):
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
-
-**WASM target + wasm-pack**:
-```bash
-rustup target add wasm32-unknown-unknown
-cargo install wasm-pack
-```
-
-**Node.js 18+** — install via your package manager or [nvm](https://github.com/nvm-sh/nvm).
-
-### 2. Install Node Dependencies
+All examples require the WASM build first:
 
 ```bash
-npm install
+npm run build:wasm
 ```
 
-### 3. Build & Run the Example
+### Basic
+
+Generates a sine-wave matrix in JavaScript. Demonstrates colormap switching, size selection, hover tooltips, and optional streaming mode.
 
 ```bash
-# Build the WASM package
-wasm-pack build --target web --release
-
-# Serve from repo root (so ../../pkg/ resolves correctly)
-npx http-server . -p 8080 -o /examples/basic/
+npm run dev
+# Open http://localhost:8080/examples/basic/
 ```
 
-Open `http://localhost:8080/examples/basic/` in a WebGPU-capable browser (Chrome 113+).
+### GPU Generation
 
-### 4. Build Commands
+Generates the matrix entirely on the GPU via a WebGPU compute shader, then passes the result to LeibnizFast. Eliminates the JS CPU bottleneck for large matrices.
 
 ```bash
-npm run build          # Full build (WASM + JS bundle)
-npm run build:wasm     # WASM only
-npm run build:js       # JS/TS only
-npm run dev            # Build + serve example at localhost:8080
+npm run dev
+# Open http://localhost:8080/examples/gpu-gen/
 ```
 
-### 5. Test & Lint
+### Waterfall
+
+Live scrolling waterfall display. A C++ generator simulates spatial-temporal sensor data at a fixed sampling rate, streams it via ZeroMQ to a Python bridge, which broadcasts over WebSocket to the browser.
+
+**Dependencies:** `libzmq`, Python packages `pyzmq` and `websockets`.
 
 ```bash
-cargo test                        # 42 Rust unit tests
-cargo fmt --check                 # Rust formatting
-cargo clippy -- -D warnings       # Rust linting
-npx prettier --check js/          # TypeScript formatting
-npx eslint js/                    # TypeScript linting
+# Terminal 1 — Python bridge
+pip install pyzmq websockets
+python examples/waterfall/bridge.py
+
+# Terminal 2 — C++ generator
+g++ -std=c++17 -O2 -o generator examples/waterfall/generator.cpp -lzmq
+./generator
+
+# Terminal 3 — Web server
+npm run dev
+# Open http://localhost:8080/examples/waterfall/
 ```
 
-## Architecture
+### C++ Live Stream (Wave Equation)
 
-```
-JS (Float32Array) → WASM (Rust) → GPU buffers
-                                  ↓
-                    Compute shader: apply colormap → RGBA texture
-                                  ↓
-                    Render pass: textured quad with camera transform → canvas
-```
+Solves a 2D wave equation in C++ and streams live frames to the browser. Supports chunked transmission and optional zlib compression.
 
-### Chunked upload flow
+**Dependencies:** `libzmq`, `zlib`, Python packages `pyzmq` and `websockets`.
 
-```
-setData(data, rows, cols)
-  └─ MatrixView::with_empty_buffer()   ← pre-allocates GPU buffer (full or staging)
-  └─ ChunkedUploader (auto ~16 MB chunks, 16-row aligned)
-       └─ MatrixData::append_rows()    ← updates running min/max on CPU
-       └─ MatrixView::write_chunk()    ← queue.write_buffer() at byte offset
-  └─ [staging: apply_colormap_staged() ← per-chunk compute dispatch]
-  └─ MatrixData::finalize()            ← NaN edge-case handling
-  └─ MatrixView::update_params()       ← final min/max → params uniform
-  └─ rebuild_pipelines()
-  └─ render_frame()
+```bash
+# Terminal 1 — Python bridge
+pip install pyzmq websockets
+python examples/cpp-stream/bridge.py
+
+# Terminal 2 — C++ generator
+g++ -std=c++17 -O2 -o generator examples/cpp-stream/generator.cpp -lzmq -lz
+./generator                  # plain mode
+./generator --compress       # zlib compression (~4x smaller, ~2x FPS)
+./generator --size 4096      # larger grid
+
+# Terminal 3 — Web server
+npm run dev
+# Open http://localhost:8080/examples/cpp-stream/
 ```
 
-The compute shader only re-runs when data or colormap changes. Pan/zoom only updates a camera uniform in the fragment shader, making viewport changes nearly free.
+## Browser Support
+
+WebGPU (compute shader path): Chrome 113+, Edge 113+, Firefox Nightly (flag), Safari Technology Preview.
+
+Falls back to WebGL2 with CPU-side colormapping when WebGPU is unavailable.
 
 ## License
 

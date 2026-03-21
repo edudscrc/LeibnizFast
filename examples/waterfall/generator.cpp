@@ -1,8 +1,9 @@
 /*
- * generator.cpp — DAS (Distributed Acoustic Sensing) data generator → ZeroMQ PUSH
+ * generator.cpp — Spatial-temporal data generator → ZeroMQ PUSH
  *
- * Simulates a DAS acquisition system streaming float32 column data over ZMQ.
- * A Python bridge (bridge.py) relays messages to WebSocket clients.
+ * Simulates a sensor array acquiring spatial-temporal data and streaming
+ * float32 columns over ZMQ. A Python bridge (bridge.py) relays messages
+ * to WebSocket clients.
  *
  * Two ZMQ sockets:
  *   tcp://127.0.0.1:5555  PUSH — binary column data out to bridge
@@ -19,10 +20,10 @@
  *   Offset 16: float32[rows × new_cols]  column data (each column contiguous)
  *
  * Data model:
- *   - DAQ acquires int8 samples at `sampling_rate` MHz over a round-trip fiber segment
- *   - int8 cast to float32 and normalized by 128.0 → range [-0.992, 0.992]
+ *   - Sensor acquires samples at `sampling_rate` MHz over a spatial extent
+ *   - Samples normalized to float32 range [-0.992, 0.992]
  *   - Spatial downsampling by `spatial_downsample` (integer step)
- *   - rows = ceil(round(sampling_rate_MHz × 1e6 × 2 × fiber_length / v) / spatial_downsample)
+ *   - rows = ceil(round(sampling_rate_MHz × 1e6 × 2 × spatial_extent / propagation_velocity) / spatial_downsample)
  *   - cols_per_msg = round(repetition_rate_Hz × time_buffer_s)
  *   - msg_interval_ns = round(time_buffer_s × 1e9)
  *
@@ -30,11 +31,11 @@
  *   g++ -std=c++17 -O2 -o generator generator.cpp -lzmq
  *
  * Run:
- *   ./generator                                              # defaults: 400 MHz, 10–20 km fiber, ds=5
- *   ./generator --fiber-start 5000 --fiber-end 15000        # 10 km segment starting at 5 km
- *   ./generator --sampling-rate 200 --spatial-downsample 10 # lower resolution
- *   ./generator --repetition-rate 5000 --time-buffer 0.4    # slower pulse rate, larger batches
- *   ./generator --debug                                      # per-message timing
+ *   ./generator                                                    # defaults
+ *   ./generator --spatial-start 5000 --spatial-end 15000           # custom spatial range
+ *   ./generator --sampling-rate 200 --spatial-downsample 10        # lower resolution
+ *   ./generator --repetition-rate 5000 --time-buffer 0.4           # slower rate, larger batches
+ *   ./generator --debug                                            # per-message timing
  */
 
 #include <zmq.h>
@@ -60,10 +61,8 @@
 static constexpr uint32_t WATERFALL_MAGIC = 0x4C465A10u;
 static constexpr int HEADER_BYTES = 16;  // 4 × uint32
 
-// Speed of light and fiber refractive index
-static constexpr double C_LIGHT = 3.0e8;   // m/s
-static constexpr double N_FIBER = 1.4682;  // silica single-mode fiber
-static constexpr double V_FIBER = C_LIGHT / N_FIBER;  // ~2.0432e8 m/s
+// Propagation velocity for round-trip spatial sampling (m/s)
+static constexpr double PROPAGATION_VELOCITY = 2.0432e8;
 
 // ADC normalization: int8 [-127,127] → float [-0.992, 0.992]
 static constexpr float ADC_NORM = 1.0f / 128.0f;
@@ -88,9 +87,9 @@ struct Impulse {
   bool active;
 };
 
-// ---- Persistent fiber events (sine-modulated signals at fixed rows) ------
+// ---- Persistent spatial signals (sine-modulated at fixed rows) -----------
 
-struct FiberEvent {
+struct PersistentSignal {
   int row_center;
   int row_span;
   float base_amplitude;
@@ -100,8 +99,8 @@ struct FiberEvent {
 // ---- Main ----------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
-  double fiber_start_m      = 10000.0;  // meters
-  double fiber_end_m        = 20000.0;  // meters
+  double spatial_start_m    = 10000.0;  // meters
+  double spatial_end_m      = 20000.0;  // meters
   int    sampling_rate_mhz  = 400;      // MHz
   int    repetition_rate_hz = 10000;    // Hz
   int    spatial_downsample = 5;        // integer step
@@ -110,16 +109,16 @@ int main(int argc, char* argv[]) {
 
   for (int a = 1; a < argc; ++a) {
     const std::string arg(argv[a]);
-    if (arg == "--fiber-start" && a + 1 < argc) {
-      fiber_start_m = std::stod(argv[++a]);
-      if (fiber_start_m < 0.0 || fiber_start_m > 1.0e6) {
-        std::cerr << "fiber-start must be 0..1000000 m\n";
+    if (arg == "--spatial-start" && a + 1 < argc) {
+      spatial_start_m = std::stod(argv[++a]);
+      if (spatial_start_m < 0.0 || spatial_start_m > 1.0e6) {
+        std::cerr << "spatial-start must be 0..1000000 m\n";
         return 1;
       }
-    } else if (arg == "--fiber-end" && a + 1 < argc) {
-      fiber_end_m = std::stod(argv[++a]);
-      if (fiber_end_m < 1.0 || fiber_end_m > 1.0e6) {
-        std::cerr << "fiber-end must be 1..1000000 m\n";
+    } else if (arg == "--spatial-end" && a + 1 < argc) {
+      spatial_end_m = std::stod(argv[++a]);
+      if (spatial_end_m < 1.0 || spatial_end_m > 1.0e6) {
+        std::cerr << "spatial-end must be 1..1000000 m\n";
         return 1;
       }
     } else if (arg == "--sampling-rate" && a + 1 < argc) {
@@ -151,16 +150,16 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  if (fiber_end_m <= fiber_start_m) {
-    std::cerr << "fiber-end must be greater than fiber-start\n";
+  if (spatial_end_m <= spatial_start_m) {
+    std::cerr << "spatial-end must be greater than spatial-start\n";
     return 1;
   }
 
-  // ---- DAS physics computation -------------------------------------------
+  // ---- Spatial sampling computation --------------------------------------
 
-  const double fiber_length_m     = fiber_end_m - fiber_start_m;
-  const double round_trip_time_s  = 2.0 * fiber_length_m / V_FIBER;
-  const int    points_per_segment = static_cast<int>(
+  const double spatial_extent_m    = spatial_end_m - spatial_start_m;
+  const double round_trip_time_s   = 2.0 * spatial_extent_m / PROPAGATION_VELOCITY;
+  const int    points_per_segment  = static_cast<int>(
       std::round(sampling_rate_mhz * 1.0e6 * round_trip_time_s));
   const int    rows_init = static_cast<int>(
       std::ceil(static_cast<double>(points_per_segment) / spatial_downsample));
@@ -174,7 +173,7 @@ int main(int argc, char* argv[]) {
 
   if (rows_init < 1) {
     std::cerr << "Computed spatial rows=" << rows_init
-              << " is too small. Check fiber length and sampling rate.\n";
+              << " is too small. Check spatial extent and sampling rate.\n";
     return 1;
   }
   if (cols_per_msg < 1) {
@@ -186,14 +185,14 @@ int main(int argc, char* argv[]) {
   // Mutable row count — updated by resize control messages at runtime
   int rows = rows_init;
 
-  std::cout << "DAS Waterfall Generator\n"
-            << "  Fiber:          " << fiber_start_m << " – " << fiber_end_m << " m\n"
-            << "  Fiber length:   " << fiber_length_m << " m\n"
-            << "  v (in fiber):   " << (V_FIBER / 1.0e6) << " × 10⁶ m/s\n"
-            << "  Round-trip:     " << (round_trip_time_s * 1.0e6) << " µs\n"
+  std::cout << "Waterfall Generator\n"
+            << "  Spatial range:  " << spatial_start_m << " – " << spatial_end_m << " m\n"
+            << "  Spatial extent: " << spatial_extent_m << " m\n"
+            << "  Propagation v:  " << (PROPAGATION_VELOCITY / 1.0e6) << " × 10\u2076 m/s\n"
+            << "  Round-trip:     " << (round_trip_time_s * 1.0e6) << " \u00b5s\n"
             << "  Sampling rate:  " << sampling_rate_mhz << " MHz\n"
             << "  Points/segment: " << points_per_segment << "\n"
-            << "  Spatial DS:     " << spatial_downsample << "×\n"
+            << "  Spatial DS:     " << spatial_downsample << "\u00d7\n"
             << "  Spatial rows:   " << rows << "\n"
             << "  Repetition rt:  " << repetition_rate_hz << " Hz\n"
             << "  Time buffer:    " << (time_buffer_s * 1000.0) << " ms\n"
@@ -214,32 +213,32 @@ int main(int argc, char* argv[]) {
   std::uniform_int_distribution<int> span_dist(5, std::max(5, rows / 10));
   std::uniform_real_distribution<float> trigger_dist(0.0f, 1.0f);
 
-  // ---- Initialize persistent fiber events ------------------------------
+  // ---- Initialize persistent spatial signals ----------------------------
   //
-  // Events are anchored to absolute fiber distances (meters) so they stay
+  // Signals are anchored to absolute spatial positions (meters) so they stay
   // physically consistent when the spatial resolution changes via resize.
 
-  const int n_fiber_events = 4;
-  // Four events at 20/40/60/80% of the fiber segment length
-  const std::array<double, 4> EVENT_DIST_M = {
-      fiber_start_m + fiber_length_m * 0.2,
-      fiber_start_m + fiber_length_m * 0.4,
-      fiber_start_m + fiber_length_m * 0.6,
-      fiber_start_m + fiber_length_m * 0.8,
+  const int n_signals = 4;
+  // Four signals at 20/40/60/80% of the spatial extent
+  const std::array<double, 4> SIGNAL_POS_M = {
+      spatial_start_m + spatial_extent_m * 0.2,
+      spatial_start_m + spatial_extent_m * 0.4,
+      spatial_start_m + spatial_extent_m * 0.6,
+      spatial_start_m + spatial_extent_m * 0.8,
   };
 
-  // Project absolute fiber distance to row index for current `rows`
-  auto event_row = [&](double dist_m) -> int {
+  // Project absolute spatial position to row index for current `rows`
+  auto signal_row = [&](double pos_m) -> int {
     return static_cast<int>(std::round(
-        (dist_m - fiber_start_m) / fiber_length_m * rows));
+        (pos_m - spatial_start_m) / spatial_extent_m * rows));
   };
 
-  std::vector<FiberEvent> fiber_events(n_fiber_events);
-  for (int i = 0; i < n_fiber_events; i++) {
-    fiber_events[i].row_center     = event_row(EVENT_DIST_M[i]);
-    fiber_events[i].row_span       = std::max(3, rows / 20);
-    fiber_events[i].base_amplitude = 0.3f + 0.2f * (i % 2);
-    fiber_events[i].freq           = 0.02f + 0.01f * i;
+  std::vector<PersistentSignal> signals(n_signals);
+  for (int i = 0; i < n_signals; i++) {
+    signals[i].row_center     = signal_row(SIGNAL_POS_M[i]);
+    signals[i].row_span       = std::max(3, rows / 20);
+    signals[i].base_amplitude = 0.3f + 0.2f * (i % 2);
+    signals[i].freq           = 0.02f + 0.01f * i;
   }
 
   // ---- Initialize impulse array ----------------------------------------
@@ -323,12 +322,12 @@ int main(int argc, char* argv[]) {
       if (new_rows >= 4 && new_rows <= 65536 &&
           static_cast<int>(new_rows) != rows) {
         rows = static_cast<int>(new_rows);
-        std::cout << "Resize → rows=" << rows << "\n" << std::flush;
+        std::cout << "Resize \u2192 rows=" << rows << "\n" << std::flush;
 
-        // Reproject fiber events to new row resolution
-        for (int i = 0; i < n_fiber_events; i++) {
-          fiber_events[i].row_center = event_row(EVENT_DIST_M[i]);
-          fiber_events[i].row_span   = std::max(3, rows / 20);
+        // Reproject signals to new row resolution
+        for (int i = 0; i < n_signals; i++) {
+          signals[i].row_center = signal_row(SIGNAL_POS_M[i]);
+          signals[i].row_span   = std::max(3, rows / 20);
         }
         row_dist  = std::uniform_int_distribution<int>(0, rows - 1);
         span_dist = std::uniform_int_distribution<int>(5, std::max(5, rows / 10));
@@ -351,19 +350,19 @@ int main(int argc, char* argv[]) {
     for (int c = 0; c < cols_per_msg; c++) {
       float* col = col_buf.data() + static_cast<size_t>(c) * rows;
 
-      // Base: int8 ADC noise floor, normalized to float32
+      // Base: noise floor (int8 ADC range normalized to float32)
       for (int r = 0; r < rows; r++) {
         col[r] = static_cast<float>(noise_dist(rng)) * ADC_NORM;
       }
 
-      // Persistent fiber events: sine-modulated Gaussian bumps
-      for (const auto& ev : fiber_events) {
+      // Persistent spatial signals: sine-modulated Gaussian bumps
+      for (const auto& sig : signals) {
         float amp =
-            ev.base_amplitude *
-            (0.5f + 0.5f * std::sin(static_cast<float>(col_index + c) * ev.freq));
-        for (int r = std::max(0, ev.row_center - ev.row_span);
-             r < std::min(rows, ev.row_center + ev.row_span); r++) {
-          float dist = static_cast<float>(r - ev.row_center) / ev.row_span;
+            sig.base_amplitude *
+            (0.5f + 0.5f * std::sin(static_cast<float>(col_index + c) * sig.freq));
+        for (int r = std::max(0, sig.row_center - sig.row_span);
+             r < std::min(rows, sig.row_center + sig.row_span); r++) {
+          float dist = static_cast<float>(r - sig.row_center) / sig.row_span;
           col[r] += amp * std::exp(-dist * dist * 2.0f);
         }
       }
@@ -402,7 +401,7 @@ int main(int argc, char* argv[]) {
         imp.age++;
       }
 
-      // Clamp to [-1, 1] (mirrors physical ADC saturation)
+      // Clamp to [-1, 1] (mirrors ADC saturation)
       for (int r = 0; r < rows; r++) {
         col[r] = std::max(-1.0f, std::min(1.0f, col[r]));
       }

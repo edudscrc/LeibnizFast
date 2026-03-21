@@ -158,4 +158,40 @@ mod tests {
         let result = state.mouse_move(200.0, 200.0);
         assert_eq!(result, InteractionResult::Hover);
     }
+
+    #[test]
+    fn test_double_mouse_down_resets_drag_origin() {
+        let mut state = InteractionState::new();
+        state.mouse_down(100.0, 200.0);
+        // Second mouse_down before mouse_up → resets drag anchor
+        state.mouse_down(500.0, 600.0);
+
+        let result = state.mouse_move(510.0, 610.0);
+        assert_eq!(
+            result,
+            InteractionResult::Pan { dx: 10.0, dy: 10.0 },
+            "Delta should be relative to second mouse_down"
+        );
+    }
+
+    #[test]
+    fn test_mouse_up_while_idle_is_noop() {
+        let mut state = InteractionState::new();
+        state.mouse_up();
+        assert!(matches!(state, InteractionState::Idle));
+    }
+
+    #[test]
+    fn test_drag_zero_delta() {
+        let mut state = InteractionState::new();
+        state.mouse_down(100.0, 200.0);
+        let result = state.mouse_move(100.0, 200.0);
+        assert_eq!(result, InteractionResult::Pan { dx: 0.0, dy: 0.0 });
+    }
+
+    #[test]
+    fn test_default_trait() {
+        let state = InteractionState::default();
+        assert!(matches!(state, InteractionState::Idle));
+    }
 }

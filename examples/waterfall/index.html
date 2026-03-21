@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>LeibnizFast — DAS Waterfall</title>
+  <title>LeibnizFast — Waterfall</title>
   <style>
     * {
       margin: 0;
@@ -150,13 +150,13 @@
 
 <body>
   <div class="container">
-    <h1>LeibnizFast — DAS Waterfall</h1>
+    <h1>LeibnizFast — Waterfall</h1>
     <p class="note">
-      Simulated DAS (Distributed Acoustic Sensing) acquisition streamed from
-      a C++ generator over ZeroMQ to a Python WebSocket bridge. The generator
-      models a fiber segment with physics-based parameters (sampling rate,
-      repetition rate, spatial downsampling). New data appears on the right;
-      old data scrolls left. Pan and zoom to explore; hover for per-cell values.
+      Simulated spatial-temporal data acquisition streamed from a C++ generator
+      over ZeroMQ to a Python WebSocket bridge. The generator produces signal
+      data at a fixed sampling rate with configurable spatial resolution.
+      New data appears on the right; old data scrolls left.
+      Pan and zoom to explore; hover for per-cell values.
     </p>
 
     <!-- Connection status + FPS + Data rate -->
@@ -204,7 +204,7 @@
       </label>
     </div>
 
-    <div id="das-stats" style="display:flex; gap:20px; font-size:0.82rem; color:#aab; font-family:monospace; padding:2px 0">
+    <div id="signal-stats" style="display:flex; gap:20px; font-size:0.82rem; color:#aab; font-family:monospace; padding:2px 0">
       <span id="stat-rows">Rows: –</span>
       <span id="stat-cols">Cols/msg: –</span>
       <span id="stat-rate">Rate: – MB/s</span>
@@ -228,9 +228,9 @@
 
     Run (three terminals):
       python bridge.py                                              # terminal 1
-      ./generator                                                   # terminal 2 (defaults: 400 MHz, 10–20 km fiber, ds=5)
-      ./generator --fiber-start 10000 --fiber-end 20000            # explicit fiber range
-      ./generator --spatial-downsample 10                          # lower resolution (fewer rows)
+      ./generator                                                   # terminal 2 (defaults: ds=5)
+      ./generator --spatial-start 10000 --spatial-end 20000         # explicit spatial range
+      ./generator --spatial-downsample 10                           # lower resolution (fewer rows)
       npm run dev (project root)                                    # terminal 3
 
     Then open: http://localhost:8080/examples/waterfall/

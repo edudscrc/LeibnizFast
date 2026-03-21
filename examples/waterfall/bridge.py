@@ -1,7 +1,7 @@
 """
 bridge.py — ZeroMQ PULL → WebSocket broadcast bridge.
 
-Receives binary messages from the C++ DAS generator over ZMQ PUSH/PULL and
+Receives binary messages from the C++ data generator over ZMQ PUSH/PULL and
 rebroadcasts each message verbatim (binary) to all connected WebSocket
 clients. Also forwards control commands from browser clients back to the
 generator via a second ZMQ PUSH socket.

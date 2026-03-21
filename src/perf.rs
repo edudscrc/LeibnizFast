@@ -7,12 +7,12 @@
 /// Get the current high-resolution timestamp in milliseconds.
 ///
 /// Uses `performance.now()` from the Web Performance API.
+/// Returns `0.0` if the browser APIs are unavailable (e.g. in a worker
+/// without a global `window`).
 fn now_ms() -> f64 {
     web_sys::window()
-        .expect("no window")
-        .performance()
-        .expect("no performance")
-        .now()
+        .and_then(|w| w.performance())
+        .map_or(0.0, |p| p.now())
 }
 
 /// Lightweight performance timer that logs elapsed time on `finish()`.

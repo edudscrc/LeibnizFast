@@ -20,6 +20,15 @@ pub struct CameraUniforms {
     pub uv_scale: [f32; 2],
 }
 
+/// Scroll-to-zoom conversion factor (how much one scroll tick zooms).
+const ZOOM_SENSITIVITY: f32 = 0.001;
+
+/// Minimum zoom level (1.0 = full matrix visible).
+const MIN_ZOOM: f32 = 1.0;
+
+/// Maximum zoom level (1000x magnification).
+const MAX_ZOOM: f32 = 1000.0;
+
 /// Pure math camera state — no GPU dependency, fully unit-testable.
 ///
 /// The camera defines a viewport over the matrix in UV coordinates [0,1]².
@@ -93,8 +102,8 @@ impl CameraState {
         let uv_before = self.screen_to_uv(screen_x, screen_y);
 
         // Apply zoom (exponential for smooth feel)
-        let zoom_factor = 1.0 + delta * 0.001;
-        self.zoom = (self.zoom * zoom_factor).clamp(1.0, 1000.0);
+        let zoom_factor = 1.0 + delta * ZOOM_SENSITIVITY;
+        self.zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
 
         // Convert same screen position to UV after zoom
         let uv_after = self.screen_to_uv(screen_x, screen_y);
@@ -322,6 +331,55 @@ mod tests {
     fn test_zoom_clamp_minimum() {
         let mut cam = CameraState::new(800.0, 600.0);
         cam.zoom_at(400.0, 300.0, -10000.0);
-        assert!((cam.zoom - 1.0).abs() < 1e-6);
+        assert!((cam.zoom - MIN_ZOOM).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_zoom_clamp_maximum() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        // Zoom in with a massive delta to hit the ceiling
+        cam.zoom_at(400.0, 300.0, 1_000_000.0);
+        assert!((cam.zoom - MAX_ZOOM).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_set_canvas_size() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.set_canvas_size(1920.0, 1080.0);
+
+        // screen_to_uv at bottom-right of new canvas should map to (1,1)
+        let (u, v) = cam.screen_to_uv(1920.0, 1080.0);
+        assert!((u - 1.0).abs() < 1e-6);
+        assert!((v - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_set_matrix_size() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.set_matrix_size(500, 1000);
+
+        // screen_to_matrix should use the new dimensions
+        let result = cam.screen_to_matrix(400.0, 300.0, 500, 1000);
+        assert_eq!(result, Some((250, 500)));
+    }
+
+    #[test]
+    fn test_pan_zero_delta() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom = 4.0;
+        let center_before = cam.center;
+
+        cam.pan(0.0, 0.0);
+
+        assert!((cam.center.0 - center_before.0).abs() < 1e-6);
+        assert!((cam.center.1 - center_before.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_screen_to_matrix_bottom_right_edge() {
+        let cam = CameraState::new(800.0, 600.0);
+        // Exactly at the bottom-right edge → should be None (exclusive)
+        let result = cam.screen_to_matrix(800.0, 600.0, 100, 200);
+        assert_eq!(result, None);
     }
 }

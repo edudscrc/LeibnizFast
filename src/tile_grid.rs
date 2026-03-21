@@ -275,4 +275,49 @@ mod tests {
         let count = g.iter_tiles().count();
         assert_eq!(count, g.tile_count());
     }
+
+    #[test]
+    fn test_single_row_matrix() {
+        let g = TileGrid::new(1, 10000, 8192);
+        assert!(g.needs_tiling());
+        assert_eq!(g.tiles_x, 2);
+        assert_eq!(g.tiles_y, 1);
+        assert_eq!(g.tile_height(0), 1);
+        check_partitions(&g);
+    }
+
+    #[test]
+    fn test_single_column_matrix() {
+        let g = TileGrid::new(10000, 1, 8192);
+        assert!(g.needs_tiling());
+        assert_eq!(g.tiles_x, 1);
+        assert_eq!(g.tiles_y, 2);
+        assert_eq!(g.tile_width(0), 1);
+        check_partitions(&g);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_dim must be > 0")]
+    fn test_max_dim_zero_panics() {
+        TileGrid::new(100, 100, 0);
+    }
+
+    #[test]
+    fn test_uv_sizes_sum_to_one() {
+        let g = TileGrid::new(16000, 24000, 8192);
+        let col_sum: f32 = (0..g.tiles_x).map(|tx| g.col_uv_size(tx)).sum();
+        let row_sum: f32 = (0..g.tiles_y).map(|ty| g.row_uv_size(ty)).sum();
+        assert!((col_sum - 1.0).abs() < 1e-5, "col UV sum = {col_sum}");
+        assert!((row_sum - 1.0).abs() < 1e-5, "row UV sum = {row_sum}");
+    }
+
+    #[test]
+    fn test_one_by_one_matrix() {
+        let g = TileGrid::new(1, 1, 8192);
+        assert!(!g.needs_tiling());
+        assert_eq!(g.tile_count(), 1);
+        assert_eq!(g.tile_width(0), 1);
+        assert_eq!(g.tile_height(0), 1);
+        check_partitions(&g);
+    }
 }

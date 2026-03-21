@@ -14,6 +14,7 @@
 //! with UV coordinates mapped to that tile's region of the full matrix.
 
 use crate::camera::Camera;
+use crate::chunked_upload::WORKGROUP_ALIGNMENT;
 use crate::colormap::ColormapTexture;
 use crate::matrix::{MatrixParams, MatrixView};
 use crate::perf::PerfTimer;
@@ -634,7 +635,11 @@ impl Renderer {
                     });
                     pass.set_pipeline(compute_pipeline);
                     pass.set_bind_group(0, bind_group, &[]);
-                    pass.dispatch_workgroups((tile_w + 15) / 16, (chunk_rows + 15) / 16, 1);
+                    pass.dispatch_workgroups(
+                        (tile_w + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                        (chunk_rows + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                        1,
+                    );
                 }
                 self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -724,7 +729,11 @@ impl Renderer {
                     });
                     pass.set_pipeline(compute_pipeline);
                     pass.set_bind_group(0, bind_group, &[]);
-                    pass.dispatch_workgroups((tile_w + 15) / 16, (local_chunk_rows + 15) / 16, 1);
+                    pass.dispatch_workgroups(
+                        (tile_w + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                        (local_chunk_rows + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                        1,
+                    );
                 }
                 self.queue.submit(std::iter::once(encoder.finish()));
             }

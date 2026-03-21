@@ -434,7 +434,9 @@ mod wasm_entry {
 
             if same_dims {
                 // Fast path: reuse existing resources — no allocation, no pipeline rebuild
-                let mut js_data = self.js_data.take().unwrap();
+                let mut js_data = self.js_data.take().ok_or_else(|| {
+                    JsValue::from_str("begin_update: js_data missing despite same_dims check")
+                })?;
                 if let Some((min, max)) = self.sticky_range {
                     js_data.set_range(min, max);
                 } else {
@@ -475,6 +477,7 @@ mod wasm_entry {
         /// refresh rate via `requestAnimationFrame`.
         #[wasm_bindgen]
         pub fn render(&mut self) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("render", self.debug);
             self.render_frame()
         }
 
@@ -626,6 +629,7 @@ mod wasm_entry {
         /// Handle mouse move event. Called from JS event listeners.
         #[wasm_bindgen(js_name = onMouseMove)]
         pub fn on_mouse_move(&mut self, x: f32, y: f32) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("on_mouse_move", self.debug);
             match self.interaction.mouse_move(x, y) {
                 interaction::InteractionResult::Pan { dx, dy } => {
                     self.camera.state.pan(dx, dy);
@@ -649,6 +653,7 @@ mod wasm_entry {
         /// Handle wheel/scroll event for zooming. Called from JS event listeners.
         #[wasm_bindgen(js_name = onWheel)]
         pub fn on_wheel(&mut self, x: f32, y: f32, delta: f32) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("on_wheel", self.debug);
             self.camera.state.zoom_at(x, y, delta);
             self.camera.update_uniform(&self.renderer.queue);
             self.render_frame()?;
@@ -658,6 +663,7 @@ mod wasm_entry {
         /// Resize the canvas and update the rendering surface.
         #[wasm_bindgen]
         pub fn resize(&mut self, width: u32, height: u32) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("resize", self.debug);
             self.camera
                 .state
                 .set_canvas_size(width as f32, height as f32);

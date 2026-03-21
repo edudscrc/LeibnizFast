@@ -1,8 +1,8 @@
 /**
- * main.js — WebSocket client for the DAS waterfall example.
+ * main.js — WebSocket client for the waterfall example.
  *
  * Connects to the Python bridge (bridge.py) over WebSocket, receives
- * binary column data from the C++ DAS generator, and renders a scrolling
+ * binary column data from the C++ generator, and renders a scrolling
  * waterfall plot using LeibnizFast.
  *
  * Protocol — waterfall v1 (magic 0x4C465A10, 16-byte header):
@@ -43,49 +43,47 @@ const WS_URL       = 'ws://localhost:8765';
 const RECONNECT_MS = 2000;
 const FPS_WINDOW   = 10;
 
-// ---- DAS Physics Constants (must match generator CLI defaults) ----------
+// ---- Signal Parameters (must match generator CLI defaults) --------------
 // NOTE: Keep these in sync with generator.cpp defaults.
 
-const C_LIGHT            = 3e8;            // m/s
-const N_FIBER            = 1.4682;         // silica fiber refractive index
-const V_FIBER            = C_LIGHT / N_FIBER;  // ~2.0432e8 m/s
-const FIBER_START_M      = 10000;          // m  (matches --fiber-start default)
-const FIBER_END_M        = 20000;          // m  (matches --fiber-end default)
-const SAMPLING_RATE_MHZ  = 400;            // MHz (matches --sampling-rate default)
-const REPETITION_RATE_HZ = 10000;          // Hz (matches --repetition-rate default)
-const TIME_BUFFER_S      = 0.2;            // s  (matches --time-buffer default)
-const BRIDGE_MAX_ROWS    = 65536;
+const PROPAGATION_VELOCITY = 2.0432e8;  // m/s
+const SPATIAL_START_M      = 10000;     // m  (matches --spatial-start default)
+const SPATIAL_END_M        = 20000;     // m  (matches --spatial-end default)
+const SAMPLING_RATE_MHZ    = 400;       // MHz (matches --sampling-rate default)
+const REPETITION_RATE_HZ   = 10000;     // Hz (matches --repetition-rate default)
+const TIME_BUFFER_S        = 0.2;       // s  (matches --time-buffer default)
+const BRIDGE_MAX_ROWS      = 65536;
 
 /**
  * Compute spatial row count from spatial downsampling factor.
  * @param {number} ds - integer downsampling step (>= 1)
  * @returns {number}
  */
-function computeDasRows(ds) {
-  const fiberLength   = FIBER_END_M - FIBER_START_M;
-  const roundTripTime = 2.0 * fiberLength / V_FIBER;
+function computeSpatialRows(ds) {
+  const spatialExtent = SPATIAL_END_M - SPATIAL_START_M;
+  const roundTripTime = 2.0 * spatialExtent / PROPAGATION_VELOCITY;
   const pointsPerSeg  = Math.round(SAMPLING_RATE_MHZ * 1e6 * roundTripTime);
   return Math.ceil(pointsPerSeg / ds);
 }
 
 /**
- * Compute derived DAS stats for a given downsampling factor.
+ * Compute derived stats for a given downsampling factor.
  * @param {number} ds
  * @returns {{ rows: number, colsPerMsg: number, rateMbs: number }}
  */
-function computeDasStats(ds) {
-  const rows       = computeDasRows(ds);
+function computeStats(ds) {
+  const rows       = computeSpatialRows(ds);
   const colsPerMsg = Math.round(REPETITION_RATE_HZ * TIME_BUFFER_S);
   const rateMbs    = (rows * colsPerMsg * 4 * (1.0 / TIME_BUFFER_S)) / 1e6;
   return { rows, colsPerMsg, rateMbs };
 }
 
 /**
- * Update the DAS computed stats display in the UI.
+ * Update the computed stats display in the UI.
  * @param {number} ds
  */
-function updateDasStats(ds) {
-  const { rows, colsPerMsg, rateMbs } = computeDasStats(ds);
+function updateStats(ds) {
+  const { rows, colsPerMsg, rateMbs } = computeStats(ds);
   document.getElementById('stat-rows').textContent = `Rows: ${rows.toLocaleString()}`;
   document.getElementById('stat-cols').textContent = `Cols/msg: ${colsPerMsg.toLocaleString()}`;
   document.getElementById('stat-rate').textContent = `Rate: ${rateMbs.toFixed(1)} MB/s`;
@@ -112,7 +110,7 @@ let tLastMessage = 0;  // performance.now() of the last processMessage call
 // Waterfall buffer
 let displayCols = parseInt(displayColsSel.value);
 let spatialDownsample = parseInt(spatialDsInput.value);
-let rows = computeDasRows(spatialDownsample);
+let rows = computeSpatialRows(spatialDownsample);
 
 // ---- Waterfall Buffer --------------------------------------------------
 
@@ -270,7 +268,7 @@ function processMessage(buf) {
   if (h.rows !== buffer.rows) {
     rows = h.rows;
     buffer = new WaterfallBuffer(rows, displayCols);
-    updateDasStats(spatialDownsample);
+    updateStats(spatialDownsample);
   }
 
   // Extract column data from after the header
@@ -385,7 +383,7 @@ async function main() {
   buffer = new WaterfallBuffer(rows, displayCols);
   viewer.setData(buffer.data, rows, displayCols);
   applyRange();
-  updateDasStats(spatialDownsample);
+  updateStats(spatialDownsample);
 
   // Start decoupled render loop
   requestAnimationFrame(renderLoop);
@@ -437,10 +435,10 @@ async function main() {
     const ds = Math.max(1, parseInt(spatialDsInput.value) || 1);
     spatialDsInput.value = ds;
     spatialDownsample = ds;
-    rows = computeDasRows(ds);
+    rows = computeSpatialRows(ds);
     buffer = new WaterfallBuffer(rows, displayCols);
     viewer.setData(buffer.data, rows, displayCols);
-    updateDasStats(ds);
+    updateStats(ds);
     if (rows <= BRIDGE_MAX_ROWS) {
       sendResize(rows);
     } else {

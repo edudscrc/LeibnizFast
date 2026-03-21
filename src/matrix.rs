@@ -64,12 +64,19 @@ impl PagedStorage {
         let mut offset = 0;
         while offset < data.len() {
             // Get or create current page
-            if self.pages.is_empty() || self.pages.last().unwrap().len() == PAGE_SIZE_ELEMENTS {
+            let last_page_full = self
+                .pages
+                .last()
+                .is_none_or(|p| p.len() == PAGE_SIZE_ELEMENTS);
+            if last_page_full {
                 self.pages.push(Vec::with_capacity(
                     PAGE_SIZE_ELEMENTS.min(data.len() - offset + self.current_page_len()),
                 ));
             }
-            let page = self.pages.last_mut().unwrap();
+            // Safety: we just ensured at least one non-full page exists.
+            let Some(page) = self.pages.last_mut() else {
+                break;
+            };
             let space = PAGE_SIZE_ELEMENTS - page.len();
             let to_copy = space.min(data.len() - offset);
             page.extend_from_slice(&data[offset..offset + to_copy]);
@@ -899,5 +906,54 @@ mod tests {
         let max_binding: u32 = u32::MAX; // effectively unlimited
         let budget = compute_staging_budget(max_buffer_size, max_binding);
         assert_eq!(budget, MAX_STAGING_BYTES);
+    }
+
+    // --- Additional edge case tests ---
+
+    #[test]
+    fn test_paged_storage_append_empty_slice() {
+        let mut ps = PagedStorage::new();
+        ps.append(&[]);
+        assert!(ps.is_empty());
+        assert_eq!(ps.len(), 0);
+        assert_eq!(ps.page_count(), 0);
+    }
+
+    #[test]
+    fn test_paged_storage_get_page_out_of_range() {
+        let mut ps = PagedStorage::new();
+        ps.append(&[1.0, 2.0]);
+        assert!(ps.get_page(0).is_some());
+        assert!(ps.get_page(1).is_none());
+    }
+
+    #[test]
+    fn test_matrix_data_empty() {
+        let m = MatrixData::new(vec![], 0, 0);
+        assert_eq!(m.rows(), 0);
+        assert_eq!(m.cols(), 0);
+        assert_eq!(m.get_value(0, 0), None);
+    }
+
+    #[test]
+    fn test_finalize_called_twice() {
+        let mut m = MatrixData::with_capacity(2, 2);
+        m.append_rows(&[1.0, 2.0, 3.0, 4.0]);
+        m.finalize();
+        let range1 = m.range();
+        m.finalize();
+        let range2 = m.range();
+        assert!((range1.0 - range2.0).abs() < 1e-6);
+        assert!((range1.1 - range2.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_matrix_with_infinity_values() {
+        let data = vec![f32::NEG_INFINITY, 1.0, f32::INFINITY, 2.0];
+        let m = MatrixData::new(data, 2, 2);
+        // Infinities are not finite, should be skipped in range computation
+        let (min, max) = m.range();
+        assert!((min - 1.0).abs() < 1e-6);
+        assert!((max - 2.0).abs() < 1e-6);
     }
 }

@@ -16,6 +16,7 @@
  * ```
  */
 
+import type { LeibnizFast as WasmLeibnizFast } from '../pkg/leibniz_fast';
 import type {
   ColormapName,
   CreateOptions,
@@ -58,7 +59,7 @@ async function ensureWasmLoaded(): Promise<
  */
 export class LeibnizFast {
   /** Internal WASM instance */
-  private inner: any;
+  private inner: WasmLeibnizFast;
   /** Canvas element this viewer is attached to */
   private canvas: HTMLCanvasElement;
   /** Performance timing enabled */
@@ -72,7 +73,11 @@ export class LeibnizFast {
     resize: () => void;
   };
 
-  private constructor(inner: any, canvas: HTMLCanvasElement, debug: boolean) {
+  private constructor(
+    inner: WasmLeibnizFast,
+    canvas: HTMLCanvasElement,
+    debug: boolean,
+  ) {
     this.inner = inner;
     this.canvas = canvas;
     this.debug = debug;
@@ -155,12 +160,6 @@ export class LeibnizFast {
     return new LeibnizFast(inner, canvas, debug);
   }
 
-  /**
-   * Set the matrix data to visualize.
-   *
-   * @param data - Flat Float32Array in row-major order
-   * @param options - Matrix dimensions (rows, cols)
-   */
   /** Time a synchronous call, logging duration when debug is enabled. */
   private timeSync<T>(label: string, fn: () => T): T {
     if (!this.debug) return fn();
@@ -170,6 +169,12 @@ export class LeibnizFast {
     return result;
   }
 
+  /**
+   * Set the matrix data to visualize.
+   *
+   * @param data - Flat Float32Array in row-major order
+   * @param options - Matrix dimensions (rows, cols)
+   */
   setData(data: Float32Array, options: DataOptions): void {
     this.timeSync('JS setData', () =>
       this.inner.setData(data, options.rows, options.cols),

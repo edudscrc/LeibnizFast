@@ -7,6 +7,22 @@
 
 use crate::colormap_data;
 
+/// Number of entries in each colormap lookup table.
+#[cfg(target_arch = "wasm32")]
+const COLORMAP_SIZE: u32 = 256;
+
+/// Maximum valid colormap LUT index (0-based).
+const COLORMAP_MAX_INDEX: usize = 255;
+
+/// Float version of `COLORMAP_MAX_INDEX` for normalisation arithmetic.
+const COLORMAP_MAX_INDEX_F32: f32 = 255.0;
+
+/// Number of bytes per pixel in an RGBA image.
+const RGBA_CHANNELS: usize = 4;
+
+/// Fully opaque alpha channel value.
+const RGBA_ALPHA_OPAQUE: u8 = 255;
+
 /// Trait for colormap data resolution — allows testing without GPU.
 ///
 /// Implementations provide RGB lookup tables indexed by colormap name.
@@ -43,7 +59,7 @@ pub fn apply_colormap_cpu(
     lut: &[[u8; 3]; 256],
 ) -> Vec<u8> {
     let range = max_val - min_val;
-    let mut rgba = Vec::with_capacity(data.len() * 4);
+    let mut rgba = Vec::with_capacity(data.len() * RGBA_CHANNELS);
 
     for &value in data {
         let normalized = if range > 0.0 {
@@ -52,14 +68,14 @@ pub fn apply_colormap_cpu(
             0.5
         };
 
-        // Map to LUT index [0, 255]
-        let idx = (normalized * 255.0).round() as usize;
-        let idx = idx.min(255);
+        // Map to LUT index [0, COLORMAP_MAX_INDEX]
+        let idx = (normalized * COLORMAP_MAX_INDEX_F32).round() as usize;
+        let idx = idx.min(COLORMAP_MAX_INDEX);
         let rgb = lut[idx];
         rgba.push(rgb[0]);
         rgba.push(rgb[1]);
         rgba.push(rgb[2]);
-        rgba.push(255);
+        rgba.push(RGBA_ALPHA_OPAQUE);
     }
 
     rgba
@@ -86,18 +102,18 @@ impl ColormapTexture {
     /// Converts the RGB data to RGBA (alpha=255) and uploads to a 256x1 texture.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, rgb_data: &[[u8; 3]; 256]) -> Self {
         // Convert RGB → RGBA for the texture
-        let mut rgba_data = [0u8; 256 * 4];
+        let mut rgba_data = [0u8; COLORMAP_SIZE as usize * RGBA_CHANNELS];
         for (i, rgb) in rgb_data.iter().enumerate() {
-            rgba_data[i * 4] = rgb[0];
-            rgba_data[i * 4 + 1] = rgb[1];
-            rgba_data[i * 4 + 2] = rgb[2];
-            rgba_data[i * 4 + 3] = 255;
+            rgba_data[i * RGBA_CHANNELS] = rgb[0];
+            rgba_data[i * RGBA_CHANNELS + 1] = rgb[1];
+            rgba_data[i * RGBA_CHANNELS + 2] = rgb[2];
+            rgba_data[i * RGBA_CHANNELS + 3] = RGBA_ALPHA_OPAQUE;
         }
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Colormap LUT Texture"),
             size: wgpu::Extent3d {
-                width: 256,
+                width: COLORMAP_SIZE,
                 height: 1,
                 depth_or_array_layers: 1,
             },
@@ -119,11 +135,11 @@ impl ColormapTexture {
             &rgba_data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(256 * 4),
+                bytes_per_row: Some(COLORMAP_SIZE * RGBA_CHANNELS as u32),
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d {
-                width: 256,
+                width: COLORMAP_SIZE,
                 height: 1,
                 depth_or_array_layers: 1,
             },
@@ -239,5 +255,91 @@ mod tests {
         assert_eq!(names.len(), 6);
         assert!(names.contains(&"viridis"));
         assert!(names.contains(&"grayscale"));
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_colormap_cpu tests
+    // -----------------------------------------------------------------------
+
+    fn grayscale_lut() -> &'static [[u8; 3]; COLORMAP_MAX_INDEX + 1] {
+        BuiltinColormaps
+            .get_colormap_rgb("grayscale")
+            .expect("grayscale must exist")
+    }
+
+    #[test]
+    fn test_apply_colormap_cpu_basic() {
+        let lut = grayscale_lut();
+        let data = vec![0.0, 0.5, 1.0];
+        let rgba = apply_colormap_cpu(&data, 0.0, 1.0, lut);
+
+        // 3 pixels × 4 channels
+        assert_eq!(rgba.len(), 12);
+
+        // First pixel: value=0 → index 0 → (0,0,0,255)
+        assert_eq!(rgba[0], 0);
+        assert_eq!(rgba[3], RGBA_ALPHA_OPAQUE);
+
+        // Last pixel: value=1 → index 255 → (255,255,255,255)
+        assert_eq!(rgba[8], RGBA_ALPHA_OPAQUE);
+        assert_eq!(rgba[11], RGBA_ALPHA_OPAQUE);
+    }
+
+    #[test]
+    fn test_apply_colormap_cpu_empty_data() {
+        let lut = grayscale_lut();
+        let rgba = apply_colormap_cpu(&[], 0.0, 1.0, lut);
+        assert!(rgba.is_empty());
+    }
+
+    #[test]
+    fn test_apply_colormap_cpu_zero_range() {
+        let lut = grayscale_lut();
+        let data = vec![5.0, 5.0, 5.0];
+        let rgba = apply_colormap_cpu(&data, 5.0, 5.0, lut);
+
+        // Zero range → normalized = 0.5 → index 128
+        assert_eq!(rgba.len(), 12);
+        assert_eq!(rgba[0], 128); // R
+        assert_eq!(rgba[1], 128); // G
+        assert_eq!(rgba[2], 128); // B
+        assert_eq!(rgba[3], RGBA_ALPHA_OPAQUE);
+    }
+
+    #[test]
+    fn test_apply_colormap_cpu_values_outside_range() {
+        let lut = grayscale_lut();
+        let data = vec![-10.0, 100.0];
+        let rgba = apply_colormap_cpu(&data, 0.0, 1.0, lut);
+
+        // Below min → clamped to 0 → index 0 → (0,0,0)
+        assert_eq!(rgba[0], 0);
+        // Above max → clamped to 1 → index 255 → (255,255,255)
+        assert_eq!(rgba[4], RGBA_ALPHA_OPAQUE);
+    }
+
+    #[test]
+    fn test_apply_colormap_cpu_nan_values() {
+        let lut = grayscale_lut();
+        let data = vec![f32::NAN];
+        let rgba = apply_colormap_cpu(&data, 0.0, 1.0, lut);
+
+        // NaN normalisation → clamp(NaN, 0, 1) → 0 → index 0
+        assert_eq!(rgba.len(), 4);
+        assert_eq!(rgba[3], RGBA_ALPHA_OPAQUE);
+    }
+
+    #[test]
+    fn test_apply_colormap_cpu_single_element() {
+        let lut = grayscale_lut();
+        let data = vec![0.5];
+        let rgba = apply_colormap_cpu(&data, 0.0, 1.0, lut);
+
+        // 0.5 → index 128 → grayscale (128, 128, 128)
+        assert_eq!(rgba.len(), 4);
+        assert_eq!(rgba[0], 128);
+        assert_eq!(rgba[1], 128);
+        assert_eq!(rgba[2], 128);
+        assert_eq!(rgba[3], RGBA_ALPHA_OPAQUE);
     }
 }

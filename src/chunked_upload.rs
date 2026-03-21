@@ -25,7 +25,7 @@ pub struct ChunkedUploader {
 const TARGET_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Workgroup alignment (must match compute shader workgroup_size.y).
-const WORKGROUP_ALIGNMENT: u32 = 16;
+pub(crate) const WORKGROUP_ALIGNMENT: u32 = 16;
 
 impl ChunkedUploader {
     /// Create a new ChunkedUploader.
@@ -156,6 +156,48 @@ mod tests {
             chunk_count > 1,
             "8000x8000 matrix should need multiple chunks, got {chunk_count}"
         );
+        assert!(uploader.is_complete());
+    }
+
+    #[test]
+    fn test_zero_cols_produces_single_chunk() {
+        let mut uploader = ChunkedUploader::new(100, 0, ChunkConfig { chunk_rows: None });
+        assert_eq!(uploader.next_chunk_range(), Some((0, 100)));
+        uploader.advance();
+        assert!(uploader.is_complete());
+    }
+
+    #[test]
+    fn test_next_chunk_after_complete_returns_none() {
+        let mut uploader = ChunkedUploader::new(10, 10, ChunkConfig { chunk_rows: None });
+        uploader.advance();
+        assert!(uploader.is_complete());
+        assert_eq!(uploader.next_chunk_range(), None);
+        // Calling advance again should not panic
+        uploader.advance();
+        assert_eq!(uploader.next_chunk_range(), None);
+    }
+
+    #[test]
+    fn test_explicit_chunk_rows_larger_than_matrix() {
+        let mut uploader = ChunkedUploader::new(
+            50,
+            100,
+            ChunkConfig {
+                chunk_rows: Some(1000),
+            },
+        );
+        // chunk_rows clamped to rows
+        assert_eq!(uploader.next_chunk_range(), Some((0, 50)));
+        uploader.advance();
+        assert!(uploader.is_complete());
+    }
+
+    #[test]
+    fn test_single_row_matrix() {
+        let mut uploader = ChunkedUploader::new(1, 1000, ChunkConfig { chunk_rows: None });
+        assert_eq!(uploader.next_chunk_range(), Some((0, 1)));
+        uploader.advance();
         assert!(uploader.is_complete());
     }
 }
