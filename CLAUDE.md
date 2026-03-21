@@ -1,164 +1,78 @@
-# LeibnizFast — Claude Code Project Context
+# CLAUDE.md
 
-## Project Overview
-GPU-accelerated 2D matrix visualization library for the browser. Renders matrices of millions to billions of pixels as interactive heatmaps with zoom, pan, and tooltip inspection.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**Tech stack**: Rust + wgpu → WASM (via wasm-pack) → npm package
-**Backend**: WebGPU (primary), WebGL2 fallback (limited — no compute shaders)
+## Project
+
+LeibnizFast is a GPU-accelerated 2D matrix visualization library for browsers, published as npm package `leibniz-fast`. It combines a Rust/WASM core (wgpu) with a thin TypeScript wrapper. WebGPU is the primary backend; WebGL2 is the fallback.
+
+## Build & Dev Commands
+
+```bash
+npm run build:wasm    # wasm-pack build --target web --release → pkg/
+npm run build:js      # tsup js/index.ts --format esm --dts → dist/
+npm run build         # both WASM + JS
+npm run dev           # build + serve at localhost:8080/examples/basic/
+```
+
+## Test & Lint
+
+```bash
+npm run test:rs       # cargo test (unit tests across Rust modules)
+cargo test <test_name>  # run a single Rust test
+npm run lint:rs       # cargo fmt --check && cargo clippy -- -D warnings
+npm run lint:ts       # prettier --check js/ && eslint js/
+npm run lint          # all linting (Rust + TypeScript)
+```
 
 ## Architecture
 
+### Data Flow
+
 ```
-JS (Float32Array) → WASM (Rust) → GPU buffers
-                                  ↓
-                    Compute shader: apply colormap → RGBA texture
-                                  ↓
-                    Render pass: textured quad with camera transform → canvas
-```
-
-- Compute shader pre-applies colormap to texture (only re-runs on data/colormap change, not on pan/zoom)
-- Camera is UV-space offset/scale in fragment shader
-- Matrix data kept in JS heap (Float32Array) — no WASM memory pressure; enables tooltips and colormap at any size
-
-### Key subsystems
-
-**JsDataSource** (`src/matrix.rs`): wraps `js_sys::Float32Array` in JS heap. Reads via `subarray().copy_to()`, single-element via `get_index()`. Bypasses WASM 4 GB limit; tested up to 32000×32000 (~3.81 GB).
-
-**Universal staging buffer** (`MatrixView`): all GPU uploads go through a ≤256 MB staging buffer. No single GPU allocation exceeds 256 MB regardless of matrix size.
-
-**setData flow:**
-```
-JsDataSource::new()  → MatrixView::with_empty_buffer()  → rebuild_pipelines()
-→ apply_colormap_tiled()  → render_frame()
+JavaScript Float32Array
+  → TypeScript LeibnizFast class (js/index.ts) — event handling, WASM init
+    → WASM exports (src/lib.rs, wasm_entry module)
+      → Rust core: MatrixData (CPU), MatrixView (GPU buffer), chunked upload
+        → GPU compute shader (shaders/colormap.wgsl): normalize + colormap → RGBA texture
+          → GPU render shader (shaders/render.wgsl): camera transform → canvas
 ```
 
-**setColormap flow** (zero VRAM spike):
-```
-set_colormap_internal()   ← replaces ColormapTexture only
-rebuild_compute_bind_groups()  ← recreates compute bind groups (cheap); tile textures reused
-apply_colormap_tiled()    ← re-dispatches compute from JS heap
-```
-> Tile textures are NOT recreated on colormap change — only bind groups update. `setRange()` follows the same pattern.
+### Rust Modules
 
-**Streaming flow (initial load):**
-```
-begin_data()  → append_chunk() × N  → end_data()
-```
-Each `append_chunk` copies to JS accumulator and dispatches compute immediately.
+**Pure logic (testable natively, no GPU):** `camera`, `chunked_upload`, `colormap`, `colormap_data`, `interaction`, `matrix`, `tile_grid`
 
-**Streaming update flow (real-time, same dimensions):**
-```
-begin_update()  → append_chunk() × N  → end_data()
-```
-`begin_update()` reuses the existing `JsDataSource` (JS Float32Array) and `MatrixView` (GPU staging buffer) — zero allocation, zero pipeline rebuild. Falls back to `begin_data()` on first call or dimension change. `abort_data()` cancels an in-progress upload and restores resources for reuse (enables frame dropping). `render()` exposes frame rendering independently from data upload for rAF-decoupled rendering.
+**GPU/WASM-only (cfg=wasm32):** `perf`, `pipeline`, `renderer`
 
-**Texture tiling**: matrices exceeding `maxTextureDimension2D` are split into a `TileGrid` of tiles. Each tile has its own texture, params buffer, compute bind group, camera buffer, and render bind group. Fragments outside a tile's UV region are discarded in the fragment shader.
+Key entry point: `src/lib.rs` contains the `wasm_entry` module with the main `LeibnizFast` struct exported via `#[wasm_bindgen]`.
 
-### Performance instrumentation
+### TypeScript Layer
 
-**Debug flag**: `CreateOptions.debug` (JS) / `debug: Option<bool>` (WASM `create()`). When enabled, logs `[perf] label: X.XXms` to the browser console for all key operations. Zero overhead when disabled (single branch per call site).
+`js/index.ts` — thin wrapper that lazy-loads WASM, wraps the WASM instance with a typed API, manages DOM event listeners, and provides callbacks (`onCreate`, `onHover`).
 
-**PerfTimer** (`src/perf.rs`): WASM-only utility using `web_sys::Performance::now()`. Instantiate with `PerfTimer::new(label, debug)`, consume with `.finish()` or `.finish_with(extra)`. The `debug` flag propagates from `LeibnizFast` → `Renderer` → `PipelineFactory`.
+`js/types.ts` — public API types (`ColormapName`, `CreateOptions`, etc.).
 
-**JS-side**: `LeibnizFast` class stores `debug` and provides `timeSync(label, fn)` helper. The basic example has a "Debug timing" checkbox that controls JS-side logging and passes the flag to WASM on viewer creation.
+### GPU Resource Patterns
 
-### GPU limits
-- Auto-tiled when matrix dims exceed `max_texture_dimension` (8192 on Chrome, 16384+ on desktop)
-- Staging buffer capped at `MAX_STAGING_BYTES` (256 MB), further limited by `max_buffer_size`
-- Exposed to JS: `getMaxTextureDimension()`, `getMaxMatrixElements()`
+- **Chunked upload:** Large matrices split into ~16MB chunks, 16-row aligned (`chunked_upload.rs`)
+- **Tiling:** Matrices exceeding `maxTextureDimension2D` are split into a grid of smaller textures (`tile_grid.rs`)
+- **Staging path:** If data exceeds `max_buffer_size`, compute shader runs per-chunk instead of all-at-once
+- **Camera-only updates:** Pan/zoom only updates a uniform buffer; compute shader does not re-run
 
-## Build & Test
+### WebGL2 Fallback Limitations
 
-```bash
-cargo fmt --check && cargo clippy -- -D warnings && cargo test  # Rust checks (56 tests)
-wasm-pack build --target web                                     # Build WASM
-npx prettier --check js/ && npx eslint js/                       # TS checks
-npm run build                                                    # Full bundle
-npm run dev                                                      # Build + serve
-```
+No hover tooltips; colormap changes require full data reload; colormapping is CPU-side.
 
-## Coding Style
+## Toolchain
 
-**Rust**: `///` on every public item, `//!` module docs, 4-space indent, snake_case/PascalCase/SCREAMING_SNAKE, `Result`/`Option` over panics.
-**TypeScript**: JSDoc on exports, 2-space indent, single quotes, trailing commas, strict mode.
-**WGSL**: comment every binding, workgroup size, and math operation.
+- **Rust:** Stable channel, `wasm32-unknown-unknown` target (see `rust-toolchain.toml`)
+- **wasm-pack:** Compiles Rust → WASM, outputs to `pkg/`
+- **tsup:** Bundles TypeScript (ESM), outputs to `dist/`
+- **Prettier:** 80 cols, semicolons, 2-space indent (`.prettierrc`)
+- **ESLint:** TypeScript-ESLint (`eslint.config.js`)
 
-## Key Patterns
+## Key Dependencies
 
-- **TDD**: write tests first for pure-logic modules
-- **DI via closures**: `apply_colormap_tiled` accepts `&dyn Fn` for data reading
-- **Factory pattern**: `PipelineFactory` centralizes wgpu pipeline creation
-- **Pure/GPU split**: `CameraState`/`Camera`, `MatrixData`/`MatrixView` — pure math is testable
-- **In-place colormap**: `rebuild_compute_bind_groups()` reuses tile textures; no 2× VRAM spike
-- **Zero-alloc streaming updates**: `begin_update()` reuses JsDataSource + MatrixView for same-dimension frames; `abort_data()` restores resources on frame drop
-
-## File Structure
-
-| File | Purpose |
-|------|---------|
-| `src/lib.rs` | wasm-bindgen entry point, public API, `PendingUpload` |
-| `src/renderer.rs` | wgpu setup, pipelines, render loop |
-| `src/camera.rs` | `CameraState` (pure) + `Camera` (GPU uniform) |
-| `src/colormap.rs` | `ColormapProvider` trait + `ColormapTexture` |
-| `src/colormap_data.rs` | Const 256-entry RGB tables |
-| `src/matrix.rs` | `JsDataSource`, `PagedStorage`, `MatrixData`, `MatrixView` |
-| `src/chunked_upload.rs` | `ChunkedUploader`: pure chunk boundary logic |
-| `src/tile_grid.rs` | `TileGrid`: pure tile layout |
-| `src/interaction.rs` | `InteractionState` (Idle/Dragging) |
-| `src/perf.rs` | `PerfTimer`: debug-gated performance timing (WASM-only) |
-| `src/pipeline.rs` | `PipelineFactory` |
-| `src/shaders/colormap.wgsl` | Compute shader |
-| `src/shaders/render.wgsl` | Vertex + fragment shader |
-| `js/index.ts` | TypeScript wrapper |
-| `js/types.ts` | Type definitions |
-| `examples/waterfall/generator.cpp` | C++ DAS generator: physics-based params (fiber range, sampling/repetition rate, spatial downsample, time buffer) → ZMQ PUSH |
-| `examples/waterfall/bridge.py` | ZMQ PULL → WebSocket broadcast bridge; `compression=None` required — float32 data is incompressible and default deflate adds ~3-4 s/msg |
-| `examples/waterfall/main.js` | WebSocket waterfall client: FIFO buffer + `setData` fast path; physics constants mirror generator defaults |
-| `examples/waterfall/index.html` | DAS waterfall example page: Spatial DS control, computed stats bar (rows / cols-per-msg / rate) |
-
-## Common Tasks
-
-### Add a new colormap
-1. Add `[[u8; 3]; 256]` const to `src/colormap_data.rs`
-2. Add to `COLORMAP_NAMES` and `get_colormap_by_name` match
-3. Add test in `src/colormap.rs`
-4. Add to `ColormapName` in `js/types.ts`
-
-### Add an interaction mode
-1. Add variant to `InteractionState` in `src/interaction.rs`
-2. Add transitions in `mouse_down`/`mouse_move`/`mouse_up`
-3. Write tests for all new transitions
-4. Wire up in `src/lib.rs` event handlers
-
-### Real-time streaming (same-dimension updates)
-Use `beginUpdate` → `appendChunk` × N → `endData` instead of `setData` for real-time feeds.
-`beginUpdate` reuses GPU resources (zero allocation); `appendChunk` dispatches compute per-chunk
-(no full-matrix staging). See `examples/cpp-stream/main.js` for the complete pattern including
-frame dropping via `abortData`.
-
-### Waterfall / FIFO streaming (right-to-left scroll)
-Use `setData` fast path with a pre-allocated `Float32Array(rows × displayCols)`. On each new batch:
-per-row `copyWithin` shifts left, new columns written at right edge. Render decoupled via `requestAnimationFrame`.
-See `examples/waterfall/main.js` for the complete pattern including the `WaterfallBuffer` class.
-
-Generator uses physics-based DAS parameters:
-```
-./generator --fiber-start 10000 --fiber-end 20000  # meters
-            --sampling-rate 400                     # MHz
-            --repetition-rate 10000                 # Hz (pulses/s)
-            --spatial-downsample 5                  # integer step
-            --time-buffer 0.2                       # seconds per message
-```
-Derived automatically: `rows = ceil(round(sr_MHz × 1e6 × 2 × fiber_len / v_fiber) / ds)`,
-`cols_per_msg = round(rep_rate × time_buffer)`, `msg_interval = time_buffer`.
-With defaults: ~7831 rows, 2000 cols/msg, ~313 MB/s, one 60 MB message every 200 ms.
-
-**Bridge**: always run with `compression=None` (set in `websockets.serve()`). The websockets
-library negotiates permessage-deflate by default; compressing incompressible float32 data adds
-~3–4 s per message. With compression disabled, broadcast latency drops to ~100 ms for 60 MB.
-
-### Extend streaming API for waterfall/ring-buffer
-`start_row` on `append_chunk` is reserved for out-of-order support. To add rolling window:
-1. Remove sequential assert in `append_chunk`
-2. Add `mode: "static" | "ring"` to `PendingUpload`
-3. In ring mode, skip `end_data` and overwrite rows modulo buffer height
+- `wgpu 24` — WebGPU abstraction for Rust
+- `wasm-bindgen` + `web-sys` — Rust↔JS interop
+- `bytemuck` — zero-copy type casting for GPU buffers
