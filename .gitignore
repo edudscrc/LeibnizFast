@@ -20,3 +20,8 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# Extra
+venv/
+examples/cpp-stream/generator
+examples/waterfall/generator
