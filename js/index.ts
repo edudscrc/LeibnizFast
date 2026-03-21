@@ -18,19 +18,32 @@
 
 import type { LeibnizFast as WasmLeibnizFast } from '../pkg/leibniz_fast';
 import type {
+  AxisConfig,
+  ChartConfig,
   ColormapName,
   CreateOptions,
   DataOptions,
   HoverCallback,
+  StreamingAxisConfig,
   StreamingDataOptions,
 } from './types';
+import {
+  computeLayout,
+  isStreamingAxis,
+  renderOverlay,
+  uvToVisibleRange,
+} from './axes';
+import type { LayoutRect, VisibleRange } from './axes';
 
 // Re-export types for consumers
 export type {
+  AxisConfig,
+  ChartConfig,
   ColormapName,
   CreateOptions,
   DataOptions,
   HoverCallback,
+  StreamingAxisConfig,
   StreamingDataOptions,
 };
 
@@ -46,7 +59,11 @@ async function ensureWasmLoaded(): Promise<
 > {
   if (!wasmModule) {
     // Dynamic import of the wasm-pack generated module
-    wasmModule = await import('../pkg/leibniz_fast');
+    const mod = await import('../pkg/leibniz_fast');
+    // The default export is the init function that loads the .wasm binary.
+    // It must be called before any WASM class can be used.
+    await mod.default();
+    wasmModule = mod;
   }
   return wasmModule;
 }
@@ -73,14 +90,36 @@ export class LeibnizFast {
     resize: () => void;
   };
 
+  // --- Chart overlay state ---
+  /** Chart configuration (axes, title, labels). Null when no chart mode. */
+  private chartConfig: ChartConfig | null = null;
+  /** Wrapper div that contains both canvases. */
+  private wrapperDiv: HTMLDivElement | null = null;
+  /** 2D overlay canvas for axes/title rendering. */
+  private overlayCanvas: HTMLCanvasElement | null = null;
+  /** 2D rendering context for the overlay canvas. */
+  private overlayCtx: CanvasRenderingContext2D | null = null;
+  /** Current layout (matrix area position within container). */
+  private layout: LayoutRect = { x: 0, y: 0, width: 0, height: 0 };
+  /** Streaming X axis: columns currently displayed in the matrix. */
+  private streamingDisplayCols: number = 0;
+  /** Streaming X axis: total columns received (including scrolled-off). */
+  private streamingXOffset: number = 0;
+
   private constructor(
     inner: WasmLeibnizFast,
     canvas: HTMLCanvasElement,
     debug: boolean,
+    chartConfig: ChartConfig | null,
   ) {
     this.inner = inner;
     this.canvas = canvas;
     this.debug = debug;
+
+    if (chartConfig) {
+      this.chartConfig = chartConfig;
+      this.setupChartOverlay();
+    }
 
     // Bind DOM event handlers
     this.boundHandlers = {
@@ -91,6 +130,7 @@ export class LeibnizFast {
       mousemove: (e: MouseEvent) => {
         const rect = canvas.getBoundingClientRect();
         this.inner.onMouseMove(e.clientX - rect.left, e.clientY - rect.top);
+        this.updateOverlay();
       },
       mouseup: () => {
         this.inner.onMouseUp();
@@ -103,13 +143,10 @@ export class LeibnizFast {
           e.clientY - rect.top,
           -e.deltaY,
         );
+        this.updateOverlay();
       },
       resize: () => {
-        const rect = canvas.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        canvas.width = rect.width * dpr;
-        canvas.height = rect.height * dpr;
-        this.inner.resize(canvas.width, canvas.height);
+        this.handleResize();
       },
     };
 
@@ -121,6 +158,9 @@ export class LeibnizFast {
       passive: false,
     });
     window.addEventListener('resize', this.boundHandlers.resize);
+
+    // Compute initial layout and render overlay (must happen after DOM setup)
+    this.handleResize();
   }
 
   /**
@@ -129,7 +169,7 @@ export class LeibnizFast {
    * Initializes WASM (if needed) and the GPU context.
    *
    * @param canvas - The HTML canvas element to render into
-   * @param options - Optional configuration (colormap, etc.)
+   * @param options - Optional configuration (colormap, chart, etc.)
    * @returns A new LeibnizFast instance
    */
   static async create(
@@ -157,7 +197,7 @@ export class LeibnizFast {
       console.log(
         `[perf] LeibnizFast.create (total): ${(performance.now() - t0).toFixed(2)}ms`,
       );
-    return new LeibnizFast(inner, canvas, debug);
+    return new LeibnizFast(inner, canvas, debug, options?.chart ?? null);
   }
 
   /** Time a synchronous call, logging duration when debug is enabled. */
@@ -179,6 +219,13 @@ export class LeibnizFast {
     this.timeSync('JS setData', () =>
       this.inner.setData(data, options.rows, options.cols),
     );
+    if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
+      this.streamingDisplayCols = options.cols;
+      if (options.xOffset !== undefined) {
+        this.streamingXOffset = options.xOffset;
+      }
+    }
+    this.updateOverlay();
   }
 
   /**
@@ -224,6 +271,9 @@ export class LeibnizFast {
     this.timeSync('JS beginData', () =>
       this.inner.beginData(options.rows, options.cols),
     );
+    if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
+      this.streamingDisplayCols = options.cols;
+    }
   }
 
   /**
@@ -280,6 +330,7 @@ export class LeibnizFast {
    */
   endData(): void {
     this.timeSync('JS endData', () => this.inner.endData());
+    this.updateOverlay();
   }
 
   /**
@@ -304,7 +355,44 @@ export class LeibnizFast {
   }
 
   /**
-   * Clean up all resources (GPU, event listeners, WASM).
+   * Update the chart configuration (axes, title, labels).
+   *
+   * If no chart overlay exists yet, it will be created. If called with
+   * `null`, the overlay is removed and the viewer reverts to raw matrix mode.
+   *
+   * @param config - Chart configuration, or null to remove
+   */
+  setChart(config: ChartConfig | null): void {
+    if (config && !this.chartConfig) {
+      this.chartConfig = config;
+      this.setupChartOverlay();
+    } else if (!config && this.chartConfig) {
+      this.teardownChartOverlay();
+      this.chartConfig = null;
+    } else {
+      this.chartConfig = config;
+    }
+    this.handleResize();
+  }
+
+  /**
+   * Set the chart title.
+   *
+   * @param title - Title text displayed centered above the matrix
+   */
+  setTitle(title: string): void {
+    if (!this.chartConfig) {
+      this.chartConfig = { title };
+      this.setupChartOverlay();
+      this.handleResize();
+    } else {
+      this.chartConfig.title = title;
+      this.updateOverlay();
+    }
+  }
+
+  /**
+   * Clean up all resources (GPU, event listeners, WASM, overlay DOM).
    * Must be called when the viewer is no longer needed.
    */
   destroy(): void {
@@ -315,7 +403,213 @@ export class LeibnizFast {
     this.canvas.removeEventListener('wheel', this.boundHandlers.wheel);
     window.removeEventListener('resize', this.boundHandlers.resize);
 
+    // Clean up overlay DOM
+    this.teardownChartOverlay();
+
     // Destroy WASM instance (frees GPU resources)
     this.inner.destroy();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: chart overlay setup & rendering
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create the wrapper div and overlay canvas for chart annotations.
+   * Reparents the WebGPU canvas inside a container div.
+   */
+  private setupChartOverlay(): void {
+    if (this.wrapperDiv) return; // already set up
+
+    const parent = this.canvas.parentElement;
+    if (!parent) return;
+
+    // Create wrapper div matching the canvas's CSS size
+    const wrapper = document.createElement('div');
+    wrapper.style.position = 'relative';
+    wrapper.style.width = this.canvas.style.width || '100%';
+    wrapper.style.height = this.canvas.style.height || '100%';
+
+    // Copy computed dimensions if inline styles aren't set
+    const computedStyle = getComputedStyle(this.canvas);
+    if (!this.canvas.style.width) {
+      wrapper.style.width = computedStyle.width;
+    }
+    if (!this.canvas.style.height) {
+      wrapper.style.height = computedStyle.height;
+    }
+
+    // Reparent: insert wrapper where canvas was, move canvas inside
+    parent.insertBefore(wrapper, this.canvas);
+    wrapper.appendChild(this.canvas);
+
+    // Position the WebGPU canvas absolutely within the wrapper
+    this.canvas.style.position = 'absolute';
+
+    // Create overlay canvas
+    const overlay = document.createElement('canvas');
+    overlay.style.position = 'absolute';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.width = '100%';
+    overlay.style.height = '100%';
+    overlay.style.pointerEvents = 'none';
+    wrapper.appendChild(overlay);
+
+    this.wrapperDiv = wrapper;
+    this.overlayCanvas = overlay;
+    this.overlayCtx = overlay.getContext('2d');
+  }
+
+  /**
+   * Remove the overlay canvas and wrapper div, restoring the original
+   * canvas position in the DOM.
+   */
+  private teardownChartOverlay(): void {
+    if (!this.wrapperDiv) return;
+
+    const parent = this.wrapperDiv.parentElement;
+    if (parent) {
+      // Restore canvas to its original position
+      this.canvas.style.position = '';
+      this.canvas.style.left = '';
+      this.canvas.style.top = '';
+      this.canvas.style.width = '';
+      this.canvas.style.height = '';
+      parent.insertBefore(this.canvas, this.wrapperDiv);
+      parent.removeChild(this.wrapperDiv);
+    }
+
+    if (this.overlayCanvas) {
+      this.overlayCanvas.remove();
+    }
+
+    this.wrapperDiv = null;
+    this.overlayCanvas = null;
+    this.overlayCtx = null;
+  }
+
+  /**
+   * Handle window resize: recalculate layout, resize both canvases,
+   * update the WASM renderer, and redraw the overlay.
+   */
+  private handleResize(): void {
+    const dpr = window.devicePixelRatio || 1;
+
+    if (this.chartConfig && this.wrapperDiv && this.overlayCtx) {
+      const wrapperRect = this.wrapperDiv.getBoundingClientRect();
+      const containerW = wrapperRect.width;
+      const containerH = wrapperRect.height;
+
+      // Resize overlay canvas to cover the full container
+      this.overlayCanvas!.width = containerW * dpr;
+      this.overlayCanvas!.height = containerH * dpr;
+      this.overlayCanvas!.style.width = `${containerW}px`;
+      this.overlayCanvas!.style.height = `${containerH}px`;
+
+      // Compute layout (margins for axes/title)
+      this.layout = computeLayout(
+        containerW,
+        containerH,
+        this.chartConfig,
+        this.overlayCtx,
+      );
+
+      // Position and resize the WebGPU canvas to the matrix area
+      this.canvas.style.left = `${this.layout.x}px`;
+      this.canvas.style.top = `${this.layout.y}px`;
+      this.canvas.style.width = `${this.layout.width}px`;
+      this.canvas.style.height = `${this.layout.height}px`;
+      this.canvas.width = this.layout.width * dpr;
+      this.canvas.height = this.layout.height * dpr;
+
+      // Update WASM renderer with matrix area size
+      this.inner.resize(this.canvas.width, this.canvas.height);
+
+      // Redraw overlay
+      this.updateOverlay();
+    } else {
+      // No chart mode: standard resize
+      const rect = this.canvas.getBoundingClientRect();
+      this.canvas.width = rect.width * dpr;
+      this.canvas.height = rect.height * dpr;
+      this.inner.resize(this.canvas.width, this.canvas.height);
+    }
+  }
+
+  /**
+   * Redraw the chart overlay (axes, ticks, labels, title).
+   * Called after data changes, pan/zoom, and resize.
+   */
+  private updateOverlay(): void {
+    if (!this.chartConfig || !this.overlayCtx || !this.wrapperDiv) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const wrapperRect = this.wrapperDiv.getBoundingClientRect();
+
+    const visible = this.computeVisibleRange();
+
+    renderOverlay(
+      this.overlayCtx,
+      this.layout,
+      this.chartConfig,
+      visible,
+      wrapperRect.width,
+      wrapperRect.height,
+      dpr,
+    );
+  }
+
+  /**
+   * Compute the visible data range by mapping camera UV coordinates
+   * to axis data coordinates.
+   */
+  private computeVisibleRange(): VisibleRange {
+    const uv = this.inner.getVisibleRange();
+    const uvOffset: [number, number] = [uv[0], uv[1]];
+    const uvScale: [number, number] = [uv[2], uv[3]];
+
+    // Determine full axis ranges
+    const xRange = this.getFullXRange();
+    const yRange = this.getFullYRange();
+
+    return uvToVisibleRange(
+      uvOffset,
+      uvScale,
+      xRange[0],
+      xRange[1],
+      yRange[0],
+      yRange[1],
+    );
+  }
+
+  /**
+   * Get the full X axis range from the chart configuration.
+   * For streaming axes, computes a sliding window:
+   *   xMax = totalColsReceived * unitsPerCell
+   *   xMin = (totalColsReceived - displayCols) * unitsPerCell
+   */
+  private getFullXRange(): [number, number] {
+    if (!this.chartConfig?.xAxis) return [0, 1];
+    const xAxis = this.chartConfig.xAxis;
+    if (isStreamingAxis(xAxis)) {
+      const xMax = this.streamingXOffset * xAxis.unitsPerCell;
+      // Allow negative values before the buffer fills — the "0" tick
+      // marks where streaming data begins, and the left portion shows
+      // negative time (unfilled region).
+      const xMin =
+        (this.streamingXOffset - this.streamingDisplayCols) *
+        xAxis.unitsPerCell;
+      return [xMin, xMax];
+    }
+    return [xAxis.min, xAxis.max];
+  }
+
+  /**
+   * Get the full Y axis range from the chart configuration.
+   */
+  private getFullYRange(): [number, number] {
+    if (!this.chartConfig?.yAxis) return [0, 1];
+    return [this.chartConfig.yAxis.min, this.chartConfig.yAxis.max];
   }
 }

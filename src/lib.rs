@@ -614,6 +614,21 @@ mod wasm_entry {
             self.renderer.max_texture_dimension()
         }
 
+        /// Get the current camera visible range as UV coordinates.
+        ///
+        /// Returns `[uv_offset_x, uv_offset_y, uv_scale_x, uv_scale_y]`.
+        /// The TypeScript layer maps these to data-space axis coordinates.
+        #[wasm_bindgen(js_name = getVisibleRange)]
+        pub fn get_visible_range(&self) -> Vec<f32> {
+            let uniforms = self.camera.state.get_uniforms();
+            vec![
+                uniforms.uv_offset[0],
+                uniforms.uv_offset[1],
+                uniforms.uv_scale[0],
+                uniforms.uv_scale[1],
+            ]
+        }
+
         /// Register a callback for hover events.
         #[wasm_bindgen(js_name = onHover)]
         pub fn on_hover(&mut self, callback: js_sys::Function) {

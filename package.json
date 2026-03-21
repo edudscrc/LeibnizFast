@@ -11,9 +11,10 @@
   ],
   "scripts": {
     "build:wasm": "wasm-pack build --target web --release",
-    "build:js": "npx tsup js/index.ts --format esm --dts --out-dir dist",
+    "build:js": "npx tsup js/index.ts --format esm --dts --out-dir dist && cp pkg/leibniz_fast_bg.wasm dist/",
     "build": "npm run build:wasm && npm run build:js",
-    "dev": "npm run build:wasm && npx http-server . -p 8080 -o /examples/basic/",
+    "dev": "npm run build:wasm && firefox http://localhost:8080/examples/basic/ & npx http-server . -p 8080",
+    "dev:chart": "npm run build && firefox http://localhost:8080/examples/chart/ & npx http-server . -p 8080",
     "lint:rs": "cargo fmt --check && cargo clippy -- -D warnings",
     "lint:ts": "npx prettier --check js/ && npx eslint js/",
     "lint": "npm run lint:rs && npm run lint:ts",

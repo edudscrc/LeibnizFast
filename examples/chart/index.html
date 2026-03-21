@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LeibnizFast — Chart Axes Example</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+    }
+
+    .container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      gap: 12px;
+    }
+
+    h1 {
+      font-size: 1.4rem;
+      color: #e0e0ff;
+    }
+
+    .controls {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    label {
+      font-size: 0.9rem;
+    }
+
+    select,
+    button {
+      padding: 4px 8px;
+      border-radius: 4px;
+      border: 1px solid #444;
+      background: #2a2a4e;
+      color: #eee;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #3a3a6e;
+    }
+
+    #chart-canvas {
+      width: 800px;
+      height: 600px;
+      border: 1px solid #333;
+      cursor: crosshair;
+    }
+
+    .tooltip {
+      position: fixed;
+      padding: 6px 10px;
+      background: rgba(0, 0, 0, 0.85);
+      color: #fff;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      pointer-events: none;
+      display: none;
+      font-family: monospace;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h1>LeibnizFast — Chart with Axes</h1>
+    <div class="controls">
+      <label for="colormap">Colormap:</label>
+      <select id="colormap">
+        <option value="viridis" selected>Viridis</option>
+        <option value="inferno">Inferno</option>
+        <option value="magma">Magma</option>
+        <option value="plasma">Plasma</option>
+        <option value="cividis">Cividis</option>
+        <option value="grayscale">Grayscale</option>
+      </select>
+      <label for="mode">Mode:</label>
+      <select id="mode">
+        <option value="static" selected>Static Chart</option>
+        <option value="streaming">Streaming Chart</option>
+      </select>
+      <button id="reload">Reload Data</button>
+    </div>
+    <canvas id="chart-canvas"></canvas>
+    <div class="tooltip" id="tooltip"></div>
+  </div>
+  <script type="module" src="main.js"></script>
+</body>
+
+</html>
