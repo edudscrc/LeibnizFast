@@ -17,73 +17,96 @@
  *   - On each message: shift every row left by new_cols, write new data at right edge
  *   - Render at rAF rate (decoupled from network receive)
  */
-import init, { LeibnizFast } from '../../pkg/leibniz_fast.js';
+import { LeibnizFast } from '../../dist/index.js';
 
 // ---- DOM refs ----------------------------------------------------------
 const canvas           = document.getElementById('canvas');
 const colormapSelect   = document.getElementById('colormap');
-const spatialDsInput   = document.getElementById('spatial-downsample');
-const displayColsSel   = document.getElementById('display-cols');
-const rangeMinInput  = document.getElementById('range-min');
-const rangeMaxInput  = document.getElementById('range-max');
-const debugCheckbox  = document.getElementById('debug');
-const statusBadge    = document.getElementById('status-badge');
-const statusText     = document.getElementById('status-text');
-const fpsCounter     = document.getElementById('fps-counter');
-const dataRateEl     = document.getElementById('data-rate');
-const tooltip        = document.getElementById('tooltip');
-const errorBanner    = document.getElementById('error-banner');
+const rangeMinInput    = document.getElementById('range-min');
+const rangeMaxInput    = document.getElementById('range-max');
+const debugCheckbox    = document.getElementById('debug');
+const statusBadge      = document.getElementById('status-badge');
+const statusText       = document.getElementById('status-text');
+const fpsCounter       = document.getElementById('fps-counter');
+const dataRateEl       = document.getElementById('data-rate');
+const tooltip          = document.getElementById('tooltip');
+const errorBanner      = document.getElementById('error-banner');
+
+// Generator parameter inputs
+const genSpatialStartInput  = document.getElementById('gen-spatial-start');
+const genSpatialEndInput    = document.getElementById('gen-spatial-end');
+const genSamplingRateInput  = document.getElementById('gen-sampling-rate');
+const genRepetitionRateInput = document.getElementById('gen-repetition-rate');
+const genSpatialDsInput     = document.getElementById('gen-spatial-downsample');
+const genTimeBufferInput    = document.getElementById('gen-time-buffer');
+const genTimeWindowInput    = document.getElementById('gen-time-window');
+const genSaveButton         = document.getElementById('gen-save');
+const genStatusEl           = document.getElementById('gen-status');
 
 // ---- Constants ---------------------------------------------------------
 
-const WATERFALL_MAGIC = 0x4C465A10;
-const HEADER_BYTES    = 16;  // 4 × uint32
+const WATERFALL_MAGIC    = 0x4C465A10;
+const HEADER_BYTES       = 16;  // 4 × uint32
+const PROPAGATION_VELOCITY = 2.0432e8;  // m/s (fixed physical constant)
+const BRIDGE_MAX_ROWS    = 65536;
 
 const WS_URL       = 'ws://localhost:8765';
 const RECONNECT_MS = 2000;
 const FPS_WINDOW   = 10;
 
-// ---- Signal Parameters (must match generator CLI defaults) --------------
-// NOTE: Keep these in sync with generator.cpp defaults.
+// ---- Generator parameters (mirrors generator.cpp defaults) -------------
 
-const PROPAGATION_VELOCITY = 2.0432e8;  // m/s
-const SPATIAL_START_M      = 10000;     // m  (matches --spatial-start default)
-const SPATIAL_END_M        = 20000;     // m  (matches --spatial-end default)
-const SAMPLING_RATE_MHZ    = 400;       // MHz (matches --sampling-rate default)
-const REPETITION_RATE_HZ   = 10000;     // Hz (matches --repetition-rate default)
-const TIME_BUFFER_S        = 0.2;       // s  (matches --time-buffer default)
-const BRIDGE_MAX_ROWS      = 65536;
+/** @typedef {{ spatialStart: number, spatialEnd: number, samplingRate: number, repetitionRate: number, spatialDownsample: number, timeBuffer: number }} GenParams */
 
 /**
- * Compute spatial row count from spatial downsampling factor.
- * @param {number} ds - integer downsampling step (>= 1)
+ * Read initial generator parameters from DOM inputs so the chart config
+ * always reflects the values the user sees, not stale JS constants.
+ * @returns {GenParams}
+ */
+function readInitialGenParams() {
+  return {
+    spatialStart:      parseFloat(genSpatialStartInput.value)   || 10000,
+    spatialEnd:        parseFloat(genSpatialEndInput.value)     || 15000,
+    samplingRate:      parseInt(genSamplingRateInput.value)     || 400,
+    repetitionRate:    parseInt(genRepetitionRateInput.value)   || 1000,
+    spatialDownsample: parseInt(genSpatialDsInput.value)        || 5,
+    timeBuffer:        parseFloat(genTimeBufferInput.value)     || 0.15,
+  };
+}
+
+/** @type {GenParams} */
+let genParams = readInitialGenParams();
+
+/**
+ * Compute spatial row count from generator parameters.
+ * @param {GenParams} p
  * @returns {number}
  */
-function computeSpatialRows(ds) {
-  const spatialExtent = SPATIAL_END_M - SPATIAL_START_M;
-  const roundTripTime = 2.0 * spatialExtent / PROPAGATION_VELOCITY;
-  const pointsPerSeg  = Math.round(SAMPLING_RATE_MHZ * 1e6 * roundTripTime);
-  return Math.ceil(pointsPerSeg / ds);
+function computeSpatialRows(p) {
+  const extent        = p.spatialEnd - p.spatialStart;
+  const roundTripTime = 2.0 * extent / PROPAGATION_VELOCITY;
+  const pointsPerSeg  = Math.round(p.samplingRate * 1e6 * roundTripTime);
+  return Math.ceil(pointsPerSeg / p.spatialDownsample);
 }
 
 /**
- * Compute derived stats for a given downsampling factor.
- * @param {number} ds
+ * Compute derived stats from generator parameters.
+ * @param {GenParams} p
  * @returns {{ rows: number, colsPerMsg: number, rateMbs: number }}
  */
-function computeStats(ds) {
-  const rows       = computeSpatialRows(ds);
-  const colsPerMsg = Math.round(REPETITION_RATE_HZ * TIME_BUFFER_S);
-  const rateMbs    = (rows * colsPerMsg * 4 * (1.0 / TIME_BUFFER_S)) / 1e6;
+function computeStats(p) {
+  const rows       = computeSpatialRows(p);
+  const colsPerMsg = Math.round(p.repetitionRate * p.timeBuffer);
+  const rateMbs    = (rows * colsPerMsg * 4 * (1.0 / p.timeBuffer)) / 1e6;
   return { rows, colsPerMsg, rateMbs };
 }
 
 /**
  * Update the computed stats display in the UI.
- * @param {number} ds
+ * @param {GenParams} p
  */
-function updateStats(ds) {
-  const { rows, colsPerMsg, rateMbs } = computeStats(ds);
+function updateStats(p) {
+  const { rows, colsPerMsg, rateMbs } = computeStats(p);
   document.getElementById('stat-rows').textContent = `Rows: ${rows.toLocaleString()}`;
   document.getElementById('stat-cols').textContent = `Cols/msg: ${colsPerMsg.toLocaleString()}`;
   document.getElementById('stat-rate').textContent = `Rate: ${rateMbs.toFixed(1)} MB/s`;
@@ -92,6 +115,14 @@ function updateStats(ds) {
 // ---- State -------------------------------------------------------------
 /** @type {LeibnizFast|null} */
 let viewer = null;
+/** Total columns received from the WebSocket since last buffer reset. */
+let totalColsReceived = 0;
+/**
+ * When true, discard incoming messages whose row count doesn't match the
+ * expected value from genParams. This prevents stale messages from a
+ * still-dying old generator from reverting the buffer dimensions after Save.
+ */
+let pendingRestart = false;
 /** @type {WebSocket|null} */
 let ws = null;
 let reconnectTimer = null;
@@ -108,9 +139,8 @@ let lastRateUpdate = performance.now();
 let tLastMessage = 0;  // performance.now() of the last processMessage call
 
 // Waterfall buffer
-let displayCols = parseInt(displayColsSel.value);
-let spatialDownsample = parseInt(spatialDsInput.value);
-let rows = computeSpatialRows(spatialDownsample);
+let displayCols = Math.round(parseFloat(genTimeWindowInput.value) * genParams.repetitionRate);
+let rows = computeSpatialRows(genParams);
 
 // ---- Waterfall Buffer --------------------------------------------------
 
@@ -262,19 +292,30 @@ function processMessage(buf) {
   const h = parseHeader(buf);
   if (!h) return;
 
+  // After a Save+restart, discard stale messages from the old generator
+  // until we receive one that matches the expected row count.
+  if (pendingRestart) {
+    const expectedRows = computeSpatialRows(genParams);
+    if (h.rows !== expectedRows) {
+      return;  // stale message from old generator — discard
+    }
+    pendingRestart = false;
+  }
+
   const tAfterParse = performance.now();
 
-  // If generator rows changed (e.g. via resize), recreate buffer
+  // If generator rows changed (e.g. after restart), recreate buffer
   if (h.rows !== buffer.rows) {
     rows = h.rows;
     buffer = new WaterfallBuffer(rows, displayCols);
-    updateStats(spatialDownsample);
+    updateStats(genParams);
   }
 
   // Extract column data from after the header
   const colData = new Float32Array(buf, HEADER_BYTES, h.rows * h.newCols);
 
   buffer.pushColumns(colData, h.newCols);
+  totalColsReceived += h.newCols;
   dirty = true;
 
   const tAfterPush = performance.now();
@@ -298,17 +339,11 @@ function processMessage(buf) {
 
 function renderLoop() {
   if (dirty && viewer && buffer) {
-    if (debugEnabled) {
-      const t0 = performance.now();
-      viewer.setData(buffer.data, buffer.rows, buffer.cols);
-      const setDataMs = performance.now() - t0;
-      console.log(
-        `[perf] render` +
-        `  setData(${buffer.rows}×${buffer.cols})=${setDataMs.toFixed(2)}ms`
-      );
-    } else {
-      viewer.setData(buffer.data, buffer.rows, buffer.cols);
-    }
+    viewer.setData(buffer.data, {
+      rows: buffer.rows,
+      cols: buffer.cols,
+      xOffset: totalColsReceived,
+    });
     dirty = false;
     updateFps();
   }
@@ -338,8 +373,6 @@ function connect() {
     bytesThisSecond = 0;
     lastRateUpdate = performance.now();
     dataRateEl.textContent = '-- MB/s';
-    // Sync row count with generator on reconnect
-    sendResize(rows);
   });
 
   ws.addEventListener('message', (e) => {
@@ -362,28 +395,133 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(connect, RECONNECT_MS);
 }
 
-function sendResize(newRows) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'resize', rows: newRows }));
-  }
-}
-
 // ---- Main --------------------------------------------------------------
 
-async function main() {
-  const t0 = performance.now();
-  await init();
-  if (debugEnabled) console.log(`[perf] WASM init: ${(performance.now() - t0).toFixed(2)}ms`);
+/**
+ * Build a chart config object from the current generator parameters.
+ * @param {GenParams} p
+ * @returns {object}
+ */
+function buildChartConfig(p) {
+  return {
+    title: 'Live Waterfall',
+    xAxis: { label: 'Time', unit: 's', unitsPerCell: 1 / p.repetitionRate },
+    yAxis: { label: 'Depth', unit: 'm', min: p.spatialStart, max: p.spatialEnd },
+  };
+}
 
-  const t1 = performance.now();
-  viewer = await LeibnizFast.create(canvas, colormapSelect.value, debugEnabled);
-  if (debugEnabled) console.log(`[perf] LeibnizFast.create: ${(performance.now() - t1).toFixed(2)}ms`);
+/**
+ * Read and validate the generator parameter inputs.
+ * Returns the validated params or null if invalid.
+ * @returns {GenParams|null}
+ */
+function readGenParamInputs() {
+  const spatialStart     = parseFloat(genSpatialStartInput.value);
+  const spatialEnd       = parseFloat(genSpatialEndInput.value);
+  const samplingRate     = parseInt(genSamplingRateInput.value);
+  const repetitionRate   = parseInt(genRepetitionRateInput.value);
+  const spatialDownsample = parseInt(genSpatialDsInput.value);
+  const timeBuffer       = parseFloat(genTimeBufferInput.value);
+
+  if (!isFinite(spatialStart) || spatialStart < 0 || spatialStart > 1e6) {
+    showError('Spatial Start must be 0–1,000,000 m');
+    return null;
+  }
+  if (!isFinite(spatialEnd) || spatialEnd < 1 || spatialEnd > 1e6) {
+    showError('Spatial End must be 1–1,000,000 m');
+    return null;
+  }
+  if (spatialEnd <= spatialStart) {
+    showError('Spatial End must be greater than Spatial Start');
+    return null;
+  }
+  if (!isFinite(samplingRate) || samplingRate < 1 || samplingRate > 10000) {
+    showError('Sampling Rate must be 1–10,000 MHz');
+    return null;
+  }
+  if (!isFinite(repetitionRate) || repetitionRate < 1 || repetitionRate > 1000000) {
+    showError('Repetition Rate must be 1–1,000,000 Hz');
+    return null;
+  }
+  if (!isFinite(spatialDownsample) || spatialDownsample < 1 || spatialDownsample > 1000) {
+    showError('Spatial Downsample must be 1–1,000');
+    return null;
+  }
+  if (!isFinite(timeBuffer) || timeBuffer < 0.001 || timeBuffer > 60) {
+    showError('Time Buffer must be 0.001–60 s');
+    return null;
+  }
+
+  return { spatialStart, spatialEnd, samplingRate, repetitionRate, spatialDownsample, timeBuffer };
+}
+
+/**
+ * Send a restart command to the bridge with new generator parameters,
+ * then reset local state (buffer, chart axes, stats).
+ */
+function saveParams() {
+  const params = readGenParamInputs();
+  if (!params) return;
+
+  const newRows = computeSpatialRows(params);
+  if (newRows > BRIDGE_MAX_ROWS) {
+    showError(
+      `Computed rows (${newRows.toLocaleString()}) exceeds bridge limit (${BRIDGE_MAX_ROWS.toLocaleString()}). ` +
+      `Increase Spatial Downsample or reduce the spatial range.`
+    );
+    return;
+  }
+
+  genParams = params;
+  pendingRestart = true;
+
+  // Recompute displayCols from time window (seconds) and new repetition rate
+  const timeWindowSec = parseFloat(genTimeWindowInput.value) || 1.0;
+  displayCols = Math.max(1, Math.round(timeWindowSec * params.repetitionRate));
+
+  // Send restart message to bridge — bridge will kill + respawn the generator
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'restart',
+      spatialStart:      params.spatialStart,
+      spatialEnd:        params.spatialEnd,
+      samplingRate:      params.samplingRate,
+      repetitionRate:    params.repetitionRate,
+      spatialDownsample: params.spatialDownsample,
+      timeBuffer:        params.timeBuffer,
+    }));
+    genStatusEl.textContent = 'Restart sent…';
+    setTimeout(() => { genStatusEl.textContent = ''; }, 3000);
+  } else {
+    genStatusEl.textContent = 'Not connected — parameters saved locally';
+    setTimeout(() => { genStatusEl.textContent = ''; }, 3000);
+  }
+
+  // Reset buffer and counters for new geometry
+  rows = newRows;
+  buffer = new WaterfallBuffer(rows, displayCols);
+  totalColsReceived = 0;
+
+  if (viewer) {
+    viewer.setData(buffer.data, { rows, cols: displayCols, xOffset: 0 });
+    viewer.setChart(buildChartConfig(params));
+  }
+
+  updateStats(params);
+}
+
+async function main() {
+  viewer = await LeibnizFast.create(canvas, {
+    colormap: colormapSelect.value,
+    debug: debugEnabled,
+    chart: buildChartConfig(genParams),
+  });
 
   // Initialize waterfall buffer and do an initial setData so the canvas isn't blank
   buffer = new WaterfallBuffer(rows, displayCols);
-  viewer.setData(buffer.data, rows, displayCols);
+  viewer.setData(buffer.data, { rows, cols: displayCols, xOffset: 0 });
   applyRange();
-  updateStats(spatialDownsample);
+  updateStats(genParams);
 
   // Start decoupled render loop
   requestAnimationFrame(renderLoop);
@@ -394,34 +532,14 @@ async function main() {
     tooltip.textContent = `[${row}, ${col}] = ${value.toFixed(4)}`;
   });
 
-  // ---- Pan / zoom interactions -----------------------------------------
-  canvas.addEventListener('mousedown', (e) => {
-    const rect = canvas.getBoundingClientRect();
-    viewer.onMouseDown(e.clientX - rect.left, e.clientY - rect.top);
-  });
-
   canvas.addEventListener('mousemove', (e) => {
-    const rect = canvas.getBoundingClientRect();
-    viewer.onMouseMove(e.clientX - rect.left, e.clientY - rect.top);
     tooltip.style.left = `${e.clientX + 12}px`;
     tooltip.style.top  = `${e.clientY + 12}px`;
   });
 
-  window.addEventListener('mouseup', () => viewer.onMouseUp());
-
   canvas.addEventListener('mouseleave', () => {
     tooltip.style.display = 'none';
   });
-
-  canvas.addEventListener(
-    'wheel',
-    (e) => {
-      e.preventDefault();
-      const rect = canvas.getBoundingClientRect();
-      viewer.onWheel(e.clientX - rect.left, e.clientY - rect.top, -e.deltaY);
-    },
-    { passive: false },
-  );
 
   // ---- Controls --------------------------------------------------------
 
@@ -431,29 +549,7 @@ async function main() {
     if (debugEnabled) console.log(`[perf] setColormap: ${(performance.now() - t).toFixed(2)}ms`);
   });
 
-  spatialDsInput.addEventListener('change', () => {
-    const ds = Math.max(1, parseInt(spatialDsInput.value) || 1);
-    spatialDsInput.value = ds;
-    spatialDownsample = ds;
-    rows = computeSpatialRows(ds);
-    buffer = new WaterfallBuffer(rows, displayCols);
-    viewer.setData(buffer.data, rows, displayCols);
-    updateStats(ds);
-    if (rows <= BRIDGE_MAX_ROWS) {
-      sendResize(rows);
-    } else {
-      showError(
-        `Computed rows (${rows.toLocaleString()}) exceeds bridge limit (${BRIDGE_MAX_ROWS.toLocaleString()}). ` +
-        `Restart generator with --spatial-downsample ${ds} to apply.`
-      );
-    }
-  });
-
-  displayColsSel.addEventListener('change', () => {
-    displayCols = parseInt(displayColsSel.value);
-    buffer = new WaterfallBuffer(rows, displayCols);
-    viewer.setData(buffer.data, rows, displayCols);
-  });
+  genSaveButton.addEventListener('click', saveParams);
 
   rangeMinInput.addEventListener('input', applyRange);
   rangeMaxInput.addEventListener('input', applyRange);

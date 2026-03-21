@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import struct
 import time
@@ -42,16 +43,80 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-ZMQ_DATA_ADDR = "tcp://127.0.0.1:5555"
-ZMQ_CTRL_ADDR = "tcp://127.0.0.1:5556"
-WS_HOST       = "localhost"
-WS_PORT       = 8765
+ZMQ_DATA_ADDR  = "tcp://127.0.0.1:5555"
+ZMQ_CTRL_ADDR  = "tcp://127.0.0.1:5556"
+WS_HOST        = "localhost"
+WS_PORT        = 8765
+GENERATOR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generator")
 
 # Parsed in main() and stored here for module-wide access
 DEBUG: bool = False
 
 # Active WebSocket connections (modified only from the asyncio thread).
 clients: set[WebSocketServerProtocol] = set()
+
+# Generator subprocess handle — managed by restart_generator().
+_generator_proc: asyncio.subprocess.Process | None = None
+
+
+async def restart_generator(params: dict) -> str:
+    """Kill the running generator (if any) and spawn a new one with params.
+
+    Handles both bridge-managed processes and generators started manually by
+    the user, since both bind the same ZMQ ports.
+    """
+    global _generator_proc
+
+    # Step 1: Kill the bridge-managed generator process.
+    if _generator_proc is not None and _generator_proc.returncode is None:
+        _generator_proc.terminate()
+        try:
+            await asyncio.wait_for(_generator_proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            _generator_proc.kill()
+            await _generator_proc.wait()
+        log.info("Generator (PID %d) stopped.", _generator_proc.pid)
+
+    # Step 2: Kill any manually-started generator instances the bridge does
+    # not track.  These hold the ZMQ bind ports and cause the next bind to
+    # fail with "Address already in use".
+    #
+    # Use the process name (`-x generator`) instead of the full command-line
+    # path (`-f /full/path/generator`), because a manually-started
+    # `./generator` won't have the full path in its argv[0].
+    generator_name = os.path.basename(GENERATOR_PATH)
+    pkill = await asyncio.create_subprocess_exec(
+        "pkill", "-x", generator_name,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await pkill.wait()  # exit code 1 = no process found; that is fine
+
+    # Step 3: Wait for the killed process to fully exit and the OS to
+    # release the ZMQ TCP bind ports.
+    await asyncio.sleep(1.0)
+
+    if not os.path.isfile(GENERATOR_PATH):
+        return f"Generator binary not found at {GENERATOR_PATH}. Build it with: g++ -std=c++17 -O2 -o generator generator.cpp -lzmq"
+
+    cmd = [GENERATOR_PATH]
+    if "spatialStart" in params:
+        cmd += ["--spatial-start", str(params["spatialStart"])]
+    if "spatialEnd" in params:
+        cmd += ["--spatial-end", str(params["spatialEnd"])]
+    if "samplingRate" in params:
+        cmd += ["--sampling-rate", str(params["samplingRate"])]
+    if "repetitionRate" in params:
+        cmd += ["--repetition-rate", str(params["repetitionRate"])]
+    if "spatialDownsample" in params:
+        cmd += ["--spatial-downsample", str(params["spatialDownsample"])]
+    if "timeBuffer" in params:
+        cmd += ["--time-buffer", str(params["timeBuffer"])]
+
+    # Inherit stdout/stderr so generator output is visible in the bridge terminal.
+    _generator_proc = await asyncio.create_subprocess_exec(*cmd)
+    log.info("Generator restarted (PID %d): %s", _generator_proc.pid, " ".join(cmd))
+    return "ok"
 
 
 def _log_client_count() -> None:
@@ -79,6 +144,9 @@ def make_ws_handler(ctrl_sock: zmq.asyncio.Socket):
                                 # Send as 4-byte little-endian uint32 to generator
                                 await ctrl_sock.send(struct.pack("<I", new_rows))
                                 log.info("Forwarded resize → rows=%d", new_rows)
+                        elif data.get("type") == "restart":
+                            result = await restart_generator(data)
+                            log.info("Generator restart result: %s", result)
                     except (json.JSONDecodeError, KeyError, ValueError):
                         pass
                 # Binary messages from browser are ignored
@@ -207,6 +275,16 @@ async def main() -> None:
     await server.wait_closed()
     ctrl_sock.close()
     ctx.destroy(linger=0)
+
+    if _generator_proc is not None and _generator_proc.returncode is None:
+        _generator_proc.terminate()
+        try:
+            await asyncio.wait_for(_generator_proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            _generator_proc.kill()
+            await _generator_proc.wait()
+        log.info("Generator stopped on shutdown.")
+
     log.info("Shutdown complete.")
 
 

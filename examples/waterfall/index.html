@@ -145,6 +145,72 @@
       align-items: center;
       gap: 6px;
     }
+
+    .gen-params {
+      border: 1px solid #3a3a5e;
+      border-radius: 6px;
+      padding: 12px 16px;
+      max-width: 820px;
+      width: 100%;
+    }
+
+    .gen-params legend {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #aab;
+      padding: 0 6px;
+      letter-spacing: 0.05em;
+    }
+
+    .gen-params-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 10px 20px;
+      margin-bottom: 12px;
+    }
+
+    .gen-params-grid label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.82rem;
+      color: #ccc;
+    }
+
+    .gen-params-grid input[type="number"] {
+      width: 100%;
+    }
+
+    .gen-params-footer {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    button#gen-save {
+      padding: 6px 18px;
+      border-radius: 4px;
+      border: 1px solid #556;
+      background: #2a2a5e;
+      color: #dde;
+      font-size: 0.88rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    button#gen-save:hover {
+      background: #3a3a7e;
+    }
+
+    button#gen-save:active {
+      background: #4a4a9e;
+    }
+
+    #gen-status {
+      font-size: 0.8rem;
+      color: #aab;
+      font-family: monospace;
+    }
   </style>
 </head>
 
@@ -180,18 +246,6 @@
         <option value="grayscale">Grayscale</option>
       </select>
 
-      <label for="spatial-downsample">Spatial DS:</label>
-      <input type="number" id="spatial-downsample" value="5" min="1" max="1000" step="1" style="width:64px" />
-
-      <label for="display-cols">Time window:</label>
-      <select id="display-cols">
-        <option value="500">500</option>
-        <option value="1000" selected>1000</option>
-        <option value="2000">2000</option>
-        <option value="4000">4000</option>
-        <option value="8000">8000</option>
-      </select>
-
       <div class="range-inputs">
         <label for="range-min">Min:</label>
         <input type="number" id="range-min" value="-0.5" step="0.05" />
@@ -203,6 +257,45 @@
         <input type="checkbox" id="debug" /> Debug timing
       </label>
     </div>
+
+    <!-- Generator Parameters panel -->
+    <fieldset class="gen-params">
+      <legend>GENERATOR PARAMETERS</legend>
+      <div class="gen-params-grid">
+        <label>
+          Spatial Start (m)
+          <input type="number" id="gen-spatial-start" value="10000" min="0" max="1000000" step="100" />
+        </label>
+        <label>
+          Spatial End (m)
+          <input type="number" id="gen-spatial-end" value="15000" min="1" max="1000000" step="100" />
+        </label>
+        <label>
+          Sampling Rate (MHz)
+          <input type="number" id="gen-sampling-rate" value="400" min="1" max="10000" step="1" />
+        </label>
+        <label>
+          Repetition Rate (Hz)
+          <input type="number" id="gen-repetition-rate" value="1000" min="1" max="1000000" step="100" />
+        </label>
+        <label>
+          Spatial Downsample
+          <input type="number" id="gen-spatial-downsample" value="5" min="1" max="1000" step="1" />
+        </label>
+        <label>
+          Time Buffer (s) — e.g. 0.15, 0.2
+          <input type="number" id="gen-time-buffer" value="0.15" min="0.001" max="60" step="0.01" />
+        </label>
+        <label>
+          Time Window (s) — visible duration
+          <input type="number" id="gen-time-window" value="1.0" min="0.01" max="600" step="0.1" />
+        </label>
+      </div>
+      <div class="gen-params-footer">
+        <button id="gen-save">Save &amp; Restart Generator</button>
+        <span id="gen-status"></span>
+      </div>
+    </fieldset>
 
     <div id="signal-stats" style="display:flex; gap:20px; font-size:0.82rem; color:#aab; font-family:monospace; padding:2px 0">
       <span id="stat-rows">Rows: –</span>

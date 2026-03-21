@@ -23,7 +23,8 @@
  *   - Sensor acquires samples at `sampling_rate` MHz over a spatial extent
  *   - Samples normalized to float32 range [-0.992, 0.992]
  *   - Spatial downsampling by `spatial_downsample` (integer step)
- *   - rows = ceil(round(sampling_rate_MHz × 1e6 × 2 × spatial_extent / propagation_velocity) / spatial_downsample)
+ *   - rows = ceil(round(sampling_rate_MHz × 1e6 × 2 × spatial_extent /
+ * propagation_velocity) / spatial_downsample)
  *   - cols_per_msg = round(repetition_rate_Hz × time_buffer_s)
  *   - msg_interval_ns = round(time_buffer_s × 1e9)
  *
@@ -32,24 +33,27 @@
  *
  * Run:
  *   ./generator                                                    # defaults
- *   ./generator --spatial-start 5000 --spatial-end 15000           # custom spatial range
- *   ./generator --sampling-rate 200 --spatial-downsample 10        # lower resolution
- *   ./generator --repetition-rate 5000 --time-buffer 0.4           # slower rate, larger batches
- *   ./generator --debug                                            # per-message timing
+ *   ./generator --spatial-start 5000 --spatial-end 15000           # custom
+ * spatial range
+ *   ./generator --sampling-rate 200 --spatial-downsample 10        # lower
+ * resolution
+ *   ./generator --repetition-rate 5000 --time-buffer 0.4           # slower
+ * rate, larger batches
+ *   ./generator --debug                                            #
+ * per-message timing
  */
 
 #include <zmq.h>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
-#include <iomanip>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <random>
 #include <string>
@@ -64,48 +68,23 @@ static constexpr int HEADER_BYTES = 16;  // 4 × uint32
 // Propagation velocity for round-trip spatial sampling (m/s)
 static constexpr double PROPAGATION_VELOCITY = 2.0432e8;
 
-// ADC normalization: int8 [-127,127] → float [-0.992, 0.992]
-static constexpr float ADC_NORM = 1.0f / 128.0f;
-
-// Maximum number of simultaneous impulse events
-static constexpr int MAX_IMPULSES = 8;
-// Impulse decay rate (columns)
-static constexpr int IMPULSE_DECAY_COLS = 10;
 
 // ---- Signal handling -----------------------------------------------------
 
 static volatile bool g_running = true;
 static void handle_sigint(int) { g_running = false; }
 
-// ---- Impulse event -------------------------------------------------------
-
-struct Impulse {
-  int row_start;    // center row of the impulse
-  int row_span;     // half-width in rows
-  float amplitude;  // peak amplitude
-  int age;          // columns since trigger
-  bool active;
-};
-
-// ---- Persistent spatial signals (sine-modulated at fixed rows) -----------
-
-struct PersistentSignal {
-  int row_center;
-  int row_span;
-  float base_amplitude;
-  float freq;  // modulation frequency (radians per column)
-};
 
 // ---- Main ----------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
-  double spatial_start_m    = 10000.0;  // meters
-  double spatial_end_m      = 20000.0;  // meters
-  int    sampling_rate_mhz  = 400;      // MHz
-  int    repetition_rate_hz = 10000;    // Hz
-  int    spatial_downsample = 5;        // integer step
-  double time_buffer_s      = 0.2;      // seconds
-  bool   debug              = false;
+  double spatial_start_m = 10000.0;  // meters
+  double spatial_end_m = 15000.0;    // meters
+  int sampling_rate_mhz = 400;       // MHz
+  int repetition_rate_hz = 1000;     // Hz
+  int spatial_downsample = 5;        // integer step
+  double time_buffer_s = 0.15;       // seconds
+  bool debug = false;
 
   for (int a = 1; a < argc; ++a) {
     const std::string arg(argv[a]);
@@ -157,17 +136,18 @@ int main(int argc, char* argv[]) {
 
   // ---- Spatial sampling computation --------------------------------------
 
-  const double spatial_extent_m    = spatial_end_m - spatial_start_m;
-  const double round_trip_time_s   = 2.0 * spatial_extent_m / PROPAGATION_VELOCITY;
-  const int    points_per_segment  = static_cast<int>(
+  const double spatial_extent_m = spatial_end_m - spatial_start_m;
+  const double round_trip_time_s =
+      2.0 * spatial_extent_m / PROPAGATION_VELOCITY;
+  const int points_per_segment = static_cast<int>(
       std::round(sampling_rate_mhz * 1.0e6 * round_trip_time_s));
-  const int    rows_init = static_cast<int>(
+  const int rows_init = static_cast<int>(
       std::ceil(static_cast<double>(points_per_segment) / spatial_downsample));
-  const int    cols_per_msg = static_cast<int>(
+  const int cols_per_msg = static_cast<int>(
       std::round(static_cast<double>(repetition_rate_hz) * time_buffer_s));
-  const double msgs_per_sec   = 1.0 / time_buffer_s;
-  const double output_rate_mbs =
-      static_cast<double>(rows_init) * cols_per_msg * 4.0 * msgs_per_sec / 1.0e6;
+  const double msgs_per_sec = 1.0 / time_buffer_s;
+  const double output_rate_mbs = static_cast<double>(rows_init) * cols_per_msg *
+                                 4.0 * msgs_per_sec / 1.0e6;
   const auto msg_interval_ns =
       static_cast<int64_t>(std::round(time_buffer_s * 1.0e9));
 
@@ -186,10 +166,13 @@ int main(int argc, char* argv[]) {
   int rows = rows_init;
 
   std::cout << "Waterfall Generator\n"
-            << "  Spatial range:  " << spatial_start_m << " – " << spatial_end_m << " m\n"
+            << "  Spatial range:  " << spatial_start_m << " – " << spatial_end_m
+            << " m\n"
             << "  Spatial extent: " << spatial_extent_m << " m\n"
-            << "  Propagation v:  " << (PROPAGATION_VELOCITY / 1.0e6) << " × 10\u2076 m/s\n"
-            << "  Round-trip:     " << (round_trip_time_s * 1.0e6) << " \u00b5s\n"
+            << "  Propagation v:  " << (PROPAGATION_VELOCITY / 1.0e6)
+            << " × 10\u2076 m/s\n"
+            << "  Round-trip:     " << (round_trip_time_s * 1.0e6)
+            << " \u00b5s\n"
             << "  Sampling rate:  " << sampling_rate_mhz << " MHz\n"
             << "  Points/segment: " << points_per_segment << "\n"
             << "  Spatial DS:     " << spatial_downsample << "\u00d7\n"
@@ -204,47 +187,34 @@ int main(int argc, char* argv[]) {
 
   signal(SIGINT, handle_sigint);
 
-  // ---- Random number generator -----------------------------------------
+  // ---- Random number generator (light noise only) ----------------------
 
   std::mt19937 rng(static_cast<unsigned>(time(nullptr)));
-  std::uniform_int_distribution<int> noise_dist(-127, 127);   // ADC int8 range
-  std::uniform_real_distribution<float> amp_dist(0.5f, 1.0f);
-  std::uniform_int_distribution<int> row_dist(0, rows - 1);
-  std::uniform_int_distribution<int> span_dist(5, std::max(5, rows / 10));
-  std::uniform_real_distribution<float> trigger_dist(0.0f, 1.0f);
+  std::uniform_real_distribution<float> noise_dist(-0.03f, 0.03f);
 
-  // ---- Initialize persistent spatial signals ----------------------------
+  // ---- Sine-wave sweep parameters --------------------------------------
   //
-  // Signals are anchored to absolute spatial positions (meters) so they stay
-  // physically consistent when the spatial resolution changes via resize.
+  // Three sine waves sweep a Gaussian peak up and down through the spatial
+  // axis at different frequencies, creating a pleasant interference pattern.
+  // Angular frequencies are chosen so the pattern never quite repeats.
 
-  const int n_signals = 4;
-  // Four signals at 20/40/60/80% of the spatial extent
-  const std::array<double, 4> SIGNAL_POS_M = {
-      spatial_start_m + spatial_extent_m * 0.2,
-      spatial_start_m + spatial_extent_m * 0.4,
-      spatial_start_m + spatial_extent_m * 0.6,
-      spatial_start_m + spatial_extent_m * 0.8,
-  };
+  // Primary wave: slow, wide sweep across ~70% of the spatial extent
+  static constexpr float WAVE1_FREQ = 0.003f;   // radians per column
+  static constexpr float WAVE1_AMP  = 0.35f;    // fraction of rows (peak-to-peak/2)
+  static constexpr float WAVE1_WIDTH = 0.04f;   // Gaussian width as fraction of rows
+  static constexpr float WAVE1_BRIGHTNESS = 0.9f;
 
-  // Project absolute spatial position to row index for current `rows`
-  auto signal_row = [&](double pos_m) -> int {
-    return static_cast<int>(std::round(
-        (pos_m - spatial_start_m) / spatial_extent_m * rows));
-  };
+  // Secondary wave: faster, narrower, dimmer
+  static constexpr float WAVE2_FREQ = 0.0073f;
+  static constexpr float WAVE2_AMP  = 0.25f;
+  static constexpr float WAVE2_WIDTH = 0.025f;
+  static constexpr float WAVE2_BRIGHTNESS = 0.6f;
 
-  std::vector<PersistentSignal> signals(n_signals);
-  for (int i = 0; i < n_signals; i++) {
-    signals[i].row_center     = signal_row(SIGNAL_POS_M[i]);
-    signals[i].row_span       = std::max(3, rows / 20);
-    signals[i].base_amplitude = 0.3f + 0.2f * (i % 2);
-    signals[i].freq           = 0.02f + 0.01f * i;
-  }
-
-  // ---- Initialize impulse array ----------------------------------------
-
-  std::vector<Impulse> impulses(MAX_IMPULSES);
-  for (auto& imp : impulses) imp.active = false;
+  // Tertiary wave: very slow drift, wide and faint (background glow)
+  static constexpr float WAVE3_FREQ = 0.0011f;
+  static constexpr float WAVE3_AMP  = 0.40f;
+  static constexpr float WAVE3_WIDTH = 0.08f;
+  static constexpr float WAVE3_BRIGHTNESS = 0.3f;
 
   // ---- ZMQ setup -------------------------------------------------------
 
@@ -307,7 +277,7 @@ int main(int argc, char* argv[]) {
   };
 
   auto next_send_time = clk::now();
-  auto t_last_iter    = clk::now();  // tracks when the previous iteration ended
+  auto t_last_iter = clk::now();  // tracks when the previous iteration ended
 
   while (g_running) {
     auto t_iter_start = clk::now();  // wall time at start of this iteration
@@ -315,7 +285,8 @@ int main(int argc, char* argv[]) {
     // ---- Check for control messages (non-blocking) -------------------
 
     uint8_t ctrl_buf[4];
-    int ctrl_len = zmq_recv(sock_ctrl, ctrl_buf, sizeof(ctrl_buf), ZMQ_DONTWAIT);
+    int ctrl_len =
+        zmq_recv(sock_ctrl, ctrl_buf, sizeof(ctrl_buf), ZMQ_DONTWAIT);
     if (ctrl_len == 4) {
       uint32_t new_rows;
       memcpy(&new_rows, ctrl_buf, 4);
@@ -324,22 +295,11 @@ int main(int argc, char* argv[]) {
         rows = static_cast<int>(new_rows);
         std::cout << "Resize \u2192 rows=" << rows << "\n" << std::flush;
 
-        // Reproject signals to new row resolution
-        for (int i = 0; i < n_signals; i++) {
-          signals[i].row_center = signal_row(SIGNAL_POS_M[i]);
-          signals[i].row_span   = std::max(3, rows / 20);
-        }
-        row_dist  = std::uniform_int_distribution<int>(0, rows - 1);
-        span_dist = std::uniform_int_distribution<int>(5, std::max(5, rows / 10));
-
-        // Reallocate buffers
+        // Reallocate buffers for the new row count
         const size_t new_payload =
             static_cast<size_t>(rows) * cols_per_msg * sizeof(float);
         send_buf.resize(HEADER_BYTES + new_payload);
         col_buf.resize(static_cast<size_t>(rows) * cols_per_msg);
-
-        // Deactivate all impulses
-        for (auto& imp : impulses) imp.active = false;
       }
     }
 
@@ -349,61 +309,32 @@ int main(int argc, char* argv[]) {
 
     for (int c = 0; c < cols_per_msg; c++) {
       float* col = col_buf.data() + static_cast<size_t>(c) * rows;
+      const float t = static_cast<float>(col_index + c);
+      const float half = static_cast<float>(rows) * 0.5f;
 
-      // Base: noise floor (int8 ADC range normalized to float32)
+      // Sine-wave centers (oscillate around the midpoint of the spatial axis)
+      const float center1 = half + half * WAVE1_AMP * std::sin(t * WAVE1_FREQ);
+      const float center2 = half + half * WAVE2_AMP * std::sin(t * WAVE2_FREQ + 1.0f);
+      const float center3 = half + half * WAVE3_AMP * std::sin(t * WAVE3_FREQ + 2.5f);
+
+      const float inv_w1 = 1.0f / std::max(1.0f, static_cast<float>(rows) * WAVE1_WIDTH);
+      const float inv_w2 = 1.0f / std::max(1.0f, static_cast<float>(rows) * WAVE2_WIDTH);
+      const float inv_w3 = 1.0f / std::max(1.0f, static_cast<float>(rows) * WAVE3_WIDTH);
+
       for (int r = 0; r < rows; r++) {
-        col[r] = static_cast<float>(noise_dist(rng)) * ADC_NORM;
-      }
+        const float fr = static_cast<float>(r);
 
-      // Persistent spatial signals: sine-modulated Gaussian bumps
-      for (const auto& sig : signals) {
-        float amp =
-            sig.base_amplitude *
-            (0.5f + 0.5f * std::sin(static_cast<float>(col_index + c) * sig.freq));
-        for (int r = std::max(0, sig.row_center - sig.row_span);
-             r < std::min(rows, sig.row_center + sig.row_span); r++) {
-          float dist = static_cast<float>(r - sig.row_center) / sig.row_span;
-          col[r] += amp * std::exp(-dist * dist * 2.0f);
-        }
-      }
+        // Three Gaussian peaks sweeping at different speeds
+        const float d1 = (fr - center1) * inv_w1;
+        const float d2 = (fr - center2) * inv_w2;
+        const float d3 = (fr - center3) * inv_w3;
 
-      // Random impulse triggering (~2% chance per column)
-      if (trigger_dist(rng) < 0.02f) {
-        for (auto& imp : impulses) {
-          if (!imp.active) {
-            imp.row_start = row_dist(rng);
-            imp.row_span  = span_dist(rng);
-            imp.amplitude = amp_dist(rng);
-            imp.age       = 0;
-            imp.active    = true;
-            break;
-          }
-        }
-      }
+        float val = WAVE1_BRIGHTNESS * std::exp(-d1 * d1) +
+                    WAVE2_BRIGHTNESS * std::exp(-d2 * d2) +
+                    WAVE3_BRIGHTNESS * std::exp(-d3 * d3) +
+                    noise_dist(rng);
 
-      // Apply active impulses
-      for (auto& imp : impulses) {
-        if (!imp.active) continue;
-        float decay =
-            1.0f -
-            static_cast<float>(imp.age) / static_cast<float>(IMPULSE_DECAY_COLS);
-        if (decay <= 0.0f) {
-          imp.active = false;
-          continue;
-        }
-        float a = imp.amplitude * decay;
-        for (int r = std::max(0, imp.row_start - imp.row_span);
-             r < std::min(rows, imp.row_start + imp.row_span); r++) {
-          float dist =
-              static_cast<float>(r - imp.row_start) / imp.row_span;
-          col[r] += a * std::exp(-dist * dist * 2.0f);
-        }
-        imp.age++;
-      }
-
-      // Clamp to [-1, 1] (mirrors ADC saturation)
-      for (int r = 0; r < rows; r++) {
-        col[r] = std::max(-1.0f, std::min(1.0f, col[r]));
+        col[r] = std::max(-1.0f, std::min(1.0f, val));
       }
     }
 
@@ -448,23 +379,22 @@ int main(int argc, char* argv[]) {
     auto t_sleep_end = clk::now();
 
     if (debug) {
-      const double gap_ms      = ms_between(t_last_iter, t_iter_start);
-      const double gen_ms      = ms_between(t_gen_start, t_gen_end);
-      const double build_ms    = ms_between(t_gen_end, t_build_end);
+      const double gap_ms = ms_between(t_last_iter, t_iter_start);
+      const double gen_ms = ms_between(t_gen_start, t_gen_end);
+      const double build_ms = ms_between(t_gen_end, t_build_end);
       const double zmq_send_ms = ms_between(t_build_end, t_send_end);
-      const double sleep_ms    = ms_between(t_send_end, t_sleep_end);
-      const double total_ms    = ms_between(t_iter_start, t_sleep_end);
-      std::cout << "[perf] msg_id=" << (msg_id - 1)
-                << std::fixed << std::setprecision(2)
-                << " gap=" << gap_ms << "ms"
+      const double sleep_ms = ms_between(t_send_end, t_sleep_end);
+      const double total_ms = ms_between(t_iter_start, t_sleep_end);
+      std::cout << "[perf] msg_id=" << (msg_id - 1) << std::fixed
+                << std::setprecision(2) << " gap=" << gap_ms << "ms"
                 << " gen=" << gen_ms << "ms"
                 << " build=" << build_ms << "ms"
                 << " zmq_send=" << zmq_send_ms << "ms"
                 << " sleep=" << sleep_ms << "ms"
                 << " total=" << total_ms << "ms"
-                << " bytes=" << total_bytes
-                << (rc < 0 ? " [DROPPED]" : "")
-                << "\n" << std::flush;
+                << " bytes=" << total_bytes << (rc < 0 ? " [DROPPED]" : "")
+                << "\n"
+                << std::flush;
     }
 
     t_last_iter = t_sleep_end;

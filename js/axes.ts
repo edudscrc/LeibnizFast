@@ -492,9 +492,9 @@ function drawYAxis(
   ctx.lineTo(axisX, layout.y + layout.height);
   ctx.stroke();
 
-  // Ticks — Y axis is inverted (top = min or max depending on convention)
-  // In matrix visualization, row 0 is at the top. For chart axes, we put
-  // yMin at the bottom and yMax at the top.
+  // Ticks — image convention: row 0 is at the top of the canvas, which
+  // corresponds to yMin (the near/start of the physical range). generateTicks
+  // produces position=0 for yMin, which maps to layout.y (top). No inversion.
   const ticks = generateTicks(
     visible.yMin,
     visible.yMax,
@@ -508,8 +508,9 @@ function drawYAxis(
   ctx.textBaseline = 'middle';
 
   for (const tick of ticks) {
-    // Invert Y: bottom = min, top = max
-    const y = layout.y + layout.height - tick.position;
+    // No inversion: UV.y=0 is the top of the canvas, which corresponds to
+    // yMin (row 0), so position=0 should map to the top of the matrix area.
+    const y = layout.y + tick.position;
 
     // Tick mark
     ctx.strokeStyle = tickColor;
