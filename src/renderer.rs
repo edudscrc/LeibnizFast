@@ -122,9 +122,27 @@ pub struct Renderer {
     colormap_applied: bool,
     /// Enable performance timing logs.
     debug: bool,
+
+    /// Reusable buffer for reading matrix chunks, avoiding per-chunk allocations.
+    /// Sized to `staging_capacity_rows * cols` during pipeline rebuild.
+    chunk_buffer: Vec<f32>,
+
+    /// Ring buffer write cursor: the next texture column to write to.
+    /// Advances by `new_cols` on each scrolled update. Wraps at `matrix_cols`.
+    ring_cursor: u32,
 }
 
 impl Renderer {
+    /// Borrow the reusable chunk buffer, growing it if needed.
+    ///
+    /// Returns a mutable slice of exactly `len` elements, resizing the
+    /// internal Vec only when the current capacity is too small.
+    pub fn chunk_buf_mut(&mut self, len: usize) -> &mut [f32] {
+        if self.chunk_buffer.len() < len {
+            self.chunk_buffer.resize(len, 0.0f32);
+        }
+        &mut self.chunk_buffer[..len]
+    }
     /// Create a new Renderer from an HTML canvas element.
     pub async fn new(canvas: &web_sys::HtmlCanvasElement, debug: bool) -> Result<Self, String> {
         let _timer = PerfTimer::new("Renderer::new", debug);
@@ -226,6 +244,8 @@ impl Renderer {
             matrix_cols: 0,
             colormap_applied: false,
             debug,
+            chunk_buffer: Vec::new(),
+            ring_cursor: 0,
         })
     }
 
@@ -319,6 +339,10 @@ impl Renderer {
                     col_offset: col_start,
                     total_cols: cols,
                     texture_row_offset: 0,
+                    texture_col_offset: 0,
+                    col_major: 0,
+                    col_stride: 0,
+                    _pad2: 0,
                 };
                 let params_buf =
                     self.device
@@ -348,7 +372,8 @@ impl Renderer {
         let (tile_camera_buffers, tile_render_bind_groups) =
             self.build_tile_render_data(&grid, camera, &render_layout, &tile_texture_views);
 
-        // Commit
+        // Commit — reset ring cursor (tile dimensions may have changed)
+        self.ring_cursor = 0;
         self.tile_textures = tile_textures;
         self.tile_texture_views = tile_texture_views;
         self.tile_params_buffers = tile_params_buffers;
@@ -445,12 +470,19 @@ impl Renderer {
                 ];
                 let composed_scale = [cam.uv_scale[0] / tile_col_sz, cam.uv_scale[1] / tile_row_sz];
 
-                // Pack into a 16-byte buffer: [offset_x, offset_y, scale_x, scale_y]
-                let data: [f32; 4] = [
-                    composed_offset[0],
-                    composed_offset[1],
-                    composed_scale[0],
-                    composed_scale[1],
+                // Pack into 32-byte buffer matching WGSL CameraUniforms:
+                // X stays in full-matrix UV space so the ring offset is applied
+                // once at the correct scale before per-tile mapping.
+                // Y is pre-composed to tile-local UV (no ring on Y).
+                let data: [f32; 8] = [
+                    cam.uv_offset[0],            // uv_x_offset (full-matrix)
+                    composed_offset[1],          // uv_y_offset (tile-local)
+                    cam.uv_scale[0],             // uv_x_scale  (full-matrix)
+                    composed_scale[1],           // uv_y_scale  (tile-local)
+                    self.ring_offset_fraction(), // ring_offset
+                    0.0,                         // _pad0
+                    tile_col_off,                // tile_x_offset
+                    tile_col_sz,                 // tile_x_size
                 ];
 
                 let tile_camera_buf =
@@ -477,6 +509,7 @@ impl Renderer {
     /// rebuilding textures or pipelines.
     pub fn update_tile_camera_buffers(&self, grid: &TileGrid, camera: &Camera) {
         let cam = camera.state.get_uniforms();
+        let ring_off = self.ring_offset_fraction();
         for (tx, ty) in grid.iter_tiles() {
             let idx = grid.tile_index(tx, ty);
             let tile_col_off = grid.col_uv_offset(tx);
@@ -484,11 +517,15 @@ impl Renderer {
             let tile_col_sz = grid.col_uv_size(tx);
             let tile_row_sz = grid.row_uv_size(ty);
 
-            let data: [f32; 4] = [
-                (cam.uv_offset[0] - tile_col_off) / tile_col_sz,
-                (cam.uv_offset[1] - tile_row_off) / tile_row_sz,
-                cam.uv_scale[0] / tile_col_sz,
-                cam.uv_scale[1] / tile_row_sz,
+            let data: [f32; 8] = [
+                cam.uv_offset[0],                                // uv_x_offset (full-matrix)
+                (cam.uv_offset[1] - tile_row_off) / tile_row_sz, // uv_y_offset (tile-local)
+                cam.uv_scale[0],                                 // uv_x_scale  (full-matrix)
+                cam.uv_scale[1] / tile_row_sz,                   // uv_y_scale  (tile-local)
+                ring_off,                                        // ring_offset
+                0.0,                                             // _pad0
+                tile_col_off,                                    // tile_x_offset
+                tile_col_sz,                                     // tile_x_size
             ];
             self.queue.write_buffer(
                 &self.tile_camera_buffers[idx],
@@ -584,65 +621,74 @@ impl Renderer {
             None => return,
         };
 
-        for (tx, ty) in grid.iter_tiles() {
-            let tile_idx = grid.tile_index(tx, ty);
-            let (col_start, _) = grid.tile_col_range(tx);
+        // Iterate by row-band first, then dispatch all X-tiles sharing those rows
+        // in a single encoder+submit. This avoids redundant data reads and reduces
+        // GPU submission overhead from O(tiles_x × chunks) to O(chunks).
+        for ty in 0..grid.tiles_y {
             let (row_start, row_end) = grid.tile_row_range(ty);
-            let tile_w = grid.tile_width(tx);
             let tile_h = row_end - row_start;
-
-            let bind_group = &self.tile_compute_bind_groups[tile_idx];
             let mut current_tile_row: u32 = 0;
 
             while current_tile_row < tile_h {
                 let chunk_rows = staging_rows.min(tile_h - current_tile_row);
                 let abs_row_start = row_start + current_tile_row;
 
-                // Read full rows from data source for this chunk
+                // Read full rows once for all X-tiles in this band
                 let chunk_len = (chunk_rows as usize) * (cols as usize);
-                let mut chunk = vec![0.0f32; chunk_len];
+                if self.chunk_buffer.len() < chunk_len {
+                    self.chunk_buffer.resize(chunk_len, 0.0f32);
+                }
                 let start_idx = (abs_row_start as usize) * (cols as usize);
-                read_fn(start_idx, &mut chunk);
+                read_fn(start_idx, &mut self.chunk_buffer[..chunk_len]);
+                matrix.write_staging_chunk(&self.queue, &self.chunk_buffer[..chunk_len]);
 
-                // Write chunk to staging buffer at offset 0
-                matrix.write_staging_chunk(&self.queue, &chunk);
-
-                // Params: row_offset=0 (data starts at buffer start),
-                // col_offset for this tile, texture_row_offset for Y position
-                self.write_tile_params(
-                    tile_idx,
-                    &MatrixParams {
-                        rows: chunk_rows,
-                        cols: tile_w,
-                        min_val,
-                        max_val,
-                        row_offset: 0,
-                        col_offset: col_start,
-                        total_cols: cols,
-                        texture_row_offset: current_tile_row,
-                    },
-                );
-
+                // Single encoder for all X-tiles in this chunk
                 let mut encoder =
                     self.device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("Tiled Compute Encoder"),
                         });
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("Tiled Colormap Pass"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(compute_pipeline);
-                    pass.set_bind_group(0, bind_group, &[]);
-                    pass.dispatch_workgroups(
-                        (tile_w + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
-                        (chunk_rows + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
-                        1,
-                    );
-                }
-                self.queue.submit(std::iter::once(encoder.finish()));
 
+                for tx in 0..grid.tiles_x {
+                    let tile_idx = grid.tile_index(tx, ty);
+                    let (col_start, _) = grid.tile_col_range(tx);
+                    let tile_w = grid.tile_width(tx);
+
+                    self.write_tile_params(
+                        tile_idx,
+                        &MatrixParams {
+                            rows: chunk_rows,
+                            cols: tile_w,
+                            min_val,
+                            max_val,
+                            row_offset: 0,
+                            col_offset: col_start,
+                            total_cols: cols,
+                            texture_row_offset: current_tile_row,
+                            texture_col_offset: 0,
+                            col_major: 0,
+                            col_stride: 0,
+                            _pad2: 0,
+                        },
+                    );
+
+                    let bind_group = &self.tile_compute_bind_groups[tile_idx];
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Tiled Colormap Pass"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(compute_pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
+                        pass.dispatch_workgroups(
+                            (tile_w + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                            (chunk_rows + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                            1,
+                        );
+                    }
+                }
+
+                self.queue.submit(std::iter::once(encoder.finish()));
                 current_tile_row += chunk_rows;
             }
         }
@@ -681,6 +727,14 @@ impl Renderer {
 
         let chunk_row_end = row_offset + chunk_rows;
 
+        // Single encoder for all tile dispatches — the staging buffer is not
+        // overwritten between tiles so all compute passes can share one submit.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Stream Compute Encoder"),
+            });
+
         for ty in 0..grid.tiles_y {
             let (tile_row_start, tile_row_end) = grid.tile_row_range(ty);
             if tile_row_end <= row_offset || tile_row_start >= chunk_row_end {
@@ -714,14 +768,13 @@ impl Renderer {
                         col_offset: col_start,
                         total_cols: cols,
                         texture_row_offset,
+                        texture_col_offset: 0,
+                        col_major: 0,
+                        col_stride: 0,
+                        _pad2: 0,
                     },
                 );
 
-                let mut encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Stream Compute Encoder"),
-                        });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("Stream Colormap Pass"),
@@ -735,9 +788,196 @@ impl Renderer {
                         1,
                     );
                 }
-                self.queue.submit(std::iter::once(encoder.finish()));
             }
         }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Ring-buffer scrolled update: write new columns at `ring_cursor` and advance.
+    ///
+    /// The texture acts as a circular buffer. New columns are written at the
+    /// current cursor position (wrapping at texture width). The render shader
+    /// applies `ring_offset` to unwrap the ring so the oldest column appears at
+    /// the left edge and the newest at the right.
+    ///
+    /// Requires the JS-side buffer to be **column-major**: column `c` occupies
+    /// `data[c * rows .. (c+1) * rows]`. This means the JS ring cursor and the
+    /// texture ring cursor are both in sync: same position, both advance by
+    /// `new_cols` each frame.
+    ///
+    /// Cost: O(rows × new_cols) per frame — independent of total column count.
+    /// For the common case (rows ≤ staging capacity), a single `read_fn` call
+    /// per x-tile per segment transfers all new column data in one JS/WASM copy.
+    pub fn apply_colormap_ring(
+        &mut self,
+        matrix: &MatrixView,
+        read_fn: &dyn Fn(usize, &mut [f32]),
+        cols: u32,
+        new_cols: u32,
+        min_val: f32,
+        max_val: f32,
+    ) {
+        let _timer = PerfTimer::new("apply_colormap_ring", self.debug);
+        let grid = match &self.tile_grid {
+            Some(g) => g.clone(),
+            None => return,
+        };
+        let compute_pipeline = match &self.compute_pipeline {
+            Some(p) => p,
+            None => return,
+        };
+
+        if new_cols == 0 {
+            return;
+        }
+
+        // Clamp: if all columns are replaced it is equivalent to a full refresh
+        // starting from the current cursor position (ring stays in-place).
+        let new_cols = new_cols.min(cols);
+
+        let rows = self.matrix_rows;
+        let rows_usize = rows as usize;
+        let staging_rows = matrix.staging_capacity_rows();
+
+        // Split at the wrap boundary: [cursor..cols) then [0..remainder)
+        let cursor = self.ring_cursor;
+        let first_segment = new_cols.min(cols - cursor);
+        let second_segment = new_cols - first_segment;
+
+        // Each segment is a contiguous ring-position range starting at tex_col_start.
+        // Because the JS buffer is column-major with the same ring layout, the JS
+        // positions are identical to the texture positions within [0, cols).
+        let segments: [(u32, u32); 2] = [(cursor, first_segment), (0, second_segment)];
+
+        for &(seg_start, seg_cols) in &segments {
+            if seg_cols == 0 {
+                continue;
+            }
+            let seg_end = seg_start + seg_cols;
+
+            for tx in 0..grid.tiles_x {
+                let (tile_col_start, tile_col_end) = grid.tile_col_range(tx);
+
+                // Clip segment to this tile's column range
+                let clip_start = seg_start.max(tile_col_start);
+                let clip_end = seg_end.min(tile_col_end);
+                if clip_start >= clip_end {
+                    continue;
+                }
+                let tile_new_cols = clip_end - clip_start;
+                let tile_new_cols_usize = tile_new_cols as usize;
+
+                // Texture-local write offset within this tile
+                let tex_col_offset = clip_start - tile_col_start;
+
+                for ty in 0..grid.tiles_y {
+                    let tile_idx = grid.tile_index(tx, ty);
+                    let (row_start, row_end) = grid.tile_row_range(ty);
+                    let tile_h = row_end - row_start;
+                    let mut current_tile_row: u32 = 0;
+
+                    while current_tile_row < tile_h {
+                        let chunk_rows = staging_rows.min(tile_h - current_tile_row);
+                        let abs_row_start = row_start + current_tile_row;
+                        let chunk_rows_usize = chunk_rows as usize;
+
+                        let staging_len = tile_new_cols_usize * chunk_rows_usize;
+                        if self.chunk_buffer.len() < staging_len {
+                            self.chunk_buffer.resize(staging_len, 0.0f32);
+                        }
+
+                        // Read new columns from column-major ring buffer.
+                        //
+                        // The JS buffer stores column c at data[c*rows .. (c+1)*rows].
+                        // For the common case where all rows fit in one chunk
+                        // (chunk_rows == tile_h), columns clip_start..clip_end are
+                        // contiguous in memory — one read_fn call copies everything.
+                        //
+                        // For multi-chunk (large row counts), each column's portion
+                        // is non-contiguous, so we fall back to per-column reads.
+                        if chunk_rows == tile_h {
+                            // Fast path: contiguous block covering all tile rows
+                            let js_start = clip_start as usize * rows_usize;
+                            read_fn(js_start, &mut self.chunk_buffer[..staging_len]);
+                        } else {
+                            // Slow path: multiple row chunks, read per column
+                            for c in 0..tile_new_cols_usize {
+                                let js_col = clip_start as usize + c;
+                                let js_off = js_col * rows_usize + abs_row_start as usize;
+                                let stage_start = c * chunk_rows_usize;
+                                read_fn(
+                                    js_off,
+                                    &mut self.chunk_buffer
+                                        [stage_start..stage_start + chunk_rows_usize],
+                                );
+                            }
+                        }
+
+                        matrix.write_staging_chunk(&self.queue, &self.chunk_buffer[..staging_len]);
+
+                        // Dispatch compute: column-major staging, no row/col offsets
+                        // needed since the staging buffer is tile-local.
+                        let mut encoder =
+                            self.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("Ring Colormap Encoder"),
+                                });
+                        {
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("Ring Colormap Pass"),
+                                    timestamp_writes: None,
+                                });
+                            pass.set_pipeline(compute_pipeline);
+                            pass.set_bind_group(0, &self.tile_compute_bind_groups[tile_idx], &[]);
+                            self.write_tile_params(
+                                tile_idx,
+                                &MatrixParams {
+                                    rows: chunk_rows,
+                                    cols: tile_new_cols,
+                                    min_val,
+                                    max_val,
+                                    row_offset: 0,
+                                    col_offset: 0,
+                                    total_cols: 0,
+                                    texture_row_offset: current_tile_row,
+                                    texture_col_offset: tex_col_offset,
+                                    col_major: 1,
+                                    col_stride: chunk_rows,
+                                    _pad2: 0,
+                                },
+                            );
+                            pass.dispatch_workgroups(
+                                (tile_new_cols + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                                (chunk_rows + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                                1,
+                            );
+                        }
+                        self.queue.submit(std::iter::once(encoder.finish()));
+
+                        current_tile_row += chunk_rows;
+                    }
+                }
+            }
+        }
+
+        self.ring_cursor = (cursor + new_cols) % cols;
+        self.colormap_applied = true;
+    }
+
+    /// Get the current ring buffer offset as a fraction of texture width [0, 1).
+    /// Returns 0.0 when the ring buffer is not active (cursor at 0).
+    pub fn ring_offset_fraction(&self) -> f32 {
+        if self.matrix_cols == 0 {
+            return 0.0;
+        }
+        self.ring_cursor as f32 / self.matrix_cols as f32
+    }
+
+    /// Reset the ring cursor to 0 (e.g. after a full colormap or dimension change).
+    pub fn reset_ring_cursor(&mut self) {
+        self.ring_cursor = 0;
     }
 
     // -----------------------------------------------------------------------

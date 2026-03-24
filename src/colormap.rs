@@ -58,8 +58,25 @@ pub fn apply_colormap_cpu(
     max_val: f32,
     lut: &[[u8; 3]; 256],
 ) -> Vec<u8> {
-    let range = max_val - min_val;
     let mut rgba = Vec::with_capacity(data.len() * RGBA_CHANNELS);
+    apply_colormap_cpu_into(data, min_val, max_val, lut, &mut rgba);
+    rgba
+}
+
+/// Apply a colormap to matrix data on the CPU, writing into a reusable buffer.
+///
+/// Like `apply_colormap_cpu` but writes into `output` instead of allocating.
+/// The buffer is cleared and refilled, reusing its existing heap allocation.
+pub fn apply_colormap_cpu_into(
+    data: &[f32],
+    min_val: f32,
+    max_val: f32,
+    lut: &[[u8; 3]; 256],
+    output: &mut Vec<u8>,
+) {
+    let range = max_val - min_val;
+    output.clear();
+    output.reserve(data.len() * RGBA_CHANNELS);
 
     for &value in data {
         let normalized = if range > 0.0 {
@@ -72,13 +89,11 @@ pub fn apply_colormap_cpu(
         let idx = (normalized * COLORMAP_MAX_INDEX_F32).round() as usize;
         let idx = idx.min(COLORMAP_MAX_INDEX);
         let rgb = lut[idx];
-        rgba.push(rgb[0]);
-        rgba.push(rgb[1]);
-        rgba.push(rgb[2]);
-        rgba.push(RGBA_ALPHA_OPAQUE);
+        output.push(rgb[0]);
+        output.push(rgb[1]);
+        output.push(rgb[2]);
+        output.push(RGBA_ALPHA_OPAQUE);
     }
-
-    rgba
 }
 
 /// GPU texture + sampler for a colormap lookup table.

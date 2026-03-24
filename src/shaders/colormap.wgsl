@@ -35,6 +35,14 @@ struct MatrixParams {
     total_cols: u32,
     // Y offset when writing to tile texture (for multi-chunk-per-tile staging)
     texture_row_offset: u32,
+    // X offset when writing to tile texture (for partial column updates / scrolling)
+    texture_col_offset: u32,
+    // When 1, the staging buffer is column-major: data[col * col_stride + row].
+    // When 0 (default), the staging buffer is row-major: data[row * total_cols + col].
+    col_major: u32,
+    // Stride for column-major indexing (= total matrix rows). Unused when col_major=0.
+    col_stride: u32,
+    _pad2: u32,
 }
 @group(0) @binding(2) var<uniform> params: MatrixParams;
 
@@ -59,8 +67,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let abs_row = tile_row + params.row_offset;
     let abs_col = tile_col + params.col_offset;
 
-    // Read from the flat buffer using absolute coordinates and full-matrix width
-    let idx = abs_row * params.total_cols + abs_col;
+    // Read from the staging buffer. Row-major (default) uses the full-matrix row
+    // stride; column-major (ring-buffer path) uses the column stride so the new
+    // column strip can be uploaded without transposing.
+    let idx = select(
+        abs_row * params.total_cols + abs_col,     // row-major
+        abs_col * params.col_stride + abs_row,      // column-major
+        params.col_major != 0u,
+    );
     let value = matrix_data[idx];
 
     // Normalize to [0, 1]
@@ -80,5 +94,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Write to tile-relative coordinates in the output texture.
     // texture_row_offset shifts Y when multiple chunks write to the same tile.
-    textureStore(output_texture, vec2<i32>(i32(tile_col), i32(tile_row + params.texture_row_offset)), color);
+    // texture_col_offset shifts X for partial column updates (scrolled streaming).
+    textureStore(output_texture, vec2<i32>(i32(tile_col + params.texture_col_offset), i32(tile_row + params.texture_row_offset)), color);
 }

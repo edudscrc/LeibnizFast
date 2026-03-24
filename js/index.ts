@@ -24,6 +24,7 @@ import type {
   CreateOptions,
   DataOptions,
   HoverCallback,
+  ScrolledDataOptions,
   StreamingAxisConfig,
   StreamingDataOptions,
 } from './types';
@@ -43,6 +44,7 @@ export type {
   CreateOptions,
   DataOptions,
   HoverCallback,
+  ScrolledDataOptions,
   StreamingAxisConfig,
   StreamingDataOptions,
 };
@@ -105,6 +107,10 @@ export class LeibnizFast {
   private streamingDisplayCols: number = 0;
   /** Streaming X axis: total columns received (including scrolled-off). */
   private streamingXOffset: number = 0;
+  /** Cached canvas bounding rect, invalidated on resize. */
+  private cachedCanvasRect: DOMRect | null = null;
+  /** Whether an overlay rAF redraw is already scheduled. */
+  private overlayDirty: boolean = false;
 
   private constructor(
     inner: WasmLeibnizFast,
@@ -124,26 +130,26 @@ export class LeibnizFast {
     // Bind DOM event handlers
     this.boundHandlers = {
       mousedown: (e: MouseEvent) => {
-        const rect = canvas.getBoundingClientRect();
+        const rect = this.getCanvasRect();
         this.inner.onMouseDown(e.clientX - rect.left, e.clientY - rect.top);
       },
       mousemove: (e: MouseEvent) => {
-        const rect = canvas.getBoundingClientRect();
+        const rect = this.getCanvasRect();
         this.inner.onMouseMove(e.clientX - rect.left, e.clientY - rect.top);
-        this.updateOverlay();
+        this.scheduleOverlayUpdate();
       },
       mouseup: () => {
         this.inner.onMouseUp();
       },
       wheel: (e: WheelEvent) => {
         e.preventDefault();
-        const rect = canvas.getBoundingClientRect();
+        const rect = this.getCanvasRect();
         this.inner.onWheel(
           e.clientX - rect.left,
           e.clientY - rect.top,
           -e.deltaY,
         );
-        this.updateOverlay();
+        this.scheduleOverlayUpdate();
       },
       resize: () => {
         this.handleResize();
@@ -226,6 +232,38 @@ export class LeibnizFast {
       }
     }
     this.updateOverlay();
+  }
+
+  /**
+   * Scrolled streaming update: shift existing pixels left and only colormap
+   * new columns at the right edge.
+   *
+   * Use this instead of `setData` for waterfall / scrolling time series where
+   * the buffer shifts left by `newCols` each frame. Reduces per-frame GPU work
+   * from O(rows × cols) to O(rows × newCols).
+   *
+   * **Requires `setRange()` to be called first.** Without a fixed range, this
+   * falls back to a full `setData`.
+   *
+   * @param data - Full Float32Array in row-major order (used for hover lookups)
+   * @param options - Matrix dimensions and number of new columns
+   */
+  setDataScrolled(data: Float32Array, options: ScrolledDataOptions): void {
+    this.timeSync('JS setDataScrolled', () =>
+      this.inner.setDataScrolled(
+        data,
+        options.rows,
+        options.cols,
+        options.newCols,
+      ),
+    );
+    if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
+      this.streamingDisplayCols = options.cols;
+      if (options.xOffset !== undefined) {
+        this.streamingXOffset = options.xOffset;
+      }
+    }
+    this.scheduleOverlayUpdate();
   }
 
   /**
@@ -494,6 +532,7 @@ export class LeibnizFast {
    * update the WASM renderer, and redraw the overlay.
    */
   private handleResize(): void {
+    this.cachedCanvasRect = null; // invalidate on resize
     const dpr = window.devicePixelRatio || 1;
 
     if (this.chartConfig && this.wrapperDiv && this.overlayCtx) {
@@ -535,6 +574,30 @@ export class LeibnizFast {
       this.canvas.height = rect.height * dpr;
       this.inner.resize(this.canvas.width, this.canvas.height);
     }
+  }
+
+  /**
+   * Get the cached canvas bounding rect, computing it if invalidated.
+   * Avoids forcing a layout reflow on every mouse event.
+   */
+  private getCanvasRect(): DOMRect {
+    if (!this.cachedCanvasRect) {
+      this.cachedCanvasRect = this.canvas.getBoundingClientRect();
+    }
+    return this.cachedCanvasRect;
+  }
+
+  /**
+   * Schedule an overlay redraw on the next animation frame.
+   * Multiple calls per frame are coalesced into a single redraw.
+   */
+  private scheduleOverlayUpdate(): void {
+    if (this.overlayDirty) return;
+    this.overlayDirty = true;
+    requestAnimationFrame(() => {
+      this.overlayDirty = false;
+      this.updateOverlay();
+    });
   }
 
   /**

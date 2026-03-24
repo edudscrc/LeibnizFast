@@ -251,12 +251,133 @@ mod wasm_entry {
                     }
                 }
             }
+            // setData always performs a full colormap from scratch, so the ring
+            // cursor must be at 0 — any subsequent setDataScrolled call will use
+            // a fresh JS WaterfallBuffer whose ringCursor is also 0.
+            self.renderer.reset_ring_cursor();
 
             // On WebGL2: apply colormap on CPU and upload the colored texture
             self.upload_cpu_colormap_if_needed();
 
             self.render_frame()?;
 
+            Ok(())
+        }
+
+        /// Scrolled streaming update: shift existing pixels left and only colormap new columns.
+        ///
+        /// Use this instead of `setData` when the JS buffer shifts left by `new_cols`
+        /// and writes new data at the right edge (waterfall/scrolling pattern).
+        /// Reduces per-frame GPU work from O(rows × cols) to O(rows × new_cols).
+        ///
+        /// **Requires `setRange()` to be called first** to set a fixed colormap range.
+        /// Without a fixed range, falls back to full `setData`.
+        #[wasm_bindgen(js_name = setDataScrolled)]
+        pub fn set_data_scrolled(
+            &mut self,
+            data: js_sys::Float32Array,
+            rows: u32,
+            cols: u32,
+            new_cols: u32,
+        ) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("set_data_scrolled", self.debug);
+
+            // Require sticky_range — without it we'd need a full min/max scan
+            // which defeats the purpose of the scrolled path.
+            let (min_val, max_val) = match self.sticky_range {
+                Some(range) => range,
+                None => {
+                    // Fall back to full setData if no fixed range
+                    return self.set_data(data, rows, cols);
+                }
+            };
+
+            let expected_len = rows * cols;
+            if data.length() != expected_len {
+                return Err(JsValue::from_str(&format!(
+                    "Data length {} does not match rows×cols = {}×{} = {}",
+                    data.length(),
+                    rows,
+                    cols,
+                    expected_len
+                )));
+            }
+
+            // Store as JsDataSource with the fixed range (skip scan)
+            let js_data = matrix::JsDataSource::new_with_range(data, rows, cols, min_val, max_val);
+            self.js_data = Some(js_data);
+
+            // Check if pipeline already exists for these dimensions
+            let same_dims = self.renderer.has_compute
+                && self
+                    .matrix
+                    .as_ref()
+                    .map_or(false, |m| m.rows() == rows && m.cols() == cols);
+
+            if !same_dims {
+                // First call or dimension change — do a full setData instead
+                if self.colormap_texture.is_none() || self.current_colormap_lut.is_none() {
+                    self.set_colormap_internal(&self.current_colormap.clone())?;
+                }
+                self.camera.state.set_matrix_size(rows, cols);
+
+                if self.renderer.has_compute {
+                    let matrix_view = matrix::MatrixView::with_empty_buffer(
+                        &self.renderer.device,
+                        rows,
+                        cols,
+                        self.debug,
+                    )
+                    .map_err(|e| JsValue::from_str(&e))?;
+                    self.matrix = Some(matrix_view);
+
+                    self.renderer
+                        .rebuild_pipelines(
+                            &self.matrix,
+                            &self.colormap_texture,
+                            &self.camera,
+                            rows,
+                            cols,
+                        )
+                        .map_err(|e| JsValue::from_str(&e))?;
+
+                    // Full colormap for the first frame — reset ring cursor
+                    self.renderer.reset_ring_cursor();
+                    if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
+                        let read_fn = |start: usize, buf: &mut [f32]| {
+                            jd.read_range(start, buf);
+                        };
+                        self.renderer.apply_colormap_tiled(
+                            matrix_view,
+                            &read_fn,
+                            cols,
+                            min_val,
+                            max_val,
+                        );
+                    }
+                }
+                self.upload_cpu_colormap_if_needed();
+                self.render_frame()?;
+                return Ok(());
+            }
+
+            // Ring-buffer fast path: only colormap the new columns at the cursor,
+            // O(rows × new_cols) regardless of total column count.
+            if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
+                let read_fn = |start: usize, buf: &mut [f32]| {
+                    jd.read_range(start, buf);
+                };
+                self.renderer.apply_colormap_ring(
+                    matrix_view,
+                    &read_fn,
+                    cols,
+                    new_cols,
+                    min_val,
+                    max_val,
+                );
+            }
+
+            self.render_frame()?;
             Ok(())
         }
 
@@ -727,7 +848,8 @@ mod wasm_entry {
         /// Only runs when compute shaders are unavailable. Uses chunked uploads
         /// for large matrices to avoid allocating the full RGBA buffer at once.
         /// Reads from JS-heap data via `JsDataSource::read_range()`.
-        fn upload_cpu_colormap_if_needed(&self) {
+        /// Reuses the renderer's chunk_buffer to avoid per-chunk allocations.
+        fn upload_cpu_colormap_if_needed(&mut self) {
             if self.renderer.has_compute {
                 return; // WebGPU path uses compute shader instead
             }
@@ -743,15 +865,27 @@ mod wasm_entry {
                     chunked_upload::ChunkConfig { chunk_rows: None },
                 );
 
+                let mut rgba_buffer: Vec<u8> = Vec::new();
+
                 while let Some((start_row, end_row)) = uploader.next_chunk_range() {
                     let start_idx = (start_row as usize) * (cols as usize);
                     let chunk_len = (end_row - start_row) as usize * (cols as usize);
-                    let mut chunk_buf = vec![0.0f32; chunk_len];
-                    jd.read_range(start_idx, &mut chunk_buf);
-                    let rgba = colormap::apply_colormap_cpu(&chunk_buf, min_val, max_val, lut);
+                    let chunk_buf = self.renderer.chunk_buf_mut(chunk_len);
+                    jd.read_range(start_idx, chunk_buf);
+                    colormap::apply_colormap_cpu_into(
+                        chunk_buf,
+                        min_val,
+                        max_val,
+                        lut,
+                        &mut rgba_buffer,
+                    );
                     let chunk_rows = end_row - start_row;
-                    self.renderer
-                        .upload_colored_texture_region(&rgba, cols, chunk_rows, start_row);
+                    self.renderer.upload_colored_texture_region(
+                        &rgba_buffer,
+                        cols,
+                        chunk_rows,
+                        start_row,
+                    );
                     uploader.advance();
                 }
             }

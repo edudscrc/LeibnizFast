@@ -10,7 +10,8 @@
 /// Uniform parameters for the compute shader.
 ///
 /// Contains matrix dimensions, data range, and chunk offset for normalization.
-/// Must match the WGSL struct layout exactly (32 bytes, 8 × u32/f32).
+/// Must match the WGSL struct layout exactly (48 bytes, 12 × u32/f32).
+/// Padded to 48 bytes for WGSL uniform struct alignment (multiple of 16).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MatrixParams {
@@ -30,6 +31,14 @@ pub struct MatrixParams {
     pub total_cols: u32,
     /// Y offset when writing to tile texture (for multi-chunk-per-tile staging)
     pub texture_row_offset: u32,
+    /// X offset when writing to tile texture (for partial column updates / scrolling)
+    pub texture_col_offset: u32,
+    /// When 1, staging buffer is column-major: `data[col * col_stride + row]`.
+    /// When 0 (default), row-major: `data[row * total_cols + col]`.
+    pub col_major: u32,
+    /// Column stride for column-major path (= total matrix rows). 0 otherwise.
+    pub col_stride: u32,
+    pub _pad2: u32,
 }
 
 /// Page size for paged storage: 64 MB / 4 bytes per f32 = 16M elements.
@@ -232,17 +241,24 @@ impl MatrixData {
     /// Append row data incrementally, updating the running min/max.
     ///
     /// `chunk` must contain a whole number of rows (length divisible by `cols`).
+    /// Uses a two-pass approach (min then max via fold) that auto-vectorizes
+    /// better than a single loop with `is_finite()` branch per element.
     pub fn append_rows(&mut self, chunk: &[f32]) {
-        // Update running min/max
-        for &v in chunk {
-            if v.is_finite() {
-                if v < self.min_val {
-                    self.min_val = v;
-                }
-                if v > self.max_val {
-                    self.max_val = v;
-                }
-            }
+        let chunk_min = chunk
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::INFINITY, f32::min);
+        let chunk_max = chunk
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        if chunk_min < self.min_val {
+            self.min_val = chunk_min;
+        }
+        if chunk_max > self.max_val {
+            self.max_val = chunk_max;
         }
         self.data.append(chunk);
     }
@@ -414,6 +430,10 @@ impl MatrixView {
             col_offset: 0,
             total_cols: cols,
             texture_row_offset: 0,
+            texture_col_offset: 0,
+            col_major: 0,
+            col_stride: 0,
+            _pad2: 0,
         };
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Matrix Params Buffer"),
@@ -438,9 +458,11 @@ impl MatrixView {
     }
 }
 
-/// Chunk size for scanning min/max from JS Float32Array: 4M elements = 16 MB.
+/// Chunk size for scanning min/max from JS Float32Array: 1M elements = 4 MB.
+/// Smaller than the staging buffer to reduce peak allocation pressure while
+/// keeping JS/WASM boundary crossings reasonable (~40 for a 1 GB matrix).
 #[cfg(target_arch = "wasm32")]
-const SCAN_CHUNK_ELEMENTS: usize = 4 * 1024 * 1024;
+const SCAN_CHUNK_ELEMENTS: usize = 1024 * 1024;
 
 /// JS-heap-backed data source for matrix data.
 ///

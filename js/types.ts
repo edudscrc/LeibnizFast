@@ -122,6 +122,22 @@ export interface DataOptions {
 export type HoverCallback = (row: number, col: number, value: number) => void;
 
 /**
+ * Options for scrolled streaming update via setDataScrolled.
+ *
+ * Use when the buffer shifts left by `newCols` and writes new data
+ * at the right edge (waterfall / scrolling time series pattern).
+ */
+export interface ScrolledDataOptions extends DataOptions {
+  /**
+   * Number of new columns added at the right edge since the last frame.
+   * The GPU texture scrolls left by this amount and only the new columns
+   * are colormapped, reducing per-frame work from O(rows × cols) to
+   * O(rows × newCols).
+   */
+  newCols: number;
+}
+
+/**
  * Options for streaming data upload via beginData/appendChunk/endData.
  */
 export interface StreamingDataOptions {

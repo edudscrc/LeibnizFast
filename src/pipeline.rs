@@ -14,6 +14,8 @@ use crate::tile_grid::TileGrid;
 /// Factory for creating wgpu pipelines and their associated resources.
 pub struct PipelineFactory<'a> {
     device: &'a wgpu::Device,
+    /// Cached nearest-neighbor sampler, shared across all render bind groups.
+    render_sampler: wgpu::Sampler,
     /// Enable performance timing logs.
     debug: bool,
 }
@@ -21,7 +23,19 @@ pub struct PipelineFactory<'a> {
 impl<'a> PipelineFactory<'a> {
     /// Create a new pipeline factory for the given device.
     pub fn new(device: &'a wgpu::Device, debug: bool) -> Self {
-        Self { device, debug }
+        let render_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Nearest Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Self {
+            device,
+            render_sampler,
+            debug,
+        }
     }
 
     /// Create a single tile texture with the given dimensions.
@@ -316,15 +330,6 @@ impl<'a> PipelineFactory<'a> {
         tile_view: &wgpu::TextureView,
         camera_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Nearest Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Render Bind Group"),
             layout,
@@ -335,7 +340,7 @@ impl<'a> PipelineFactory<'a> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.render_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,

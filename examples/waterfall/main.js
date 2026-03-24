@@ -146,59 +146,55 @@ let rows = computeSpatialRows(genParams);
 
 class WaterfallBuffer {
   /**
+   * Column-major ring buffer — no per-frame shifting.
+   *
+   * Layout: data[col * rows .. (col+1) * rows] = all rows for column col.
+   * New columns are written at ringCursor (mod cols) and the cursor advances.
+   * The GPU texture mirrors this ring layout; the render shader applies
+   * ring_offset to unwrap it visually so oldest data appears on the left.
+   *
    * @param {number} rows - spatial samples per column
    * @param {number} cols - display width (time window)
    */
   constructor(rows, cols) {
     this.rows = rows;
     this.cols = cols;
+    // Column-major: column c occupies data[c*rows .. (c+1)*rows]
     this.data = new Float32Array(rows * cols);
+    /** Next write position in [0, cols). Mirrors the GPU texture ring cursor. */
+    this.ringCursor = 0;
   }
 
   /**
-   * Shift all rows left by `newCols` and write new column data at the right edge.
-   * @param {Float32Array} newData - float32[rows × newCols], columns contiguous
-   * @param {number} newCols - number of new columns
+   * Write new columns into the ring buffer without any data shifting.
+   * Cost: O(rows × newCols) — independent of total display width.
+   *
+   * @param {Float32Array} newData - column-major: column i = newData[i*rows .. (i+1)*rows]
+   * @param {number} newCols - number of new columns in newData
    */
   pushColumns(newData, newCols) {
     const { rows: r, cols: c, data } = this;
 
-    // Clamp: if more new columns than display width, only keep the rightmost
+    // Clamp: if more new columns than display width, keep only the most recent
     const effectiveCols = Math.min(newCols, c);
-    const dataOffset = (newCols - effectiveCols) * r;
+    const srcColOffset = newCols - effectiveCols;
 
-    if (effectiveCols >= c) {
-      // New data fills entire buffer — just copy the rightmost displayCols columns
-      for (let col = 0; col < c; col++) {
-        const srcCol = dataOffset / r + col;
-        for (let row = 0; row < r; row++) {
-          data[row * c + col] = newData[srcCol * r + row];
-        }
-      }
-      return;
+    for (let i = 0; i < effectiveCols; i++) {
+      const dstCol = (this.ringCursor + i) % c;
+      const srcStart = (srcColOffset + i) * r;
+      // Zero-copy column write: one TypedArray.set() = one memcpy
+      data.set(newData.subarray(srcStart, srcStart + r), dstCol * r);
     }
 
-    // Shift each row left by effectiveCols
-    for (let row = 0; row < r; row++) {
-      const rowStart = row * c;
-      data.copyWithin(rowStart, rowStart + effectiveCols, rowStart + c);
-    }
-
-    // Write new columns at the right edge
-    // newData layout: columns are contiguous blocks of `rows` floats
-    for (let col = 0; col < effectiveCols; col++) {
-      const srcOffset = dataOffset + col * r;
-      const dstColIdx = c - effectiveCols + col;
-      for (let row = 0; row < r; row++) {
-        data[row * c + dstColIdx] = newData[srcOffset + row];
-      }
-    }
+    this.ringCursor = (this.ringCursor + effectiveCols) % c;
   }
 }
 
 /** @type {WaterfallBuffer|null} */
 let buffer = null;
 let dirty = false;
+/** Number of new columns added since last render (for scrolled update). */
+let pendingNewCols = 0;
 
 // ---- Utilities ---------------------------------------------------------
 
@@ -316,6 +312,7 @@ function processMessage(buf) {
 
   buffer.pushColumns(colData, h.newCols);
   totalColsReceived += h.newCols;
+  pendingNewCols += h.newCols;
   dirty = true;
 
   const tAfterPush = performance.now();
@@ -339,11 +336,17 @@ function processMessage(buf) {
 
 function renderLoop() {
   if (dirty && viewer && buffer) {
-    viewer.setData(buffer.data, {
+    // Use scrolled update: GPU texture shifts left, only new columns are
+    // colormapped. Falls back to full setData if no range is set or on
+    // the first frame.
+    const newCols = Math.min(pendingNewCols, buffer.cols);
+    viewer.setDataScrolled(buffer.data, {
       rows: buffer.rows,
       cols: buffer.cols,
+      newCols,
       xOffset: totalColsReceived,
     });
+    pendingNewCols = 0;
     dirty = false;
     updateFps();
   }
