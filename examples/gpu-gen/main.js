@@ -285,7 +285,10 @@ async function main() {
 
   viewer.onHover((row, col, value) => {
     tooltip.style.display = 'block';
-    tooltip.textContent = `[${row}, ${col}] = ${value.toFixed(4)}`;
+    tooltip.innerHTML =
+      `Y: ${row}<br>` +
+      `X: ${col}<br>` +
+      `Value: ${value.toFixed(4)}`;
   });
 
   canvas.addEventListener('mousedown', (e) => {

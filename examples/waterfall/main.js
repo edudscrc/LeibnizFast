@@ -530,9 +530,12 @@ async function main() {
   requestAnimationFrame(renderLoop);
 
   // ---- Hover tooltip ---------------------------------------------------
-  viewer.onHover((row, col, value) => {
+  viewer.onHover((info) => {
     tooltip.style.display = 'block';
-    tooltip.textContent = `[${row}, ${col}] = ${value.toFixed(4)}`;
+    tooltip.innerHTML =
+      `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
+      `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
+      `Value: ${info.value.toFixed(4)}${info.valueUnit ? ' ' + info.valueUnit : ''}`;
   });
 
   canvas.addEventListener('mousemove', (e) => {

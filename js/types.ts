@@ -71,6 +71,11 @@ export interface ChartConfig {
   xAxis?: AxisConfig | StreamingAxisConfig;
   /** Y axis configuration. */
   yAxis?: AxisConfig;
+  /**
+   * Unit string for pixel values displayed in the tooltip (e.g. "rad", "dB").
+   * When set, the tooltip value line shows "Value: 0.21 rad".
+   */
+  valueUnit?: string;
   /** CSS font string for tick labels. Defaults to "12px sans-serif". */
   font?: string;
   /** CSS font string for the chart title. Defaults to "bold 16px sans-serif". */
@@ -113,13 +118,34 @@ export interface DataOptions {
 }
 
 /**
+ * Information about a hovered matrix cell, enriched with axis coordinates
+ * when a chart configuration is present.
+ */
+export interface HoverInfo {
+  /** Zero-based row index in the matrix. */
+  row: number;
+  /** Zero-based column index in the matrix. */
+  col: number;
+  /** Raw data value at (row, col). */
+  value: number;
+  /** Y axis value mapped from the row index (present when yAxis is configured). */
+  y?: number;
+  /** X axis value mapped from the column index (present when xAxis is configured). */
+  x?: number;
+  /** Y axis unit string (e.g. "m"), copied from the chart config. */
+  yUnit?: string;
+  /** X axis unit string (e.g. "s"), copied from the chart config. */
+  xUnit?: string;
+  /** Value unit string (e.g. "rad"), copied from the chart config. */
+  valueUnit?: string;
+}
+
+/**
  * Callback invoked when the user hovers over a matrix cell.
  *
- * @param row - Zero-based row index
- * @param col - Zero-based column index
- * @param value - The data value at (row, col)
+ * @param info - Hover information including matrix indices, value, and axis coordinates
  */
-export type HoverCallback = (row: number, col: number, value: number) => void;
+export type HoverCallback = (info: HoverInfo) => void;
 
 /**
  * Options for scrolled streaming update via setDataScrolled.

@@ -24,6 +24,7 @@ import type {
   CreateOptions,
   DataOptions,
   HoverCallback,
+  HoverInfo,
   ScrolledDataOptions,
   StreamingAxisConfig,
   StreamingDataOptions,
@@ -44,6 +45,7 @@ export type {
   CreateOptions,
   DataOptions,
   HoverCallback,
+  HoverInfo,
   ScrolledDataOptions,
   StreamingAxisConfig,
   StreamingDataOptions,
@@ -88,9 +90,21 @@ export class LeibnizFast {
     mousedown: (e: MouseEvent) => void;
     mousemove: (e: MouseEvent) => void;
     mouseup: (e: MouseEvent) => void;
+    mouseenter: () => void;
+    mouseleave: () => void;
     wheel: (e: WheelEvent) => void;
     resize: () => void;
   };
+
+  // --- Hover / tooltip state ---
+  /** User-registered hover callback. */
+  private hoverCallback: HoverCallback | null = null;
+  /** Last known mouse X in canvas-local pixels. */
+  private lastMouseX: number = 0;
+  /** Last known mouse Y in canvas-local pixels. */
+  private lastMouseY: number = 0;
+  /** Whether the mouse pointer is currently inside the canvas. */
+  private mouseInside: boolean = false;
 
   // --- Chart overlay state ---
   /** Chart configuration (axes, title, labels). Null when no chart mode. */
@@ -111,6 +125,16 @@ export class LeibnizFast {
   private cachedCanvasRect: DOMRect | null = null;
   /** Whether an overlay rAF redraw is already scheduled. */
   private overlayDirty: boolean = false;
+  /** Current matrix row count (for hover coordinate mapping). */
+  private matrixRows: number = 0;
+  /** Current matrix column count (for hover coordinate mapping). */
+  private matrixCols: number = 0;
+  /** Reference to the last data array passed to setData/setDataScrolled. */
+  private dataRef: Float32Array | null = null;
+  /** Whether the stored data is column-major layout. */
+  private dataColMajor: boolean = false;
+  /** Ring cursor position for scrolled streaming data (0 when not streaming). */
+  private ringCursor: number = 0;
 
   private constructor(
     inner: WasmLeibnizFast,
@@ -135,8 +159,18 @@ export class LeibnizFast {
       },
       mousemove: (e: MouseEvent) => {
         const rect = this.getCanvasRect();
-        this.inner.onMouseMove(e.clientX - rect.left, e.clientY - rect.top);
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        this.lastMouseX = x;
+        this.lastMouseY = y;
+        this.inner.onMouseMove(x, y);
         this.scheduleOverlayUpdate();
+      },
+      mouseenter: () => {
+        this.mouseInside = true;
+      },
+      mouseleave: () => {
+        this.mouseInside = false;
       },
       mouseup: () => {
         this.inner.onMouseUp();
@@ -159,6 +193,8 @@ export class LeibnizFast {
     // Register event listeners
     canvas.addEventListener('mousedown', this.boundHandlers.mousedown);
     canvas.addEventListener('mousemove', this.boundHandlers.mousemove);
+    canvas.addEventListener('mouseenter', this.boundHandlers.mouseenter);
+    canvas.addEventListener('mouseleave', this.boundHandlers.mouseleave);
     window.addEventListener('mouseup', this.boundHandlers.mouseup);
     canvas.addEventListener('wheel', this.boundHandlers.wheel, {
       passive: false,
@@ -222,6 +258,11 @@ export class LeibnizFast {
    * @param options - Matrix dimensions (rows, cols)
    */
   setData(data: Float32Array, options: DataOptions): void {
+    this.matrixRows = options.rows;
+    this.matrixCols = options.cols;
+    this.dataRef = data;
+    this.dataColMajor = false;
+    this.ringCursor = 0;
     this.timeSync('JS setData', () =>
       this.inner.setData(data, options.rows, options.cols),
     );
@@ -232,6 +273,7 @@ export class LeibnizFast {
       }
     }
     this.updateOverlay();
+    this.refreshHoverIfNeeded();
   }
 
   /**
@@ -249,6 +291,10 @@ export class LeibnizFast {
    * @param options - Matrix dimensions and number of new columns
    */
   setDataScrolled(data: Float32Array, options: ScrolledDataOptions): void {
+    this.matrixRows = options.rows;
+    this.matrixCols = options.cols;
+    this.dataRef = data;
+    this.dataColMajor = true; // scrolled path always uses column-major layout
     this.timeSync('JS setDataScrolled', () =>
       this.inner.setDataScrolled(
         data,
@@ -257,6 +303,8 @@ export class LeibnizFast {
         options.newCols,
       ),
     );
+    // Advance ring cursor to mirror the WASM renderer's ring_cursor
+    this.ringCursor = (this.ringCursor + options.newCols) % options.cols;
     if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
       this.streamingDisplayCols = options.cols;
       if (options.xOffset !== undefined) {
@@ -264,6 +312,7 @@ export class LeibnizFast {
       }
     }
     this.scheduleOverlayUpdate();
+    this.refreshHoverIfNeeded();
   }
 
   /**
@@ -291,10 +340,19 @@ export class LeibnizFast {
   /**
    * Register a callback for hover events.
    *
-   * @param callback - Called with (row, col, value) on cell hover
+   * The callback receives a {@link HoverInfo} object with matrix indices,
+   * the raw data value, and axis-mapped coordinates and units when a
+   * chart configuration is present.
+   *
+   * @param callback - Called with enriched hover info on cell hover
    */
   onHover(callback: HoverCallback): void {
-    this.inner.onHover(callback);
+    this.hoverCallback = callback;
+    // Register a thin WASM-side callback that enriches and forwards
+    this.inner.onHover((row: number, col: number, value: number) => {
+      if (!this.hoverCallback) return;
+      this.hoverCallback(this.buildHoverInfo(row, col, value));
+    });
   }
 
   /**
@@ -306,6 +364,8 @@ export class LeibnizFast {
    * @param options - Matrix dimensions (rows, cols)
    */
   beginData(options: StreamingDataOptions): void {
+    this.matrixRows = options.rows;
+    this.matrixCols = options.cols;
     this.timeSync('JS beginData', () =>
       this.inner.beginData(options.rows, options.cols),
     );
@@ -369,6 +429,7 @@ export class LeibnizFast {
   endData(): void {
     this.timeSync('JS endData', () => this.inner.endData());
     this.updateOverlay();
+    this.refreshHoverIfNeeded();
   }
 
   /**
@@ -437,9 +498,13 @@ export class LeibnizFast {
     // Remove event listeners
     this.canvas.removeEventListener('mousedown', this.boundHandlers.mousedown);
     this.canvas.removeEventListener('mousemove', this.boundHandlers.mousemove);
+    this.canvas.removeEventListener('mouseenter', this.boundHandlers.mouseenter);
+    this.canvas.removeEventListener('mouseleave', this.boundHandlers.mouseleave);
     window.removeEventListener('mouseup', this.boundHandlers.mouseup);
     this.canvas.removeEventListener('wheel', this.boundHandlers.wheel);
     window.removeEventListener('resize', this.boundHandlers.resize);
+    this.hoverCallback = null;
+    this.dataRef = null;
 
     // Clean up overlay DOM
     this.teardownChartOverlay();
@@ -674,5 +739,81 @@ export class LeibnizFast {
   private getFullYRange(): [number, number] {
     if (!this.chartConfig?.yAxis) return [0, 1];
     return [this.chartConfig.yAxis.min, this.chartConfig.yAxis.max];
+  }
+
+  /**
+   * Build a HoverInfo object from raw matrix indices and value.
+   * Maps row/col to axis coordinates when a chart config is present.
+   */
+  private buildHoverInfo(row: number, col: number, value: number): HoverInfo {
+    const info: HoverInfo = { row, col, value };
+    const cfg = this.chartConfig;
+    if (!cfg) return info;
+
+    // Map row → Y axis value
+    if (cfg.yAxis) {
+      const [yMin, yMax] = this.getFullYRange();
+      const rows = this.matrixRows;
+      info.y = rows > 1 ? yMin + (row / (rows - 1)) * (yMax - yMin) : yMin;
+      info.yUnit = cfg.yAxis.unit;
+    }
+
+    // Map col → X axis value
+    if (cfg.xAxis) {
+      const [xMin, xMax] = this.getFullXRange();
+      const cols = this.matrixCols;
+      info.x = cols > 1 ? xMin + (col / (cols - 1)) * (xMax - xMin) : xMin;
+      info.xUnit = cfg.xAxis.unit;
+    }
+
+    // Value unit
+    if (cfg.valueUnit) {
+      info.valueUnit = cfg.valueUnit;
+    }
+
+    return info;
+  }
+
+  /**
+   * Re-invoke the hover lookup at the last known mouse position.
+   *
+   * For streaming data with a ring buffer, the visual content under
+   * the cursor shifts every frame even when the mouse is stationary.
+   * We read the value directly from the JS Float32Array with a
+   * ring-adjusted column index, matching what the GPU shader displays.
+   *
+   * Cost: one UV transform + one Float32Array element read — no WASM
+   * boundary crossing, no allocations.
+   */
+  private refreshHoverIfNeeded(): void {
+    if (!this.mouseInside || !this.hoverCallback || !this.dataRef) return;
+
+    const rows = this.matrixRows;
+    const cols = this.matrixCols;
+    if (rows === 0 || cols === 0) return;
+
+    // Map screen position → UV → (row, col)
+    const uv = this.inner.getVisibleRange();
+    const u =
+      uv[0] + (this.lastMouseX / this.canvas.clientWidth) * uv[2];
+    const v =
+      uv[1] + (this.lastMouseY / this.canvas.clientHeight) * uv[3];
+
+    const col = Math.floor(u * cols);
+    const row = Math.floor(v * rows);
+    if (row < 0 || row >= rows || col < 0 || col >= cols) return;
+
+    // Apply ring offset: the shader displays buffer column
+    // (col + ringCursor) % cols at visual column col.
+    const bufCol = (col + this.ringCursor) % cols;
+
+    // Read value from the JS Float32Array directly
+    const data = this.dataRef;
+    const idx = this.dataColMajor
+      ? bufCol * rows + row
+      : row * cols + bufCol;
+    const value = data[idx];
+
+    this.hoverCallback(this.buildHoverInfo(row, col, value));
   }
 }
