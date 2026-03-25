@@ -47,6 +47,7 @@ impl PerfTimer {
     }
 
     /// Log elapsed time with additional context (for dynamic info like dimensions).
+    #[allow(dead_code)]
     pub fn finish_with(self, extra: &str) {
         if self.debug {
             let elapsed = now_ms() - self.start;

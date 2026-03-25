@@ -6,6 +6,12 @@
 //!
 //! Tiling support: for matrices larger than `maxTextureDimension2D`, we create
 //! multiple smaller textures (tiles) and render each as a separate quad.
+//!
+//! ## Two-group render pipeline
+//!
+//! Group 0 (per-tile): R32Float data texture + camera uniform — changes per tile.
+//! Group 1 (shared):   colormap LUT texture + sampler + range uniform — shared
+//! across all tiles, swapped independently on colormap or range changes.
 
 use crate::colormap::ColormapTexture;
 use crate::perf::PerfTimer;
@@ -14,8 +20,6 @@ use crate::tile_grid::TileGrid;
 /// Factory for creating wgpu pipelines and their associated resources.
 pub struct PipelineFactory<'a> {
     device: &'a wgpu::Device,
-    /// Cached nearest-neighbor sampler, shared across all render bind groups.
-    render_sampler: wgpu::Sampler,
     /// Enable performance timing logs.
     debug: bool,
 }
@@ -23,36 +27,35 @@ pub struct PipelineFactory<'a> {
 impl<'a> PipelineFactory<'a> {
     /// Create a new pipeline factory for the given device.
     pub fn new(device: &'a wgpu::Device, debug: bool) -> Self {
-        let render_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Nearest Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        Self {
-            device,
-            render_sampler,
-            debug,
-        }
+        Self { device, debug }
     }
 
     /// Create a single tile texture with the given dimensions.
+    ///
+    /// When `needs_storage` is true (WebGPU compute path), creates an R32Float
+    /// texture with STORAGE_BINDING for the compute shader to write raw floats.
+    /// When false (WebGL2 fallback), creates an Rgba8Unorm texture with COPY_DST
+    /// for CPU-side colormap upload.
     fn create_tile_texture(
         &self,
         width: u32,
         height: u32,
         needs_storage: bool,
     ) -> (wgpu::Texture, wgpu::TextureView) {
-        let usage = if needs_storage {
-            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING
+        let (format, usage) = if needs_storage {
+            (
+                wgpu::TextureFormat::R32Float,
+                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
         } else {
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+            (
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            )
         };
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Colored Matrix Texture"),
+            label: Some("Matrix Data Texture"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -61,7 +64,7 @@ impl<'a> PipelineFactory<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage,
             view_formats: &[],
         });
@@ -88,7 +91,14 @@ impl<'a> PipelineFactory<'a> {
             .collect()
     }
 
+    // -----------------------------------------------------------------------
+    // Compute pipeline (data copy: staging buffer -> R32Float tile texture)
+    // -----------------------------------------------------------------------
+
     /// Create the compute pipeline (shared across all tiles).
+    ///
+    /// The compute shader copies raw float values from the staging buffer to
+    /// R32Float tile textures. Colormap application happens in the fragment shader.
     ///
     /// Returns the pipeline and the bind group **layout** so per-tile bind groups
     /// can be created separately via `create_compute_bind_group`.
@@ -110,13 +120,13 @@ impl<'a> PipelineFactory<'a> {
                             },
                             count: None,
                         },
-                        // Binding 1: Output tile texture (write-only storage texture)
+                        // Binding 1: Output R32Float tile texture (write-only storage)
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::StorageTexture {
                                 access: wgpu::StorageTextureAccess::WriteOnly,
-                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                format: wgpu::TextureFormat::R32Float,
                                 view_dimension: wgpu::TextureViewDimension::D2,
                             },
                             count: None,
@@ -130,24 +140,6 @@ impl<'a> PipelineFactory<'a> {
                                 has_dynamic_offset: false,
                                 min_binding_size: None,
                             },
-                            count: None,
-                        },
-                        // Binding 3: Colormap LUT texture
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // Binding 4: Colormap sampler
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
                     ],
@@ -164,14 +156,14 @@ impl<'a> PipelineFactory<'a> {
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Colormap Compute Shader"),
+                label: Some("Data Copy Compute Shader"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("shaders/colormap.wgsl").into()),
             });
 
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Colormap Compute Pipeline"),
+                label: Some("Data Copy Compute Pipeline"),
                 layout: Some(&pipeline_layout),
                 module: &shader,
                 entry_point: Some("main"),
@@ -192,7 +184,6 @@ impl<'a> PipelineFactory<'a> {
         layout: &wgpu::BindGroupLayout,
         data_buffer: &wgpu::Buffer,
         params_buffer: &wgpu::Buffer,
-        colormap: &ColormapTexture,
         tile_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -211,32 +202,69 @@ impl<'a> PipelineFactory<'a> {
                     binding: 2,
                     resource: params_buffer.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&colormap.texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&colormap.sampler),
-                },
             ],
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Render pipeline (two bind groups: per-tile data + shared colormap)
+    // -----------------------------------------------------------------------
+
     /// Create the render pipeline (shared across tiles).
     ///
-    /// Returns the pipeline and its bind group layout.
+    /// Uses a two-group layout:
+    /// - Group 0 (per-tile): R32Float data texture + camera uniform
+    /// - Group 1 (shared): colormap LUT texture + sampler + range uniform
+    ///
+    /// Returns the pipeline and both bind group layouts.
     pub fn create_render_pipeline(
         &self,
         surface_format: wgpu::TextureFormat,
-    ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    ) -> (
+        wgpu::RenderPipeline,
+        wgpu::BindGroupLayout,
+        wgpu::BindGroupLayout,
+    ) {
         let _timer = PerfTimer::new("create_render_pipeline", self.debug);
-        let bind_group_layout =
+
+        // Group 0: per-tile resources (R32Float data texture + camera)
+        let tile_bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Render Bind Group Layout"),
+                    label: Some("Render Tile Bind Group Layout"),
                     entries: &[
-                        // Binding 0: Colored tile texture
+                        // Binding 0: R32Float tile data texture (unfilterable)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        // Binding 1: Camera uniform
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        // Group 1: shared colormap resources
+        let colormap_bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Render Colormap Bind Group Layout"),
+                    entries: &[
+                        // Binding 0: Colormap LUT texture (256x1 RGBA, filterable)
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
                             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -247,17 +275,17 @@ impl<'a> PipelineFactory<'a> {
                             },
                             count: None,
                         },
-                        // Binding 1: Nearest-neighbor sampler
+                        // Binding 1: Colormap sampler (linear filtering)
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
-                        // Binding 2: Camera uniform
+                        // Binding 2: Range params uniform (min_val, max_val)
                         wgpu::BindGroupLayoutEntry {
                             binding: 2,
-                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: false,
@@ -272,7 +300,7 @@ impl<'a> PipelineFactory<'a> {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&bind_group_layout],
+                bind_group_layouts: &[&tile_bind_group_layout, &colormap_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -319,11 +347,12 @@ impl<'a> PipelineFactory<'a> {
                 cache: None,
             });
 
-        (pipeline, bind_group_layout)
+        (pipeline, tile_bind_group_layout, colormap_bind_group_layout)
     }
 
-    /// Create a render bind group for one tile, using the tile's own texture view
-    /// and a per-tile camera buffer.
+    /// Create a render bind group for one tile (group 0).
+    ///
+    /// Contains the R32Float data texture and per-tile camera buffer.
     pub fn create_render_bind_group(
         &self,
         layout: &wgpu::BindGroupLayout,
@@ -331,7 +360,7 @@ impl<'a> PipelineFactory<'a> {
         camera_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Render Bind Group"),
+            label: Some("Render Tile Bind Group"),
             layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -340,15 +369,41 @@ impl<'a> PipelineFactory<'a> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.render_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: camera_buffer,
                         offset: 0,
                         size: None,
                     }),
+                },
+            ],
+        })
+    }
+
+    /// Create the shared colormap bind group (group 1).
+    ///
+    /// Contains the colormap LUT texture, its sampler, and the range uniform.
+    /// Shared across all tiles — only one bind group is needed.
+    pub fn create_colormap_bind_group(
+        &self,
+        layout: &wgpu::BindGroupLayout,
+        colormap: &ColormapTexture,
+        range_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Render Colormap Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&colormap.texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&colormap.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: range_buffer.as_entire_binding(),
                 },
             ],
         })

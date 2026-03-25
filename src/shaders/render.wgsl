@@ -1,16 +1,19 @@
 // Vertex + Fragment shader: renders a textured full-screen quad with camera transform.
 //
 // The vertex shader generates a full-screen quad from 6 hardcoded vertices (2 triangles).
-// The fragment shader samples the colored matrix texture, applying the camera's
-// UV offset and scale for zoom/pan.
+// The fragment shader samples the raw float matrix texture, normalizes the value using
+// the range uniform, and applies the colormap LUT to produce the final RGBA color.
+//
+// Bind group 0 (per-tile): raw data texture + camera uniform
+// Bind group 1 (shared):   colormap LUT + sampler + range params
 
-// Binding 0: Colored matrix texture (output from compute shader)
-@group(0) @binding(0) var colored_texture: texture_2d<f32>;
+// --- Group 0: Per-tile resources ---
 
-// Binding 1: Nearest-neighbor sampler for pixel-perfect cell display at high zoom
-@group(0) @binding(1) var texture_sampler: sampler;
+// Binding 0: Raw float matrix texture (R32Float, output from compute shader)
+// Uses textureLoad (integer coords) because R32Float is unfilterable.
+@group(0) @binding(0) var data_texture: texture_2d<f32>;
 
-// Binding 2: Camera uniform — 32 bytes, 8 × f32
+// Binding 1: Camera uniform — 32 bytes, 8 x f32
 //
 // X is kept in full-matrix UV space so the ring offset can be applied once at the
 // correct scale before per-tile mapping.  Y is pre-composed to tile-local UV on the
@@ -29,7 +32,24 @@ struct CameraUniforms {
     tile_x_offset: f32,   // tile column start in full-matrix UV [0, 1]
     tile_x_size:   f32,   // tile column width in full-matrix UV (0, 1]
 }
-@group(0) @binding(2) var<uniform> camera: CameraUniforms;
+@group(0) @binding(1) var<uniform> camera: CameraUniforms;
+
+// --- Group 1: Shared colormap resources ---
+
+// Binding 0: Colormap lookup table — 256x1 RGBA texture
+@group(1) @binding(0) var colormap_lut: texture_2d<f32>;
+
+// Binding 1: Linear sampler for the colormap LUT
+@group(1) @binding(1) var colormap_sampler: sampler;
+
+// Binding 2: Range uniform for normalization
+struct RangeParams {
+    min_val: f32,
+    max_val: f32,
+    _pad0:   f32,
+    _pad1:   f32,
+}
+@group(1) @binding(2) var<uniform> range_params: RangeParams;
 
 // Vertex output: clip-space position and UV coordinates for texture sampling
 struct VertexOutput {
@@ -69,7 +89,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-// Fragment shader: samples the colored tile texture with camera + ring transform.
+// Fragment shader: samples the raw float tile texture with camera + ring transform,
+// then normalizes and applies the colormap LUT.
 //
 // X pipeline (ring-aware, full-matrix space):
 //   1. Compute full-matrix X UV from screen UV.
@@ -83,7 +104,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 //   uv_y_offset/uv_y_scale already produce tile-local Y directly.
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // --- X: full-matrix UV → ring → tile-local UV ---
+    // --- X: full-matrix UV -> ring -> tile-local UV ---
     var full_x = camera.uv_x_offset + input.uv.x * camera.uv_x_scale;
 
     if camera.ring_offset != 0.0 {
@@ -109,8 +130,24 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Uses textureSampleLevel (explicit LOD=0) instead of textureSample because
-    // control flow above is non-uniform (depends on per-fragment input.uv).
-    return textureSampleLevel(colored_texture, texture_sampler,
-                              vec2<f32>(tile_x, tile_y), 0.0);
+    // --- Read raw float value via textureLoad (R32Float is unfilterable) ---
+    let dims = textureDimensions(data_texture);
+    let texel = vec2<i32>(
+        clamp(i32(tile_x * f32(dims.x)), 0, i32(dims.x) - 1),
+        clamp(i32(tile_y * f32(dims.y)), 0, i32(dims.y) - 1),
+    );
+    let value = textureLoad(data_texture, texel, 0).r;
+
+    // --- Normalize to [0, 1] using range uniform ---
+    let range = range_params.max_val - range_params.min_val;
+    var normalized: f32;
+    if range > 0.0 {
+        normalized = clamp((value - range_params.min_val) / range, 0.0, 1.0);
+    } else {
+        normalized = 0.5;
+    }
+
+    // --- Apply colormap LUT ---
+    return textureSampleLevel(colormap_lut, colormap_sampler,
+                              vec2<f32>(normalized, 0.5), 0.0);
 }

@@ -1,4 +1,4 @@
-// Compute shader: applies colormap to raw matrix data and writes to a tile texture.
+// Compute shader: copies raw matrix data to an R32Float tile texture.
 //
 // Supports both single-texture (small matrices) and tiled-texture (large matrices)
 // that exceed the device's maxTextureDimension2D limit.
@@ -7,24 +7,25 @@
 // are tile-relative coordinates. The absolute matrix position is obtained by
 // adding col_offset/row_offset before reading from the flat data buffer.
 //
-// Workgroup size 16×16 is tunable but must match the dispatch calculation on
+// Workgroup size 16x16 is tunable but must match the dispatch calculation on
 // the Rust side (ceiling division by 16).
 
 // Binding 0: Raw matrix data as a flat array of f32 values (row-major order,
 // full-matrix dimensions). The data is always indexed in full-matrix space.
 @group(0) @binding(0) var<storage, read> matrix_data: array<f32>;
 
-// Binding 1: Output RGBA texture — one pixel per tile cell.
-// Size = tile_width × tile_height (≤ maxTextureDimension2D on both axes).
-@group(0) @binding(1) var output_texture: texture_storage_2d<rgba8unorm, write>;
+// Binding 1: Output R32Float texture — one pixel per tile cell.
+// Size = tile_width x tile_height (<= maxTextureDimension2D on both axes).
+// Stores raw float values; colormap is applied in the fragment shader.
+@group(0) @binding(1) var output_texture: texture_storage_2d<r32float, write>;
 
 // Binding 2: Per-dispatch parameters
 struct MatrixParams {
-    // Rows of this tile/chunk (≤ maxTextureDimension2D)
+    // Rows of this tile/chunk (<= maxTextureDimension2D)
     rows: u32,
-    // Columns of this tile (≤ maxTextureDimension2D)
+    // Columns of this tile (<= maxTextureDimension2D)
     cols: u32,
-    // Data range for normalization
+    // Data range (unused by compute — kept for struct layout compatibility)
     min_val: f32,
     max_val: f32,
     // Absolute row in the full matrix where this tile/chunk starts
@@ -45,12 +46,6 @@ struct MatrixParams {
     _pad2: u32,
 }
 @group(0) @binding(2) var<uniform> params: MatrixParams;
-
-// Binding 3: Colormap lookup table — 256×1 RGBA texture
-@group(0) @binding(3) var colormap_lut: texture_2d<f32>;
-
-// Binding 4: Sampler for the colormap LUT
-@group(0) @binding(4) var colormap_sampler: sampler;
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -77,23 +72,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     );
     let value = matrix_data[idx];
 
-    // Normalize to [0, 1]
-    let range = params.max_val - params.min_val;
-    var normalized: f32;
-    if range > 0.0 {
-        normalized = clamp((value - params.min_val) / range, 0.0, 1.0);
-    } else {
-        normalized = 0.5;
-    }
-
-    // Sample the colormap LUT
-    let color = textureSampleLevel(
-        colormap_lut, colormap_sampler,
-        vec2<f32>(normalized, 0.5), 0.0
-    );
-
-    // Write to tile-relative coordinates in the output texture.
-    // texture_row_offset shifts Y when multiple chunks write to the same tile.
-    // texture_col_offset shifts X for partial column updates (scrolled streaming).
-    textureStore(output_texture, vec2<i32>(i32(tile_col + params.texture_col_offset), i32(tile_row + params.texture_row_offset)), color);
+    // Write raw float to tile texture. Normalization and colormap application
+    // happen in the fragment shader, enabling instant colormap/range changes.
+    textureStore(output_texture,
+        vec2<i32>(i32(tile_col + params.texture_col_offset),
+                  i32(tile_row + params.texture_row_offset)),
+        vec4<f32>(value, 0.0, 0.0, 0.0));
 }

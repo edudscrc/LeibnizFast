@@ -190,22 +190,18 @@ mod wasm_entry {
                 && self
                     .matrix
                     .as_ref()
-                    .map_or(false, |m| m.rows() == rows && m.cols() == cols);
+                    .is_some_and(|m| m.rows() == rows && m.cols() == cols);
 
             if same_dims {
-                // Fast path: colormap re-dispatch only — no pipeline rebuild
+                // Fast path: data copy only — no pipeline rebuild
                 if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
                     let (min_val, max_val) = jd.range();
+                    self.renderer.update_range_buffer(min_val, max_val);
                     let read_fn = |start: usize, buf: &mut [f32]| {
                         jd.read_range(start, buf);
                     };
-                    self.renderer.apply_colormap_tiled(
-                        matrix_view,
-                        &read_fn,
-                        cols,
-                        min_val,
-                        max_val,
-                    );
+                    self.renderer
+                        .apply_colormap_tiled(matrix_view, &read_fn, cols);
                 }
             } else {
                 // Slow path: first call or dimension change — full pipeline rebuild
@@ -238,16 +234,12 @@ mod wasm_entry {
 
                     if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
                         let (min_val, max_val) = jd.range();
+                        self.renderer.update_range_buffer(min_val, max_val);
                         let read_fn = |start: usize, buf: &mut [f32]| {
                             jd.read_range(start, buf);
                         };
-                        self.renderer.apply_colormap_tiled(
-                            matrix_view,
-                            &read_fn,
-                            cols,
-                            min_val,
-                            max_val,
-                        );
+                        self.renderer
+                            .apply_colormap_tiled(matrix_view, &read_fn, cols);
                     }
                 }
             }
@@ -312,7 +304,7 @@ mod wasm_entry {
                 && self
                     .matrix
                     .as_ref()
-                    .map_or(false, |m| m.rows() == rows && m.cols() == cols);
+                    .is_some_and(|m| m.rows() == rows && m.cols() == cols);
 
             if !same_dims {
                 // First call or dimension change — do a full setData instead
@@ -343,17 +335,13 @@ mod wasm_entry {
 
                     // Full colormap for the first frame — reset ring cursor
                     self.renderer.reset_ring_cursor();
+                    self.renderer.update_range_buffer(min_val, max_val);
                     if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
                         let read_fn = |start: usize, buf: &mut [f32]| {
                             jd.read_range(start, buf);
                         };
-                        self.renderer.apply_colormap_tiled(
-                            matrix_view,
-                            &read_fn,
-                            cols,
-                            min_val,
-                            max_val,
-                        );
+                        self.renderer
+                            .apply_colormap_tiled(matrix_view, &read_fn, cols);
                     }
                 }
                 self.upload_cpu_colormap_if_needed();
@@ -361,20 +349,14 @@ mod wasm_entry {
                 return Ok(());
             }
 
-            // Ring-buffer fast path: only colormap the new columns at the cursor,
+            // Ring-buffer fast path: only copy new columns at the cursor,
             // O(rows × new_cols) regardless of total column count.
             if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
                 let read_fn = |start: usize, buf: &mut [f32]| {
                     jd.read_range(start, buf);
                 };
-                self.renderer.apply_colormap_ring(
-                    matrix_view,
-                    &read_fn,
-                    cols,
-                    new_cols,
-                    min_val,
-                    max_val,
-                );
+                self.renderer
+                    .apply_colormap_ring(matrix_view, &read_fn, cols, new_cols);
             }
 
             self.render_frame()?;
@@ -383,35 +365,23 @@ mod wasm_entry {
 
         /// Set the colormap used for visualization.
         ///
-        /// Re-dispatches the colormap from JS-heap data — works at any matrix size.
+        /// Instant O(1) operation: updates the colormap LUT texture and rebuilds
+        /// the shared render bind group. No data re-read or compute re-dispatch.
+        /// The fragment shader applies the new colormap on the next render.
         #[wasm_bindgen(js_name = setColormap)]
         pub fn set_colormap(&mut self, name: &str) -> Result<(), JsValue> {
             let _timer = PerfTimer::new("set_colormap", self.debug);
             self.set_colormap_internal(name)?;
 
-            if let Some(ref jd) = self.js_data {
-                let (min_val, max_val) = jd.range();
-                self.renderer
-                    .rebuild_compute_bind_groups(&self.matrix, &self.colormap_texture)
-                    .map_err(|e| JsValue::from_str(&e))?;
-
-                // Re-dispatch colormap from JS-heap data
-                if self.renderer.has_compute {
-                    if let Some(ref matrix_view) = self.matrix {
-                        let cols = jd.cols();
-                        let read_fn = |start: usize, buf: &mut [f32]| {
-                            jd.read_range(start, buf);
-                        };
-                        self.renderer.apply_colormap_tiled(
-                            matrix_view,
-                            &read_fn,
-                            cols,
-                            min_val,
-                            max_val,
-                        );
-                    }
+            if self.js_data.is_some() {
+                // Rebuild the shared colormap bind group (render group 1) with the new LUT
+                if let Some(ref colormap) = self.colormap_texture {
+                    self.renderer
+                        .rebuild_colormap_bind_group(colormap)
+                        .map_err(|e| JsValue::from_str(&e))?;
                 }
 
+                // WebGL2 fallback: re-apply colormap on CPU
                 self.upload_cpu_colormap_if_needed();
                 self.render_frame()?;
             }
@@ -421,7 +391,9 @@ mod wasm_entry {
 
         /// Set the data range for colormap mapping.
         ///
-        /// Re-applies the colormap with the new range from JS-heap data.
+        /// Instant O(1) operation: updates the range uniform buffer (16 bytes).
+        /// No data re-read or compute re-dispatch. The fragment shader applies
+        /// the new range on the next render.
         #[wasm_bindgen(js_name = setRange)]
         pub fn set_range(&mut self, min: f32, max: f32) -> Result<(), JsValue> {
             let _timer = PerfTimer::new("set_range", self.debug);
@@ -431,23 +403,11 @@ mod wasm_entry {
                 jd.set_range(min, max);
             }
 
-            if let Some(ref jd) = self.js_data {
-                // Re-apply colormap with new range
-                if self.renderer.has_compute {
-                    if let Some(ref matrix_view) = self.matrix {
-                        let read_fn = |start: usize, buf: &mut [f32]| {
-                            jd.read_range(start, buf);
-                        };
-                        self.renderer.apply_colormap_tiled(
-                            matrix_view,
-                            &read_fn,
-                            jd.cols(),
-                            min,
-                            max,
-                        );
-                    }
-                }
+            if self.js_data.is_some() {
+                // Update the range uniform buffer — fragment shader picks it up immediately
+                self.renderer.update_range_buffer(min, max);
 
+                // WebGL2 fallback: re-apply colormap on CPU with new range
                 self.upload_cpu_colormap_if_needed();
                 self.render_frame()?;
             }
@@ -550,7 +510,7 @@ mod wasm_entry {
                 && self
                     .matrix
                     .as_ref()
-                    .map_or(false, |m| m.rows() == rows && m.cols() == cols)
+                    .is_some_and(|m| m.rows() == rows && m.cols() == cols)
                 && self.js_data.is_some();
 
             if same_dims {
@@ -625,7 +585,7 @@ mod wasm_entry {
             }
 
             let cols = pending.cols as usize;
-            if cols > 0 && chunk.len() % cols != 0 {
+            if cols > 0 && !chunk.len().is_multiple_of(cols) {
                 return Err(JsValue::from_str(&format!(
                     "Chunk length {} is not divisible by cols {}",
                     chunk.len(),
@@ -699,16 +659,12 @@ mod wasm_entry {
             if self.renderer.has_compute {
                 if let (Some(ref matrix_view), Some(ref jd)) = (&self.matrix, &self.js_data) {
                     let (min_val, max_val) = jd.range();
+                    self.renderer.update_range_buffer(min_val, max_val);
                     let read_fn = |start: usize, buf: &mut [f32]| {
                         jd.read_range(start, buf);
                     };
-                    self.renderer.apply_colormap_tiled(
-                        matrix_view,
-                        &read_fn,
-                        cols,
-                        min_val,
-                        max_val,
-                    );
+                    self.renderer
+                        .apply_colormap_tiled(matrix_view, &read_fn, cols);
                 }
             }
 

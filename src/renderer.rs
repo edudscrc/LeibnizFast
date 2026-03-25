@@ -25,59 +25,55 @@ use crate::tile_grid::TileGrid;
 // Per-tile camera buffer
 // ---------------------------------------------------------------------------
 
-/// A camera uniform buffer that maps a tile's region of the matrix.
-///
-/// The render shader already has a `CameraUniforms` struct with `uv_offset` and
-/// `uv_scale`. For tiled rendering we create one buffer per tile so that each
-/// tile's quad maps its texture [0,1] to the correct sub-region of the full
-/// matrix, then the main camera transform is applied on top.
-///
-/// The data layout matches `CameraUniforms` in render.wgsl:
-///   offset: vec2<f32>  (bytes 0-7)
-///   scale:  vec2<f32>  (bytes 8-15)
-///
-/// For tiled rendering we embed the tile UV region into the buffer and set the
-/// camera uniform to identity — the tile quad is drawn with clip-space coords
-/// that already map to the tile's screen region.
-///
-/// Simpler approach used here: reuse the existing camera buffer but override
-/// it before each tile's draw call using a per-tile buffer pre-computed during
-/// `rebuild_pipelines` that encodes the **tile's UV region within the full matrix**.
-/// The render shader then further applies the user's camera transform on top.
-///
-/// Actually: the cleanest solution is to render each tile as a sub-quad covering
-/// only the fraction of clip-space that corresponds to that tile. The render shader
-/// receives the main camera and samples the tile texture using coordinates remapped
-/// to [0,1] within the tile.  We achieve this by passing a *tile camera* that maps
-/// screen UV → tile UV, computed as:
-///
-///   tile_uv = (screen_uv * camera_scale + camera_offset - tile_uv_offset) / tile_uv_size
-///
-/// But that would require modifying the shader. Instead we use a simpler two-step
-/// approach:
-///
-/// **Step 1 (compute)**: Each tile texture contains the correctly colored pixels for
-/// its sub-region. No UV trickery needed.
-///
-/// **Step 2 (render)**: We draw the tile covering the fraction of clip space
-/// [left, right] × [bottom, top] that the tile occupies in the full matrix, then
-/// sample the tile texture at UV [0,1] adjusted by the camera transform *relative
-/// to the tile's position*.
-///
-/// The shader already handles this: we pass a `CameraUniforms` that has been
-/// pre-composed with the tile position. Specifically, for tile (tx, ty):
-///
-///   tile_cam_offset = camera.uv_offset - vec2(col_uv_off, row_uv_off)
-///   tile_cam_offset /= vec2(col_uv_size, row_uv_size)
-///   tile_cam_scale  = camera.uv_scale  / vec2(col_uv_size, row_uv_size)
-///
-/// Then the quad covers full clip-space (unchanged) and the shader uses the
-/// composed transform to decide which part of the tile texture to sample,
-/// discarding fragments outside [0,1].
-
-// ---------------------------------------------------------------------------
-// Renderer
-// ---------------------------------------------------------------------------
+// A camera uniform buffer that maps a tile's region of the matrix.
+//
+// The render shader already has a `CameraUniforms` struct with `uv_offset` and
+// `uv_scale`. For tiled rendering we create one buffer per tile so that each
+// tile's quad maps its texture [0,1] to the correct sub-region of the full
+// matrix, then the main camera transform is applied on top.
+//
+// The data layout matches `CameraUniforms` in render.wgsl:
+//   offset: vec2<f32>  (bytes 0-7)
+//   scale:  vec2<f32>  (bytes 8-15)
+//
+// For tiled rendering we embed the tile UV region into the buffer and set the
+// camera uniform to identity — the tile quad is drawn with clip-space coords
+// that already map to the tile's screen region.
+//
+// Simpler approach used here: reuse the existing camera buffer but override
+// it before each tile's draw call using a per-tile buffer pre-computed during
+// `rebuild_pipelines` that encodes the **tile's UV region within the full matrix**.
+// The render shader then further applies the user's camera transform on top.
+//
+// Actually: the cleanest solution is to render each tile as a sub-quad covering
+// only the fraction of clip-space that corresponds to that tile. The render shader
+// receives the main camera and samples the tile texture using coordinates remapped
+// to [0,1] within the tile.  We achieve this by passing a *tile camera* that maps
+// screen UV -> tile UV, computed as:
+//
+//   tile_uv = (screen_uv * camera_scale + camera_offset - tile_uv_offset) / tile_uv_size
+//
+// But that would require modifying the shader. Instead we use a simpler two-step
+// approach:
+//
+// **Step 1 (compute)**: Each tile texture contains the correctly colored pixels for
+// its sub-region. No UV trickery needed.
+//
+// **Step 2 (render)**: We draw the tile covering the fraction of clip space
+// [left, right] x [bottom, top] that the tile occupies in the full matrix, then
+// sample the tile texture at UV [0,1] adjusted by the camera transform *relative
+// to the tile's position*.
+//
+// The shader already handles this: we pass a `CameraUniforms` that has been
+// pre-composed with the tile position. Specifically, for tile (tx, ty):
+//
+//   tile_cam_offset = camera.uv_offset - vec2(col_uv_off, row_uv_off)
+//   tile_cam_offset /= vec2(col_uv_size, row_uv_size)
+//   tile_cam_scale  = camera.uv_scale  / vec2(col_uv_size, row_uv_size)
+//
+// Then the quad covers full clip-space (unchanged) and the shader uses the
+// composed transform to decide which part of the tile texture to sample,
+// discarding fragments outside [0,1].
 
 /// Core renderer that owns the wgpu device, queue, and surface.
 pub struct Renderer {
@@ -95,8 +91,14 @@ pub struct Renderer {
     /// Bind group layout for compute pipeline (kept to create per-tile groups)
     compute_bind_group_layout: Option<wgpu::BindGroupLayout>,
     render_pipeline: Option<wgpu::RenderPipeline>,
-    /// Bind group layout for render pipeline
+    /// Bind group layout for render pipeline (group 0: per-tile)
     render_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    /// Bind group layout for colormap (group 1: shared)
+    colormap_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    /// Shared colormap bind group (group 1) for render pipeline
+    colormap_bind_group: Option<wgpu::BindGroup>,
+    /// Range uniform buffer (min_val, max_val) for fragment shader
+    range_buffer: Option<wgpu::Buffer>,
 
     // --- Per-tile resources ---
     /// Colored tile textures, indexed by tile_grid.tile_index(tx, ty)
@@ -233,6 +235,9 @@ impl Renderer {
             compute_bind_group_layout: None,
             render_pipeline: None,
             render_bind_group_layout: None,
+            colormap_bind_group_layout: None,
+            colormap_bind_group: None,
+            range_buffer: None,
             tile_textures: Vec::new(),
             tile_texture_views: Vec::new(),
             tile_compute_bind_groups: Vec::new(),
@@ -302,8 +307,27 @@ impl Renderer {
 
         // --- Shared pipelines (recreate on each rebuild) ---
         let (compute_pipeline, compute_layout) = factory.create_compute_pipeline();
-        let (render_pipeline, render_layout) =
+        let (render_pipeline, render_layout, colormap_layout) =
             factory.create_render_pipeline(self.surface_config.format);
+
+        // Range uniform buffer for fragment shader (min_val, max_val)
+        use wgpu::util::DeviceExt;
+        let range_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Range Params Buffer"),
+                contents: bytemuck::cast_slice(&[crate::matrix::RangeParams {
+                    min_val: 0.0,
+                    max_val: 1.0,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
+                }]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        // Shared colormap bind group (group 1)
+        let colormap_bind_group =
+            factory.create_colormap_bind_group(&colormap_layout, colormap, &range_buffer);
 
         // --- Per-tile resources ---
         let needs_storage = self.has_compute;
@@ -321,8 +345,8 @@ impl Renderer {
                 .as_ref()
                 .ok_or("No matrix data set (WebGPU path requires MatrixView)")?;
 
-            let mut params_bufs = Vec::with_capacity(grid.tile_count() as usize);
-            let mut bind_groups = Vec::with_capacity(grid.tile_count() as usize);
+            let mut params_bufs = Vec::with_capacity(grid.tile_count());
+            let mut bind_groups = Vec::with_capacity(grid.tile_count());
 
             for (tx, ty) in grid.iter_tiles() {
                 let (row_start, _) = grid.tile_row_range(ty);
@@ -357,7 +381,6 @@ impl Renderer {
                     &compute_layout,
                     &matrix.data_buffer,
                     &params_buf,
-                    colormap,
                     &tile_texture_views[idx],
                 );
                 params_bufs.push(params_buf);
@@ -384,53 +407,51 @@ impl Renderer {
         self.compute_bind_group_layout = Some(compute_layout);
         self.render_pipeline = Some(render_pipeline);
         self.render_bind_group_layout = Some(render_layout);
+        self.colormap_bind_group_layout = Some(colormap_layout);
+        self.colormap_bind_group = Some(colormap_bind_group);
+        self.range_buffer = Some(range_buffer);
         self.tile_grid = Some(grid);
 
         Ok(())
     }
 
-    /// Rebuild only the per-tile compute bind groups after a colormap change.
+    /// Rebuild the shared colormap bind group (render group 1) after a colormap change.
     ///
-    /// Tile textures, params buffers, render bind groups, and pipelines are not
-    /// recreated. This avoids the 2× VRAM spike that `rebuild_pipelines` would
-    /// cause, enabling colormap changes on memory-constrained GPUs.
-    pub fn rebuild_compute_bind_groups(
+    /// Only creates one bind group (shared across all tiles) — very cheap.
+    pub fn rebuild_colormap_bind_group(
         &mut self,
-        matrix: &Option<MatrixView>,
-        colormap: &Option<ColormapTexture>,
+        colormap: &ColormapTexture,
     ) -> Result<(), String> {
-        let _timer = PerfTimer::new("rebuild_compute_bind_groups", self.debug);
-        let colormap = colormap.as_ref().ok_or("No colormap set")?;
-        let matrix = matrix.as_ref().ok_or("No matrix data set")?;
+        let _timer = PerfTimer::new("rebuild_colormap_bind_group", self.debug);
         let layout = self
-            .compute_bind_group_layout
+            .colormap_bind_group_layout
             .as_ref()
             .ok_or("Pipelines not initialized")?;
-        let grid = self
-            .tile_grid
+        let range_buffer = self
+            .range_buffer
             .as_ref()
-            .ok_or("No tile grid — call setData first")?
-            .clone();
-
-        self.colormap_applied = false;
+            .ok_or("Range buffer not initialized")?;
 
         let factory = PipelineFactory::new(&self.device, self.debug);
-        let mut new_bind_groups = Vec::with_capacity(grid.tile_count() as usize);
-
-        for (tx, ty) in grid.iter_tiles() {
-            let idx = grid.tile_index(tx, ty);
-            let bg = factory.create_compute_bind_group(
-                layout,
-                &matrix.data_buffer,
-                &self.tile_params_buffers[idx],
-                colormap,
-                &self.tile_texture_views[idx],
-            );
-            new_bind_groups.push(bg);
-        }
-
-        self.tile_compute_bind_groups = new_bind_groups;
+        self.colormap_bind_group =
+            Some(factory.create_colormap_bind_group(layout, colormap, range_buffer));
         Ok(())
+    }
+
+    /// Update the range uniform buffer for the fragment shader.
+    ///
+    /// Cost: one `queue.write_buffer()` call (16 bytes). No bind group rebuild.
+    pub fn update_range_buffer(&self, min_val: f32, max_val: f32) {
+        if let Some(ref buf) = self.range_buffer {
+            let data = crate::matrix::RangeParams {
+                min_val,
+                max_val,
+                _pad0: 0.0,
+                _pad1: 0.0,
+            };
+            self.queue
+                .write_buffer(buf, 0, bytemuck::cast_slice(&[data]));
+        }
     }
 
     /// Build per-tile camera buffers and render bind groups.
@@ -590,25 +611,20 @@ impl Renderer {
         );
     }
 
-    /// Apply the colormap via compute shader, reading data through a callback.
+    /// Copy raw float data to R32Float tile textures via compute shader.
     ///
-    /// This is the universal colormap application method. It iterates over all
-    /// tiles and chunks, reading data via `read_fn`, writing it to the
-    /// staging buffer, and dispatching the compute shader for each chunk.
+    /// Iterates over all tiles and chunks, reading data via `read_fn`, writing
+    /// it to the staging buffer, and dispatching the compute shader for each chunk.
+    /// The compute shader writes raw float values; colormap application happens
+    /// in the fragment shader.
     ///
     /// `read_fn(start_index, buffer)` fills `buffer` with f32 data starting
-    /// at the given flat index. This abstraction allows reading from either
-    /// `JsDataSource` (JS heap) or `PagedStorage` (WASM memory).
-    ///
-    /// `row_offset=0` because data starts at the staging buffer start.
-    /// `texture_row_offset` advances within each tile texture.
+    /// at the given flat index.
     pub fn apply_colormap_tiled(
         &mut self,
         matrix: &MatrixView,
         read_fn: &dyn Fn(usize, &mut [f32]),
         cols: u32,
-        min_val: f32,
-        max_val: f32,
     ) {
         let _timer = PerfTimer::new("apply_colormap_tiled", self.debug);
         let grid = match &self.tile_grid {
@@ -659,8 +675,8 @@ impl Renderer {
                         &MatrixParams {
                             rows: chunk_rows,
                             cols: tile_w,
-                            min_val,
-                            max_val,
+                            min_val: 0.0,
+                            max_val: 1.0,
                             row_offset: 0,
                             col_offset: col_start,
                             total_cols: cols,
@@ -675,14 +691,14 @@ impl Renderer {
                     let bind_group = &self.tile_compute_bind_groups[tile_idx];
                     {
                         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Tiled Colormap Pass"),
+                            label: Some("Tiled Data Copy Pass"),
                             timestamp_writes: None,
                         });
                         pass.set_pipeline(compute_pipeline);
                         pass.set_bind_group(0, bind_group, &[]);
                         pass.dispatch_workgroups(
-                            (tile_w + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
-                            (chunk_rows + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                            tile_w.div_ceil(WORKGROUP_ALIGNMENT),
+                            chunk_rows.div_ceil(WORKGROUP_ALIGNMENT),
                             1,
                         );
                     }
@@ -694,104 +710,6 @@ impl Renderer {
         }
 
         self.colormap_applied = true;
-    }
-
-    /// Apply the colormap for a single streaming chunk (beginData/appendChunk path).
-    ///
-    /// The chunk covers rows [row_offset, row_offset+chunk_rows) of the full matrix.
-    /// We dispatch the compute shader once per tile that intersects this row range.
-    /// The staging buffer receives the full chunk; `row_offset=0` since data starts
-    /// at buffer offset 0; `texture_row_offset` is the tile-local Y position.
-    pub fn apply_colormap_staged_chunk(
-        &mut self,
-        matrix: &MatrixView,
-        chunk: &[f32],
-        chunk_rows: u32,
-        row_offset: u32,
-        cols: u32,
-        min_val: f32,
-        max_val: f32,
-    ) {
-        let _timer = PerfTimer::new("apply_colormap_staged_chunk", self.debug);
-        let grid = match &self.tile_grid {
-            Some(g) => g.clone(),
-            None => return,
-        };
-        let compute_pipeline = match &self.compute_pipeline {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Write the full chunk to the staging buffer once
-        matrix.write_staging_chunk(&self.queue, chunk);
-
-        let chunk_row_end = row_offset + chunk_rows;
-
-        // Single encoder for all tile dispatches — the staging buffer is not
-        // overwritten between tiles so all compute passes can share one submit.
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Stream Compute Encoder"),
-            });
-
-        for ty in 0..grid.tiles_y {
-            let (tile_row_start, tile_row_end) = grid.tile_row_range(ty);
-            if tile_row_end <= row_offset || tile_row_start >= chunk_row_end {
-                continue;
-            }
-
-            // Absolute rows of this chunk that land in this tile
-            let abs_row_start = row_offset.max(tile_row_start);
-            let abs_row_end = chunk_row_end.min(tile_row_end);
-            let local_chunk_rows = abs_row_end - abs_row_start;
-            // Tile-local Y where these rows start
-            let texture_row_offset = abs_row_start - tile_row_start;
-            // Offset into the staging buffer (rows from the start of the chunk)
-            let staging_row_offset = abs_row_start - row_offset;
-
-            for tx in 0..grid.tiles_x {
-                let tile_idx = grid.tile_index(tx, ty);
-                let (col_start, _) = grid.tile_col_range(tx);
-                let tile_w = grid.tile_width(tx);
-                let bind_group = &self.tile_compute_bind_groups[tile_idx];
-
-                // row_offset into the staging buffer where this tile's data starts
-                self.write_tile_params(
-                    tile_idx,
-                    &MatrixParams {
-                        rows: local_chunk_rows,
-                        cols: tile_w,
-                        min_val,
-                        max_val,
-                        row_offset: staging_row_offset,
-                        col_offset: col_start,
-                        total_cols: cols,
-                        texture_row_offset,
-                        texture_col_offset: 0,
-                        col_major: 0,
-                        col_stride: 0,
-                        _pad2: 0,
-                    },
-                );
-
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("Stream Colormap Pass"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(compute_pipeline);
-                    pass.set_bind_group(0, bind_group, &[]);
-                    pass.dispatch_workgroups(
-                        (tile_w + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
-                        (local_chunk_rows + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
-                        1,
-                    );
-                }
-            }
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Ring-buffer scrolled update: write new columns at `ring_cursor` and advance.
@@ -815,8 +733,6 @@ impl Renderer {
         read_fn: &dyn Fn(usize, &mut [f32]),
         cols: u32,
         new_cols: u32,
-        min_val: f32,
-        max_val: f32,
     ) {
         let _timer = PerfTimer::new("apply_colormap_ring", self.debug);
         let grid = match &self.tile_grid {
@@ -936,8 +852,8 @@ impl Renderer {
                                 &MatrixParams {
                                     rows: chunk_rows,
                                     cols: tile_new_cols,
-                                    min_val,
-                                    max_val,
+                                    min_val: 0.0,
+                                    max_val: 1.0,
                                     row_offset: 0,
                                     col_offset: 0,
                                     total_cols: 0,
@@ -949,8 +865,8 @@ impl Renderer {
                                 },
                             );
                             pass.dispatch_workgroups(
-                                (tile_new_cols + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
-                                (chunk_rows + WORKGROUP_ALIGNMENT - 1) / WORKGROUP_ALIGNMENT,
+                                tile_new_cols.div_ceil(WORKGROUP_ALIGNMENT),
+                                chunk_rows.div_ceil(WORKGROUP_ALIGNMENT),
                                 1,
                             );
                         }
@@ -986,8 +902,11 @@ impl Renderer {
 
     /// Render a single frame.
     ///
-    /// Colormap is always pre-applied to tile textures during data upload.
-    /// This method only updates tile camera buffers and draws one quad per tile.
+    /// Raw float data is in R32Float tile textures. The fragment shader reads
+    /// the float, normalizes using the range uniform, and applies the colormap
+    /// LUT. Two bind groups are set per tile draw:
+    /// - Group 0 (per-tile): data texture + camera uniform
+    /// - Group 1 (shared):   colormap LUT + sampler + range uniform
     pub fn render_frame(
         &self,
         _colormap: &Option<ColormapTexture>,
@@ -1007,6 +926,11 @@ impl Renderer {
         if self.tile_render_bind_groups.is_empty() {
             return self.render_clear();
         }
+
+        let colormap_bg = match self.colormap_bind_group.as_ref() {
+            Some(bg) => bg,
+            None => return self.render_clear(),
+        };
 
         let output = self
             .surface
@@ -1045,6 +969,8 @@ impl Renderer {
             });
 
             render_pass.set_pipeline(render_pipeline);
+            // Group 1 (shared colormap) is the same for all tiles
+            render_pass.set_bind_group(1, colormap_bg, &[]);
             for bind_group in &self.tile_render_bind_groups {
                 render_pass.set_bind_group(0, bind_group, &[]);
                 render_pass.draw(0..6, 0..1);
@@ -1112,10 +1038,5 @@ impl Renderer {
     /// Maximum 2D texture dimension.
     pub fn max_texture_dimension(&self) -> u32 {
         self.max_texture_dimension
-    }
-
-    /// Set the colormap_applied flag.
-    pub fn set_colormap_applied(&mut self, applied: bool) {
-        self.colormap_applied = applied;
     }
 }

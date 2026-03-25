@@ -41,6 +41,21 @@ pub struct MatrixParams {
     pub _pad2: u32,
 }
 
+/// Fragment shader uniform for colormap normalization range.
+///
+/// 16 bytes (4 × f32) for WGSL uniform alignment. The fragment shader uses
+/// these values to normalize raw float data before sampling the colormap LUT.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RangeParams {
+    /// Minimum data value (maps to first colormap color)
+    pub min_val: f32,
+    /// Maximum data value (maps to last colormap color)
+    pub max_val: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+}
+
 /// Page size for paged storage: 64 MB / 4 bytes per f32 = 16M elements.
 const PAGE_SIZE_ELEMENTS: usize = 16 * 1024 * 1024;
 
@@ -552,7 +567,7 @@ impl JsDataSource {
     /// Allocates `rows × cols` elements in JS heap. Use `write_range()` to fill
     /// data during streaming, and `update_min_max()` to track the running range.
     pub fn from_empty(rows: u32, cols: u32) -> Self {
-        let total = (rows as u32) * (cols as u32);
+        let total = rows * cols;
         let data = js_sys::Float32Array::new_with_length(total);
         Self {
             data,
