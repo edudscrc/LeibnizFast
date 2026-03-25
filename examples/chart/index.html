@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>LeibnizFast — Chart Axes Example</title>
+  <title>LeibnizFast — Chart Example</title>
   <style>
     * {
       margin: 0;
@@ -29,6 +29,13 @@
     h1 {
       font-size: 1.4rem;
       color: #e0e0ff;
+    }
+
+    p.note {
+      font-size: 0.85rem;
+      color: #aaa;
+      max-width: 820px;
+      text-align: center;
     }
 
     .controls {
@@ -57,6 +64,51 @@
       background: #3a3a6e;
     }
 
+    input[type="number"],
+    input[type="text"] {
+      padding: 4px 8px;
+      border-radius: 4px;
+      border: 1px solid #444;
+      background: #2a2a4e;
+      color: #eee;
+      width: 90px;
+    }
+
+    .params {
+      border: 1px solid #3a3a5e;
+      border-radius: 6px;
+      padding: 12px 16px;
+      max-width: 820px;
+      width: 100%;
+    }
+
+    .params legend {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #aab;
+      padding: 0 6px;
+      letter-spacing: 0.05em;
+    }
+
+    .params-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 10px 20px;
+      margin-bottom: 12px;
+    }
+
+    .params-grid label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.82rem;
+      color: #ccc;
+    }
+
+    .params-grid input {
+      width: 100%;
+    }
+
     #chart-canvas {
       width: 800px;
       height: 600px;
@@ -75,13 +127,37 @@
       display: none;
       font-family: monospace;
     }
+
+    .error-banner {
+      width: 100%;
+      max-width: 820px;
+      padding: 8px 14px;
+      background: #5c1a1a;
+      color: #ffcccc;
+      border: 1px solid #c44;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      display: none;
+    }
   </style>
 </head>
 
 <body>
   <div class="container">
-    <h1>LeibnizFast — Chart with Axes</h1>
+    <h1>LeibnizFast — Static Chart</h1>
+    <p class="note">
+      GPU-generated sine-wave matrix rendered as a heatmap with configurable
+      axes, colormap, and value range. Data is generated on the GPU via a
+      WebGPU compute shader. Requires a WebGPU-capable browser.
+    </p>
+
+    <!-- Matrix size + colormap + reload -->
     <div class="controls">
+      <label for="rows">Rows:</label>
+      <input type="number" id="rows" value="500" min="1" max="40000" step="100" />
+      <label for="cols">Cols:</label>
+      <input type="number" id="cols" value="1000" min="1" max="40000" step="100" />
+
       <label for="colormap">Colormap:</label>
       <select id="colormap">
         <option value="viridis" selected>Viridis</option>
@@ -91,13 +167,62 @@
         <option value="cividis">Cividis</option>
         <option value="grayscale">Grayscale</option>
       </select>
-      <label for="mode">Mode:</label>
-      <select id="mode">
-        <option value="static" selected>Static Chart</option>
-        <option value="streaming">Streaming Chart</option>
-      </select>
+
       <button id="reload">Reload Data</button>
     </div>
+
+    <!-- Axis and value configuration -->
+    <fieldset class="params">
+      <legend>AXIS &amp; VALUE CONFIG</legend>
+      <div class="params-grid">
+        <label>
+          X Label
+          <input type="text" id="x-label" value="Time" />
+        </label>
+        <label>
+          X Unit
+          <input type="text" id="x-unit" value="s" />
+        </label>
+        <label>
+          X Min
+          <input type="number" id="x-min" value="0" step="any" />
+        </label>
+        <label>
+          X Max
+          <input type="number" id="x-max" value="10" step="any" />
+        </label>
+        <label>
+          Y Label
+          <input type="text" id="y-label" value="Frequency" />
+        </label>
+        <label>
+          Y Unit
+          <input type="text" id="y-unit" value="Hz" />
+        </label>
+        <label>
+          Y Min
+          <input type="number" id="y-min" value="0" step="any" />
+        </label>
+        <label>
+          Y Max
+          <input type="number" id="y-max" value="22050" step="any" />
+        </label>
+        <label>
+          Value Unit
+          <input type="text" id="value-unit" value="dB" />
+        </label>
+        <label>
+          V Min (color)
+          <input type="number" id="vmin" value="" step="any" placeholder="auto" />
+        </label>
+        <label>
+          V Max (color)
+          <input type="number" id="vmax" value="" step="any" placeholder="auto" />
+        </label>
+      </div>
+    </fieldset>
+
+    <div class="error-banner" id="error-banner"></div>
     <canvas id="chart-canvas"></canvas>
     <div class="tooltip" id="tooltip"></div>
   </div>

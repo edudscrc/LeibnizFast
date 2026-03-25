@@ -26,7 +26,7 @@ npm install
 npm run build:wasm     # Rust → WASM (outputs to pkg/)
 npm run build:js       # TypeScript → ESM bundle (outputs to dist/)
 npm run build          # Both
-npm run dev            # Build + serve at localhost:8080/examples/basic/
+npm run dev            # Build + serve at localhost:8080/examples/chart/
 ```
 
 ## Test & Lint
@@ -97,69 +97,56 @@ viewer.endData();
 
 ## Examples
 
-All examples require the WASM build first:
+All examples require a full build first:
 
 ```bash
-npm run build:wasm
+npm run build
 ```
 
-### Basic
+### Chart (Static Heatmap)
 
-Generates a sine-wave matrix in JavaScript. Demonstrates colormap switching, size selection, hover tooltips, and optional streaming mode.
+GPU-generated sine-wave matrix rendered as a heatmap with configurable axes, colormap, and value range. Data is generated on the GPU via a WebGPU compute shader. Full user controls for matrix dimensions, axis labels/units/ranges, value unit, and color range (vmin/vmax).
 
 ```bash
-npm run dev
-# Open http://localhost:8080/examples/basic/
+npm run dev            # or: npm run dev:chart
+# Open http://localhost:8080/examples/chart/
 ```
 
-### GPU Generation
+### Waterfall (Streaming Columns)
 
-Generates the matrix entirely on the GPU via a WebGPU compute shader, then passes the result to LeibnizFast. Eliminates the JS CPU bottleneck for large matrices.
-
-```bash
-npm run dev
-# Open http://localhost:8080/examples/gpu-gen/
-```
-
-### Waterfall
-
-Live scrolling waterfall display. A C++ generator simulates spatial-temporal sensor data at a fixed sampling rate, streams it via ZeroMQ to a Python bridge, which broadcasts over WebSocket to the browser.
+Live scrolling waterfall display. A C++ generator simulates spatial-temporal sensor data at a fixed sampling rate, streams it via ZeroMQ to a Python bridge, which broadcasts over WebSocket to the browser. New data appears on the right; old data scrolls left. Uses a ring buffer for O(rows x newCols) per-frame cost.
 
 **Dependencies:** `libzmq`, Python packages `pyzmq` and `websockets`.
 
 ```bash
-# Terminal 1 — Python bridge
+# Install dependencies
+apt install libzmq3-dev       # Debian/Ubuntu
 pip install pyzmq websockets
-python examples/waterfall/bridge.py
 
-# Terminal 2 — C++ generator
-g++ -std=c++17 -O2 -o generator examples/waterfall/generator.cpp -lzmq
-./generator
+# Compile the C++ generator
+g++ -std=c++17 -O2 -o examples/waterfall/generator examples/waterfall/generator.cpp -lzmq
 
-# Terminal 3 — Web server
-npm run dev
+# Build, start generator + bridge + web server, and open browser
+npm run dev:waterfall
 # Open http://localhost:8080/examples/waterfall/
 ```
 
 ### C++ Live Stream (Wave Equation)
 
-Solves a 2D wave equation in C++ and streams live frames to the browser. Supports chunked transmission and optional zlib compression.
+Solves a 2D wave equation in C++ and streams live frames to the browser. Each complete frame replaces the previous one (not a waterfall — the entire matrix updates per frame). Render is decoupled from the network via `requestAnimationFrame` for smooth display. Includes chart-style axes with configurable labels, units, and ranges.
 
-**Dependencies:** `libzmq`, `zlib`, Python packages `pyzmq` and `websockets`.
+**Dependencies:** `libzmq`, Python packages `pyzmq` and `websockets`.
 
 ```bash
-# Terminal 1 — Python bridge
+# Install dependencies
+apt install libzmq3-dev       # Debian/Ubuntu
 pip install pyzmq websockets
-python examples/cpp-stream/bridge.py
 
-# Terminal 2 — C++ generator
-g++ -std=c++17 -O2 -o generator examples/cpp-stream/generator.cpp -lzmq -lz
-./generator                  # plain mode
-./generator --compress       # zlib compression (~4x smaller, ~2x FPS)
-./generator --size 4096      # larger grid
+# Compile the C++ generator
+g++ -std=c++17 -O2 -o examples/cpp-stream/generator examples/cpp-stream/generator.cpp -lzmq
 
-# Terminal 3 — Web server
-npm run dev
+# Build, start generator + bridge + web server, and open browser
+npm run dev:cpp-stream
 # Open http://localhost:8080/examples/cpp-stream/
 ```
 

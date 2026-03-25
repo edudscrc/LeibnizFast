@@ -149,7 +149,9 @@ async def main() -> None:
 
     # Start WebSocket server with the handler that has ctrl_sock in scope
     handler = make_ws_handler(ctrl_sock)
-    server = await websockets.serve(handler, WS_HOST, WS_PORT, compression=None)
+    server = await websockets.serve(
+        handler, WS_HOST, WS_PORT, compression=None, write_limit=1 << 22
+    )
     log.info("WebSocket server listening on ws://%s:%d", WS_HOST, WS_PORT)
 
     # Register clean shutdown handlers for SIGINT and SIGTERM

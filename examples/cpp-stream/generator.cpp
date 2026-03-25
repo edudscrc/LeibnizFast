@@ -1,5 +1,5 @@
 /*
- * generator.cpp — 2D wave equation simulation → ZeroMQ PUSH
+ * generator.cpp — 2D wave equation simulation -> ZeroMQ PUSH
  *
  * Simulates a 2D wave field and streams frames over ZMQ PUSH.
  * A Python bridge (bridge.py) relays frames to WebSocket clients.
@@ -11,7 +11,7 @@
  * Control message: 4-byte little-endian uint32 = new grid size N.
  * The simulation reinitializes immediately with the new size.
  *
- * --- Protocol v1: plain chunks (magic 0x4C465A01, 32-byte header) -------
+ * Protocol v1: plain float32 chunks (magic 0x4C465A01, 32-byte header):
  *
  *   Offset  0: magic        = 0x4C465A01
  *   Offset  4: total_rows   (N)
@@ -21,36 +21,20 @@
  *   Offset 20: total_chunks
  *   Offset 24: row_start
  *   Offset 28: chunk_rows
- *   Offset 32: float32[chunk_rows × cols]  row-major grid data
- *
- * --- Protocol v2: compressed chunks (magic 0x4C465A02, 40-byte header) ---
- *
- *   Offset  0: magic          = 0x4C465A02
- *   Offset  4: total_rows     (N)
- *   Offset  8: cols           (N)
- *   Offset 12: frame_id
- *   Offset 16: chunk_index    (0-based)
- *   Offset 20: total_chunks
- *   Offset 24: row_start
- *   Offset 28: chunk_rows
- *   Offset 32: flags          bit 0 = compressed
- *   Offset 36: payload_bytes  (byte count of compressed data following this header)
- *   Offset 40: zlib compressed float32[chunk_rows × cols]
+ *   Offset 32: float32[chunk_rows x cols]  row-major grid data
  *
  * Build:
- *   apt install libzmq3-dev zlib1g-dev   # Debian/Ubuntu
- *   brew install zeromq zlib             # macOS
- *   g++ -std=c++17 -O2 -o generator generator.cpp -lzmq -lz
+ *   apt install libzmq3-dev             # Debian/Ubuntu
+ *   brew install zeromq                 # macOS
+ *   g++ -std=c++17 -O2 -o generator generator.cpp -lzmq
  *
  * Run:
- *   ./generator                          # 512×512, plain protocol
+ *   ./generator                          # 512x512, plain protocol
  *   ./generator --size 4096             # larger grid
  *   ./generator --chunks 4             # 4 ZMQ messages per frame
- *   ./generator --compress             # zlib compression (~4× smaller → ~8 FPS at 4096²)
  *   ./generator --debug                # per-frame performance logging
  */
 
-#include <zlib.h>
 #include <zmq.h>
 
 #include <algorithm>
@@ -68,14 +52,8 @@
 
 // ---- Constants -------------------------------------------------------
 
-// Protocol v1: plain float32 chunks
 static constexpr uint32_t CHUNK_MAGIC = 0x4C465A01u;
-static constexpr int CHUNK_HEADER_BYTES = 32;  // 8 × uint32
-
-// Protocol v2: compressed chunks
-static constexpr uint32_t ENHANCED_MAGIC = 0x4C465A02u;
-static constexpr int ENHANCED_HEADER_BYTES = 40;   // 10 × uint32
-static constexpr uint32_t FLAG_COMPRESSED = 0x1u;  // zlib compressed
+static constexpr int CHUNK_HEADER_BYTES = 32;  // 8 x uint32
 
 static constexpr float C_SPEED = 1.0f;
 static constexpr float DAMPING = 0.999f;
@@ -99,7 +77,6 @@ inline int idx(int i, int j, int N) { return i * N + j; }
 struct SimState {
   int N;
   int n_chunks;
-  bool compress;  // enable zlib compression (protocol v2)
   float dx, dt, r;
 
   std::vector<float> u_prev_buf;
@@ -110,15 +87,10 @@ struct SimState {
   float* u_curr() { return u_curr_buf.data(); }
   float* u_next() { return u_next_buf.data(); }
 
-  // send_buf: pre-allocated output buffer.
-  //   v1 (plain):    CHUNK_HEADER_BYTES    + max_chunk_float_bytes
-  //   v2 (enhanced): ENHANCED_HEADER_BYTES + compressBound(max_chunk_float_bytes)
+  // send_buf: CHUNK_HEADER_BYTES + max_chunk_float_bytes
   std::vector<uint8_t> send_buf;
 
-  explicit SimState(int n, int chunks, bool comp)
-      : n_chunks(chunks), compress(comp) {
-    resize(n);
-  }
+  explicit SimState(int n, int chunks) : n_chunks(chunks) { resize(n); }
 
   void resize(int new_N) {
     N = new_N;
@@ -132,18 +104,10 @@ struct SimState {
     u_next_buf.assign(cells, 0.0f);
 
     const int max_chunk_rows = (new_N + n_chunks - 1) / n_chunks;
-    const uLong float_bytes =
-        static_cast<uLong>(max_chunk_rows) * new_N * sizeof(float);
+    const std::size_t float_bytes =
+        static_cast<std::size_t>(max_chunk_rows) * new_N * sizeof(float);
 
-    if (compress) {
-      // v2 path: header(40) + compressed output (compressBound ≈ src + 0.1% + 12B)
-      send_buf.resize(ENHANCED_HEADER_BYTES +
-                      static_cast<std::size_t>(compressBound(float_bytes)));
-    } else {
-      // v1 path: header(32) + raw float32 data
-      send_buf.resize(CHUNK_HEADER_BYTES +
-                      static_cast<std::size_t>(float_bytes));
-    }
+    send_buf.resize(CHUNK_HEADER_BYTES + float_bytes);
   }
 };
 
@@ -152,7 +116,6 @@ struct SimState {
 int main(int argc, char* argv[]) {
   int initial_N = 512;
   int n_chunks = 4;
-  bool compress = false;
   bool g_debug = false;
 
   for (int a = 1; a < argc; ++a) {
@@ -169,8 +132,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "chunks must be 1.." << CHUNKS_MAX << "\n";
         return 1;
       }
-    } else if (arg == "--compress") {
-      compress = true;
     } else if (arg == "--debug") {
       g_debug = true;
     }
@@ -217,14 +178,12 @@ int main(int argc, char* argv[]) {
   std::cout << "ZMQ PUSH (data) bound to tcp://127.0.0.1:5555\n";
   std::cout << "ZMQ PULL (ctrl) bound to tcp://127.0.0.1:5556\n";
   std::cout << "Wave sim: " << initial_N << "x" << initial_N
-            << "  n_chunks=" << n_chunks
-            << "  mode=" << (compress ? "zlib" : "plain")
-            << "\n";
+            << "  n_chunks=" << n_chunks << "\n";
   if (g_debug)
     std::cout << "Debug mode enabled — per-frame performance logging active\n";
   std::cout << "Press Ctrl+C to stop.\n";
 
-  SimState sim(initial_N, n_chunks, compress);
+  SimState sim(initial_N, n_chunks);
   uint32_t frame_id = 0;
   const auto frame_duration = std::chrono::milliseconds(33);  // ~30 FPS
 
@@ -245,7 +204,7 @@ int main(int argc, char* argv[]) {
         std::memcpy(&new_N, ctrl_buf, 4);
         if (new_N >= static_cast<uint32_t>(N_MIN) &&
             new_N <= static_cast<uint32_t>(N_MAX)) {
-          std::cout << "Resize: " << N << " → " << new_N << "\n";
+          std::cout << "Resize: " << N << " -> " << new_N << "\n";
           sim.resize(static_cast<int>(new_N));
           frame_id = 0;
           continue;
@@ -254,16 +213,6 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Wave equation step (interior points only) ---------------
-    //
-    //   u_next[i][j] = DAMPING * (
-    //       2*u_curr[i][j] - u_prev[i][j]
-    //       + r * (u_curr[i+1][j] + u_curr[i-1][j]
-    //              + u_curr[i][j+1] + u_curr[i][j-1]
-    //              - 4*u_curr[i][j])
-    //   )
-    //
-    // Boundaries stay at 0 (Dirichlet) — only interior cells written,
-    // boundary zeros persist through every std::swap rotation.
     const auto t_sim = std::chrono::steady_clock::now();
     float* uc = sim.u_curr();
     float* up = sim.u_prev();
@@ -298,63 +247,24 @@ int main(int argc, char* argv[]) {
       const int row_start = c * rows_per_chunk;
       const int chunk_rows = std::min(rows_per_chunk, N - row_start);
       const int chunk_cells = chunk_rows * N;
+      const std::size_t data_bytes =
+          static_cast<std::size_t>(chunk_cells) * sizeof(float);
 
-      if (sim.compress) {
-        // ---- Protocol v2: zlib-compressed chunk --------------
+      auto* h = reinterpret_cast<uint32_t*>(sim.send_buf.data());
+      h[0] = CHUNK_MAGIC;
+      h[1] = static_cast<uint32_t>(N);
+      h[2] = static_cast<uint32_t>(N);
+      h[3] = frame_id;
+      h[4] = static_cast<uint32_t>(c);
+      h[5] = static_cast<uint32_t>(sim.n_chunks);
+      h[6] = static_cast<uint32_t>(row_start);
+      h[7] = static_cast<uint32_t>(chunk_rows);
 
-        const uint8_t* src =
-            reinterpret_cast<const uint8_t*>(sim.u_curr() + row_start * N);
-        const uLong src_bytes =
-            static_cast<uLong>(chunk_cells) * sizeof(float);
+      std::memcpy(sim.send_buf.data() + CHUNK_HEADER_BYTES,
+                  sim.u_curr() + row_start * N, data_bytes);
 
-        // Compress directly into send_buf past the header (no intermediate copy).
-        uLong dest_bytes =
-            static_cast<uLong>(sim.send_buf.size() - ENHANCED_HEADER_BYTES);
-        const int zrc = compress2(sim.send_buf.data() + ENHANCED_HEADER_BYTES,
-                                  &dest_bytes, src, src_bytes, Z_BEST_SPEED);
-        if (zrc != Z_OK) {
-          if (g_debug) std::cerr << "[warn] compress2 failed: " << zrc << "\n";
-          continue;
-        }
-
-        // Write 40-byte enhanced header (after compression so dest_bytes is known)
-        auto* h = reinterpret_cast<uint32_t*>(sim.send_buf.data());
-        h[0] = ENHANCED_MAGIC;
-        h[1] = static_cast<uint32_t>(N);             // total_rows
-        h[2] = static_cast<uint32_t>(N);             // cols
-        h[3] = frame_id;
-        h[4] = static_cast<uint32_t>(c);             // chunk_index
-        h[5] = static_cast<uint32_t>(sim.n_chunks);  // total_chunks
-        h[6] = static_cast<uint32_t>(row_start);     // row_start
-        h[7] = static_cast<uint32_t>(chunk_rows);    // chunk_rows
-        h[8] = FLAG_COMPRESSED;                       // flags
-        h[9] = static_cast<uint32_t>(dest_bytes);    // payload_bytes
-
-        zmq_send(sock_data, sim.send_buf.data(),
-                 ENHANCED_HEADER_BYTES + static_cast<int>(dest_bytes),
-                 ZMQ_DONTWAIT);
-
-      } else {
-        // ---- Protocol v1: plain float32 chunk ----------------
-        const std::size_t data_bytes =
-            static_cast<std::size_t>(chunk_cells) * sizeof(float);
-
-        auto* h = reinterpret_cast<uint32_t*>(sim.send_buf.data());
-        h[0] = CHUNK_MAGIC;
-        h[1] = static_cast<uint32_t>(N);
-        h[2] = static_cast<uint32_t>(N);
-        h[3] = frame_id;
-        h[4] = static_cast<uint32_t>(c);
-        h[5] = static_cast<uint32_t>(sim.n_chunks);
-        h[6] = static_cast<uint32_t>(row_start);
-        h[7] = static_cast<uint32_t>(chunk_rows);
-
-        std::memcpy(sim.send_buf.data() + CHUNK_HEADER_BYTES,
-                    sim.u_curr() + row_start * N, data_bytes);
-
-        zmq_send(sock_data, sim.send_buf.data(),
-                 CHUNK_HEADER_BYTES + data_bytes, ZMQ_DONTWAIT);
-      }
+      zmq_send(sock_data, sim.send_buf.data(),
+               CHUNK_HEADER_BYTES + data_bytes, ZMQ_DONTWAIT);
     }
     const double send_ms = ms_since(t_send);
 
