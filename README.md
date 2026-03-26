@@ -2,6 +2,8 @@
 
 GPU-accelerated 2D matrix visualization for the browser. Renders interactive heatmaps with zoom, pan, and cell-level hover inspection — powered by WebGPU (with WebGL2 fallback) via Rust and WASM.
 
+**[Documentation](docs/)** — full API reference, guides for static and streaming data, chart customization, and usage examples.
+
 ## Prerequisites
 
 - **Rust** (stable) + `wasm32-unknown-unknown` target
@@ -27,6 +29,14 @@ npm run build:wasm     # Rust → WASM (outputs to pkg/)
 npm run build:js       # TypeScript → ESM bundle (outputs to dist/)
 npm run build          # Both
 npm run dev            # Build + serve at localhost:8080/examples/chart/
+```
+
+## Docs
+
+```bash
+npm run docs:dev       # Dev server with hot reload at localhost:5173
+npm run docs:build     # Build static site to docs/.vitepress/dist/
+npm run docs:preview   # Preview production build at localhost:4173
 ```
 
 ## Test & Lint
@@ -66,8 +76,8 @@ viewer.setColormap("inferno");
 viewer.setRange(0.0, 1.0);
 
 // Cell hover callback
-viewer.onHover((row, col, value) => {
-  console.log(`[${row}, ${col}] = ${value}`);
+viewer.onHover((info) => {
+  console.log(`[${info.row}, ${info.col}] = ${info.value}`);
 });
 
 // Clean up when done
