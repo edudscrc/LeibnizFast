@@ -310,6 +310,22 @@ Returns the maximum value for a single matrix dimension (`rows` or `cols`). Matr
 
 ---
 
+## resetZoom()
+
+```ts
+resetZoom(): void
+```
+
+Resets the camera to show the full matrix (both axes at zoom level 1.0). This is the programmatic equivalent of double-clicking on the matrix area.
+
+```ts
+viewer.resetZoom();
+```
+
+See [Guide: Mouse Interaction](/guide/interaction) for the full set of zoom/pan controls.
+
+---
+
 ## destroy()
 
 ```ts

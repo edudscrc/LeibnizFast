@@ -31,11 +31,45 @@ import type {
 } from './types';
 import {
   computeLayout,
+  drawAxisHighlight,
+  drawSelectionRect,
   isStreamingAxis,
   renderOverlay,
   uvToVisibleRange,
 } from './axes';
 import type { LayoutRect, VisibleRange } from './axes';
+
+// ---------------------------------------------------------------------------
+// Interaction types
+// ---------------------------------------------------------------------------
+
+/** Which region of the chart the mouse is over. */
+type HitRegion = 'matrix' | 'x-axis' | 'y-axis' | 'none';
+
+/** Current interaction mode state machine. */
+type InteractionMode =
+  | { type: 'idle' }
+  | { type: 'matrix-pan' }
+  | { type: 'axis-pan'; axis: 'x' | 'y'; lastPos: number }
+  | {
+      type: 'rect-select';
+      startX: number;
+      startY: number;
+      currentX: number;
+      currentY: number;
+    }
+  | {
+      type: 'axis-select';
+      axis: 'x' | 'y';
+      startPos: number;
+      currentPos: number;
+    };
+
+/** Minimum drag distance in CSS pixels to count as a selection. */
+const MIN_SELECTION_PX = 5;
+
+/** Duration of the zoom-reset animation in milliseconds. */
+const ANIMATION_DURATION_MS = 300;
 
 // Re-export types for consumers
 export type {
@@ -93,6 +127,8 @@ export class LeibnizFast {
     mouseenter: () => void;
     mouseleave: () => void;
     wheel: (e: WheelEvent) => void;
+    contextmenu: (e: MouseEvent) => void;
+    dblclick: (e: MouseEvent) => void;
     resize: () => void;
   };
 
@@ -105,6 +141,14 @@ export class LeibnizFast {
   private lastMouseY: number = 0;
   /** Whether the mouse pointer is currently inside the canvas. */
   private mouseInside: boolean = false;
+
+  // --- Interaction state ---
+  /** Current interaction mode. */
+  private interactionMode: InteractionMode = { type: 'idle' };
+  /** Which axis region the mouse is currently hovering (for highlight). */
+  private hoveredAxis: 'x' | 'y' | null = null;
+  /** Active zoom-reset animation frame ID, or null if no animation is running. */
+  private zoomAnimationId: number | null = null;
 
   // --- Chart overlay state ---
   /** Chart configuration (axes, title, labels). Null when no chart mode. */
@@ -121,8 +165,6 @@ export class LeibnizFast {
   private streamingDisplayCols: number = 0;
   /** Streaming X axis: total columns received (including scrolled-off). */
   private streamingXOffset: number = 0;
-  /** Cached canvas bounding rect, invalidated on resize. */
-  private cachedCanvasRect: DOMRect | null = null;
   /** Whether an overlay rAF redraw is already scheduled. */
   private overlayDirty: boolean = false;
   /** Current matrix row count (for hover coordinate mapping). */
@@ -146,60 +188,35 @@ export class LeibnizFast {
     this.canvas = canvas;
     this.debug = debug;
 
-    if (chartConfig) {
-      this.chartConfig = chartConfig;
-      this.setupChartOverlay();
-    }
-
-    // Bind DOM event handlers
+    // Bind DOM event handlers (must happen before setupChartOverlay,
+    // which calls removeEventListeners/registerEventListeners)
     this.boundHandlers = {
-      mousedown: (e: MouseEvent) => {
-        const rect = this.getCanvasRect();
-        this.inner.onMouseDown(e.clientX - rect.left, e.clientY - rect.top);
-      },
-      mousemove: (e: MouseEvent) => {
-        const rect = this.getCanvasRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        this.lastMouseX = x;
-        this.lastMouseY = y;
-        this.inner.onMouseMove(x, y);
-        this.scheduleOverlayUpdate();
-      },
+      mousedown: (e: MouseEvent) => this.handleMouseDown(e),
+      mousemove: (e: MouseEvent) => this.handleMouseMove(e),
       mouseenter: () => {
         this.mouseInside = true;
       },
       mouseleave: () => {
         this.mouseInside = false;
-      },
-      mouseup: () => {
-        this.inner.onMouseUp();
-      },
-      wheel: (e: WheelEvent) => {
-        e.preventDefault();
-        const rect = this.getCanvasRect();
-        this.inner.onWheel(
-          e.clientX - rect.left,
-          e.clientY - rect.top,
-          -e.deltaY,
-        );
+        this.hoveredAxis = null;
+        this.updateCursor('default');
         this.scheduleOverlayUpdate();
       },
+      mouseup: (e: MouseEvent) => this.handleMouseUp(e),
+      wheel: (e: WheelEvent) => this.handleWheel(e),
+      contextmenu: (e: MouseEvent) => e.preventDefault(),
+      dblclick: (e: MouseEvent) => this.handleDblClick(e),
       resize: () => {
         this.handleResize();
       },
     };
 
-    // Register event listeners
-    canvas.addEventListener('mousedown', this.boundHandlers.mousedown);
-    canvas.addEventListener('mousemove', this.boundHandlers.mousemove);
-    canvas.addEventListener('mouseenter', this.boundHandlers.mouseenter);
-    canvas.addEventListener('mouseleave', this.boundHandlers.mouseleave);
-    window.addEventListener('mouseup', this.boundHandlers.mouseup);
-    canvas.addEventListener('wheel', this.boundHandlers.wheel, {
-      passive: false,
-    });
-    window.addEventListener('resize', this.boundHandlers.resize);
+    if (chartConfig) {
+      this.chartConfig = chartConfig;
+      this.setupChartOverlay();
+    } else {
+      this.registerEventListeners();
+    }
 
     // Compute initial layout and render overlay (must happen after DOM setup)
     this.handleResize();
@@ -491,26 +508,438 @@ export class LeibnizFast {
   }
 
   /**
+   * Reset the camera to show the full matrix (both axes).
+   * Equivalent to double-clicking the matrix area.
+   */
+  resetZoom(): void {
+    const uv = this.inner.getVisibleRange();
+    this.animateToUvRect(
+      { x: uv[0], y: uv[1], w: uv[2], h: uv[3] },
+      { x: 0, y: 0, w: 1, h: 1 },
+    );
+  }
+
+  /**
    * Clean up all resources (GPU, event listeners, WASM, overlay DOM).
    * Must be called when the viewer is no longer needed.
    */
   destroy(): void {
-    // Remove event listeners
-    this.canvas.removeEventListener('mousedown', this.boundHandlers.mousedown);
-    this.canvas.removeEventListener('mousemove', this.boundHandlers.mousemove);
-    this.canvas.removeEventListener('mouseenter', this.boundHandlers.mouseenter);
-    this.canvas.removeEventListener('mouseleave', this.boundHandlers.mouseleave);
-    window.removeEventListener('mouseup', this.boundHandlers.mouseup);
-    this.canvas.removeEventListener('wheel', this.boundHandlers.wheel);
-    window.removeEventListener('resize', this.boundHandlers.resize);
+    if (this.zoomAnimationId !== null) {
+      cancelAnimationFrame(this.zoomAnimationId);
+      this.zoomAnimationId = null;
+    }
+    this.removeEventListeners();
     this.hoverCallback = null;
     this.dataRef = null;
+    this.interactionMode = { type: 'idle' };
+    this.hoveredAxis = null;
 
     // Clean up overlay DOM
     this.teardownChartOverlay();
 
     // Destroy WASM instance (frees GPU resources)
     this.inner.destroy();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: event listener registration
+  // ---------------------------------------------------------------------------
+
+  /** The element that receives mouse/wheel events (wrapper or canvas). */
+  private get eventTarget(): HTMLElement {
+    return this.wrapperDiv ?? this.canvas;
+  }
+
+  private registerEventListeners(): void {
+    const target = this.eventTarget;
+    target.addEventListener('mousedown', this.boundHandlers.mousedown);
+    target.addEventListener('mousemove', this.boundHandlers.mousemove);
+    target.addEventListener('mouseenter', this.boundHandlers.mouseenter);
+    target.addEventListener('mouseleave', this.boundHandlers.mouseleave);
+    target.addEventListener('wheel', this.boundHandlers.wheel, {
+      passive: false,
+    });
+    target.addEventListener('contextmenu', this.boundHandlers.contextmenu);
+    target.addEventListener('dblclick', this.boundHandlers.dblclick);
+    window.addEventListener('mouseup', this.boundHandlers.mouseup);
+    window.addEventListener('resize', this.boundHandlers.resize);
+  }
+
+  private removeEventListeners(): void {
+    const target = this.eventTarget;
+    target.removeEventListener('mousedown', this.boundHandlers.mousedown);
+    target.removeEventListener('mousemove', this.boundHandlers.mousemove);
+    target.removeEventListener('mouseenter', this.boundHandlers.mouseenter);
+    target.removeEventListener('mouseleave', this.boundHandlers.mouseleave);
+    target.removeEventListener('wheel', this.boundHandlers.wheel);
+    target.removeEventListener('contextmenu', this.boundHandlers.contextmenu);
+    target.removeEventListener('dblclick', this.boundHandlers.dblclick);
+    window.removeEventListener('mouseup', this.boundHandlers.mouseup);
+    window.removeEventListener('resize', this.boundHandlers.resize);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: hit region detection
+  // ---------------------------------------------------------------------------
+
+  /** Determine which chart region the mouse is over (wrapper-local coords). */
+  private getHitRegion(wrapperX: number, wrapperY: number): HitRegion {
+    if (!this.chartConfig) return 'matrix';
+    const l = this.layout;
+
+    // Matrix area
+    if (
+      wrapperX >= l.x &&
+      wrapperX <= l.x + l.width &&
+      wrapperY >= l.y &&
+      wrapperY <= l.y + l.height
+    ) {
+      return 'matrix';
+    }
+
+    // X-axis region: below the matrix, horizontally within matrix bounds
+    if (
+      wrapperX >= l.x &&
+      wrapperX <= l.x + l.width &&
+      wrapperY > l.y + l.height
+    ) {
+      return 'x-axis';
+    }
+
+    // Y-axis region: left of the matrix, vertically within matrix bounds
+    if (wrapperX < l.x && wrapperY >= l.y && wrapperY <= l.y + l.height) {
+      return 'y-axis';
+    }
+
+    return 'none';
+  }
+
+  /** Convert a MouseEvent to wrapper-local coordinates. */
+  private wrapperCoords(e: MouseEvent): { wx: number; wy: number } {
+    const target = this.eventTarget;
+    const rect = target.getBoundingClientRect();
+    return { wx: e.clientX - rect.left, wy: e.clientY - rect.top };
+  }
+
+  /** Convert wrapper-local coords to canvas-local coords. */
+  private toCanvasLocal(wx: number, wy: number): { cx: number; cy: number } {
+    return { cx: wx - this.layout.x, cy: wy - this.layout.y };
+  }
+
+  /** Whether this is a streaming/waterfall chart (X axis is time). */
+  private isStreamingChart(): boolean {
+    return !!(
+      this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: mouse event handlers
+  // ---------------------------------------------------------------------------
+
+  private handleMouseDown(e: MouseEvent): void {
+    const { wx, wy } = this.wrapperCoords(e);
+    const region = this.getHitRegion(wx, wy);
+    const { cx, cy } = this.toCanvasLocal(wx, wy);
+    const isRight = e.button === 2;
+    const isLeft = e.button === 0;
+    const streaming = this.isStreamingChart();
+
+    if (isLeft && region === 'matrix') {
+      // Standard left-drag pan via WASM
+      this.interactionMode = { type: 'matrix-pan' };
+      this.inner.onMouseDown(cx, cy);
+      this.updateCursor('grabbing');
+    } else if (isLeft && region === 'y-axis') {
+      this.interactionMode = { type: 'axis-pan', axis: 'y', lastPos: wy };
+      this.updateCursor('grabbing');
+    } else if (isLeft && region === 'x-axis' && !streaming) {
+      this.interactionMode = { type: 'axis-pan', axis: 'x', lastPos: wx };
+      this.updateCursor('grabbing');
+    } else if (isRight && region === 'matrix' && !streaming) {
+      this.interactionMode = {
+        type: 'rect-select',
+        startX: wx,
+        startY: wy,
+        currentX: wx,
+        currentY: wy,
+      };
+      this.updateCursor('crosshair');
+    } else if (isRight && region === 'y-axis') {
+      this.interactionMode = {
+        type: 'axis-select',
+        axis: 'y',
+        startPos: wy,
+        currentPos: wy,
+      };
+    } else if (isRight && region === 'x-axis' && !streaming) {
+      this.interactionMode = {
+        type: 'axis-select',
+        axis: 'x',
+        startPos: wx,
+        currentPos: wx,
+      };
+    }
+  }
+
+  private handleMouseMove(e: MouseEvent): void {
+    const { wx, wy } = this.wrapperCoords(e);
+    const { cx, cy } = this.toCanvasLocal(wx, wy);
+    const mode = this.interactionMode;
+
+    switch (mode.type) {
+      case 'matrix-pan': {
+        this.lastMouseX = cx;
+        this.lastMouseY = cy;
+        this.inner.onMouseMove(cx, cy);
+        this.scheduleOverlayUpdate();
+        return;
+      }
+
+      case 'axis-pan': {
+        if (mode.axis === 'x') {
+          const dx = wx - mode.lastPos;
+          mode.lastPos = wx;
+          this.inner.panX(dx);
+        } else {
+          const dy = wy - mode.lastPos;
+          mode.lastPos = wy;
+          this.inner.panY(dy);
+        }
+        this.scheduleOverlayUpdate();
+        return;
+      }
+
+      case 'rect-select': {
+        mode.currentX = wx;
+        mode.currentY = wy;
+        this.scheduleOverlayUpdate();
+        return;
+      }
+
+      case 'axis-select': {
+        mode.currentPos = mode.axis === 'x' ? wx : wy;
+        this.scheduleOverlayUpdate();
+        return;
+      }
+
+      case 'idle': {
+        // Update hover state
+        this.lastMouseX = cx;
+        this.lastMouseY = cy;
+        const region = this.getHitRegion(wx, wy);
+
+        if (region === 'matrix') {
+          this.inner.onMouseMove(cx, cy);
+          this.hoveredAxis = null;
+          this.updateCursor('default');
+        } else if (region === 'x-axis') {
+          this.hoveredAxis = this.isStreamingChart() ? null : 'x';
+          this.updateCursor(this.isStreamingChart() ? 'default' : 'col-resize');
+        } else if (region === 'y-axis') {
+          this.hoveredAxis = 'y';
+          this.updateCursor('row-resize');
+        } else {
+          this.hoveredAxis = null;
+          this.updateCursor('default');
+        }
+        this.scheduleOverlayUpdate();
+        return;
+      }
+    }
+  }
+
+  private handleMouseUp(_e: MouseEvent): void {
+    const mode = this.interactionMode;
+
+    switch (mode.type) {
+      case 'matrix-pan': {
+        this.inner.onMouseUp();
+        break;
+      }
+
+      case 'rect-select': {
+        this.finishRectSelect(mode);
+        break;
+      }
+
+      case 'axis-select': {
+        this.finishAxisSelect(mode);
+        break;
+      }
+
+      default:
+        break;
+    }
+
+    this.interactionMode = { type: 'idle' };
+    this.updateCursor('default');
+    this.scheduleOverlayUpdate();
+  }
+
+  private handleWheel(e: WheelEvent): void {
+    e.preventDefault();
+    const { wx, wy } = this.wrapperCoords(e);
+    const region = this.getHitRegion(wx, wy);
+    const { cx, cy } = this.toCanvasLocal(wx, wy);
+    const delta = -e.deltaY;
+    const streaming = this.isStreamingChart();
+
+    if (region === 'matrix') {
+      this.inner.onWheel(cx, cy, delta);
+    } else if (region === 'x-axis' && !streaming) {
+      // Zoom X at the horizontal position mapped to canvas-local X
+      this.inner.zoomAtX(cx, delta);
+    } else if (region === 'y-axis') {
+      // Zoom Y at the vertical position mapped to canvas-local Y
+      this.inner.zoomAtY(cy, delta);
+    }
+    this.scheduleOverlayUpdate();
+  }
+
+  private handleDblClick(e: MouseEvent): void {
+    const { wx, wy } = this.wrapperCoords(e);
+    const region = this.getHitRegion(wx, wy);
+    const streaming = this.isStreamingChart();
+
+    const uv = this.inner.getVisibleRange();
+    const from = { x: uv[0], y: uv[1], w: uv[2], h: uv[3] };
+
+    if (region === 'matrix') {
+      this.animateToUvRect(from, { x: 0, y: 0, w: 1, h: 1 });
+    } else if (region === 'x-axis' && !streaming) {
+      this.animateToUvRect(from, { x: 0, y: from.y, w: 1, h: from.h });
+    } else if (region === 'y-axis') {
+      this.animateToUvRect(from, { x: from.x, y: 0, w: from.w, h: 1 });
+    }
+  }
+
+  /**
+   * Smoothly animate from the current UV rect to a target UV rect
+   * using ease-out cubic interpolation.
+   */
+  private animateToUvRect(
+    from: { x: number; y: number; w: number; h: number },
+    to: { x: number; y: number; w: number; h: number },
+  ): void {
+    // Cancel any in-progress animation
+    if (this.zoomAnimationId !== null) {
+      cancelAnimationFrame(this.zoomAnimationId);
+      this.zoomAnimationId = null;
+    }
+
+    const startTime = performance.now();
+
+    const step = (now: number) => {
+      const elapsed = now - startTime;
+      const rawT = Math.min(1, elapsed / ANIMATION_DURATION_MS);
+      // Ease-out cubic: decelerates smoothly
+      const t = 1 - (1 - rawT) ** 3;
+
+      const x = from.x + (to.x - from.x) * t;
+      const y = from.y + (to.y - from.y) * t;
+      const w = from.w + (to.w - from.w) * t;
+      const h = from.h + (to.h - from.h) * t;
+
+      this.inner.zoomToUvRect(x, y, x + w, y + h);
+      this.scheduleOverlayUpdate();
+
+      if (rawT < 1) {
+        this.zoomAnimationId = requestAnimationFrame(step);
+      } else {
+        this.zoomAnimationId = null;
+      }
+    };
+
+    this.zoomAnimationId = requestAnimationFrame(step);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: selection finalization
+  // ---------------------------------------------------------------------------
+
+  /** Convert a rectangle selection to a UV rect and zoom into it. */
+  private finishRectSelect(
+    mode: Extract<InteractionMode, { type: 'rect-select' }>,
+  ): void {
+    const dx = Math.abs(mode.currentX - mode.startX);
+    const dy = Math.abs(mode.currentY - mode.startY);
+    if (dx < MIN_SELECTION_PX && dy < MIN_SELECTION_PX) return;
+
+    const l = this.layout;
+    // Clamp to matrix area and convert to canvas-local fractions
+    const x0 = Math.max(
+      0,
+      (Math.min(mode.startX, mode.currentX) - l.x) / l.width,
+    );
+    const x1 = Math.min(
+      1,
+      (Math.max(mode.startX, mode.currentX) - l.x) / l.width,
+    );
+    const y0 = Math.max(
+      0,
+      (Math.min(mode.startY, mode.currentY) - l.y) / l.height,
+    );
+    const y1 = Math.min(
+      1,
+      (Math.max(mode.startY, mode.currentY) - l.y) / l.height,
+    );
+
+    // Convert canvas fractions to UV using current camera
+    const uv = this.inner.getVisibleRange();
+    const uMin = uv[0] + x0 * uv[2];
+    const uMax = uv[0] + x1 * uv[2];
+    const vMin = uv[1] + y0 * uv[3];
+    const vMax = uv[1] + y1 * uv[3];
+
+    this.inner.zoomToUvRect(uMin, vMin, uMax, vMax);
+  }
+
+  /** Convert an axis selection to a UV range and zoom that axis. */
+  private finishAxisSelect(
+    mode: Extract<InteractionMode, { type: 'axis-select' }>,
+  ): void {
+    const dist = Math.abs(mode.currentPos - mode.startPos);
+    if (dist < MIN_SELECTION_PX) return;
+
+    const l = this.layout;
+    const uv = this.inner.getVisibleRange();
+
+    if (mode.axis === 'x') {
+      const x0 = Math.max(
+        0,
+        (Math.min(mode.startPos, mode.currentPos) - l.x) / l.width,
+      );
+      const x1 = Math.min(
+        1,
+        (Math.max(mode.startPos, mode.currentPos) - l.x) / l.width,
+      );
+      const uMin = uv[0] + x0 * uv[2];
+      const uMax = uv[0] + x1 * uv[2];
+      // Keep current Y range
+      this.inner.zoomToUvRect(uMin, uv[1], uMax, uv[1] + uv[3]);
+    } else {
+      const y0 = Math.max(
+        0,
+        (Math.min(mode.startPos, mode.currentPos) - l.y) / l.height,
+      );
+      const y1 = Math.min(
+        1,
+        (Math.max(mode.startPos, mode.currentPos) - l.y) / l.height,
+      );
+      const vMin = uv[1] + y0 * uv[3];
+      const vMax = uv[1] + y1 * uv[3];
+      // Keep current X range
+      this.inner.zoomToUvRect(uv[0], vMin, uv[0] + uv[2], vMax);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: cursor management
+  // ---------------------------------------------------------------------------
+
+  private updateCursor(cursor: string): void {
+    this.eventTarget.style.cursor = cursor;
   }
 
   // ---------------------------------------------------------------------------
@@ -523,6 +952,9 @@ export class LeibnizFast {
    */
   private setupChartOverlay(): void {
     if (this.wrapperDiv) return; // already set up
+
+    // Remove listeners from canvas before reparenting
+    this.removeEventListeners();
 
     const parent = this.canvas.parentElement;
     if (!parent) return;
@@ -562,6 +994,9 @@ export class LeibnizFast {
     this.wrapperDiv = wrapper;
     this.overlayCanvas = overlay;
     this.overlayCtx = overlay.getContext('2d');
+
+    // Re-register listeners on wrapper (covers axis regions)
+    this.registerEventListeners();
   }
 
   /**
@@ -570,6 +1005,8 @@ export class LeibnizFast {
    */
   private teardownChartOverlay(): void {
     if (!this.wrapperDiv) return;
+
+    this.removeEventListeners();
 
     const parent = this.wrapperDiv.parentElement;
     if (parent) {
@@ -590,6 +1027,9 @@ export class LeibnizFast {
     this.wrapperDiv = null;
     this.overlayCanvas = null;
     this.overlayCtx = null;
+
+    // Re-register on canvas directly
+    this.registerEventListeners();
   }
 
   /**
@@ -597,7 +1037,6 @@ export class LeibnizFast {
    * update the WASM renderer, and redraw the overlay.
    */
   private handleResize(): void {
-    this.cachedCanvasRect = null; // invalidate on resize
     const dpr = window.devicePixelRatio || 1;
 
     if (this.chartConfig && this.wrapperDiv && this.overlayCtx) {
@@ -642,17 +1081,6 @@ export class LeibnizFast {
   }
 
   /**
-   * Get the cached canvas bounding rect, computing it if invalidated.
-   * Avoids forcing a layout reflow on every mouse event.
-   */
-  private getCanvasRect(): DOMRect {
-    if (!this.cachedCanvasRect) {
-      this.cachedCanvasRect = this.canvas.getBoundingClientRect();
-    }
-    return this.cachedCanvasRect;
-  }
-
-  /**
    * Schedule an overlay redraw on the next animation frame.
    * Multiple calls per frame are coalesced into a single redraw.
    */
@@ -666,26 +1094,77 @@ export class LeibnizFast {
   }
 
   /**
-   * Redraw the chart overlay (axes, ticks, labels, title).
+   * Redraw the chart overlay (axes, ticks, labels, title, selections, highlights).
    * Called after data changes, pan/zoom, and resize.
    */
   private updateOverlay(): void {
     if (!this.chartConfig || !this.overlayCtx || !this.wrapperDiv) return;
 
+    const ctx = this.overlayCtx;
     const dpr = window.devicePixelRatio || 1;
     const wrapperRect = this.wrapperDiv.getBoundingClientRect();
+    const containerW = wrapperRect.width;
+    const containerH = wrapperRect.height;
 
     const visible = this.computeVisibleRange();
 
     renderOverlay(
-      this.overlayCtx,
+      ctx,
       this.layout,
       this.chartConfig,
       visible,
-      wrapperRect.width,
-      wrapperRect.height,
+      containerW,
+      containerH,
       dpr,
     );
+
+    // Draw interaction overlays on top of axes (inside the same DPR transform)
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Axis hover highlight
+    if (this.hoveredAxis && this.interactionMode.type === 'idle') {
+      drawAxisHighlight(
+        ctx,
+        this.layout,
+        this.hoveredAxis,
+        containerW,
+        containerH,
+      );
+    }
+
+    // Selection rectangle
+    const mode = this.interactionMode;
+    if (mode.type === 'rect-select') {
+      const l = this.layout;
+      const sx = Math.max(l.x, Math.min(mode.startX, mode.currentX));
+      const sy = Math.max(l.y, Math.min(mode.startY, mode.currentY));
+      const ex = Math.min(l.x + l.width, Math.max(mode.startX, mode.currentX));
+      const ey = Math.min(l.y + l.height, Math.max(mode.startY, mode.currentY));
+      drawSelectionRect(ctx, sx, sy, ex - sx, ey - sy);
+    }
+
+    // Axis selection band
+    if (mode.type === 'axis-select') {
+      const l = this.layout;
+      if (mode.axis === 'x') {
+        const sx = Math.max(l.x, Math.min(mode.startPos, mode.currentPos));
+        const ex = Math.min(
+          l.x + l.width,
+          Math.max(mode.startPos, mode.currentPos),
+        );
+        drawSelectionRect(ctx, sx, l.y, ex - sx, l.height);
+      } else {
+        const sy = Math.max(l.y, Math.min(mode.startPos, mode.currentPos));
+        const ey = Math.min(
+          l.y + l.height,
+          Math.max(mode.startPos, mode.currentPos),
+        );
+        drawSelectionRect(ctx, l.x, sy, l.width, ey - sy);
+      }
+    }
+
+    ctx.restore();
   }
 
   /**
@@ -722,9 +1201,6 @@ export class LeibnizFast {
     const xAxis = this.chartConfig.xAxis;
     if (isStreamingAxis(xAxis)) {
       const xMax = this.streamingXOffset * xAxis.unitsPerCell;
-      // Allow negative values before the buffer fills — the "0" tick
-      // marks where streaming data begins, and the left portion shows
-      // negative time (unfilled region).
       const xMin =
         (this.streamingXOffset - this.streamingDisplayCols) *
         xAxis.unitsPerCell;
@@ -750,7 +1226,6 @@ export class LeibnizFast {
     const cfg = this.chartConfig;
     if (!cfg) return info;
 
-    // Map row → Y axis value
     if (cfg.yAxis) {
       const [yMin, yMax] = this.getFullYRange();
       const rows = this.matrixRows;
@@ -758,7 +1233,6 @@ export class LeibnizFast {
       info.yUnit = cfg.yAxis.unit;
     }
 
-    // Map col → X axis value
     if (cfg.xAxis) {
       const [xMin, xMax] = this.getFullXRange();
       const cols = this.matrixCols;
@@ -766,7 +1240,6 @@ export class LeibnizFast {
       info.xUnit = cfg.xAxis.unit;
     }
 
-    // Value unit
     if (cfg.valueUnit) {
       info.valueUnit = cfg.valueUnit;
     }
@@ -776,14 +1249,6 @@ export class LeibnizFast {
 
   /**
    * Re-invoke the hover lookup at the last known mouse position.
-   *
-   * For streaming data with a ring buffer, the visual content under
-   * the cursor shifts every frame even when the mouse is stationary.
-   * We read the value directly from the JS Float32Array with a
-   * ring-adjusted column index, matching what the GPU shader displays.
-   *
-   * Cost: one UV transform + one Float32Array element read — no WASM
-   * boundary crossing, no allocations.
    */
   private refreshHoverIfNeeded(): void {
     if (!this.mouseInside || !this.hoverCallback || !this.dataRef) return;
@@ -792,26 +1257,18 @@ export class LeibnizFast {
     const cols = this.matrixCols;
     if (rows === 0 || cols === 0) return;
 
-    // Map screen position → UV → (row, col)
     const uv = this.inner.getVisibleRange();
-    const u =
-      uv[0] + (this.lastMouseX / this.canvas.clientWidth) * uv[2];
-    const v =
-      uv[1] + (this.lastMouseY / this.canvas.clientHeight) * uv[3];
+    const u = uv[0] + (this.lastMouseX / this.canvas.clientWidth) * uv[2];
+    const v = uv[1] + (this.lastMouseY / this.canvas.clientHeight) * uv[3];
 
     const col = Math.floor(u * cols);
     const row = Math.floor(v * rows);
     if (row < 0 || row >= rows || col < 0 || col >= cols) return;
 
-    // Apply ring offset: the shader displays buffer column
-    // (col + ringCursor) % cols at visual column col.
     const bufCol = (col + this.ringCursor) % cols;
 
-    // Read value from the JS Float32Array directly
     const data = this.dataRef;
-    const idx = this.dataColMajor
-      ? bufCol * rows + row
-      : row * cols + bufCol;
+    const idx = this.dataColMajor ? bufCol * rows + row : row * cols + bufCol;
     const value = data[idx];
 
     this.hoverCallback(this.buildHoverInfo(row, col, value));

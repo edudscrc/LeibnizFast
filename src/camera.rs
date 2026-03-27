@@ -39,8 +39,10 @@ const MAX_ZOOM: f32 = 1000.0;
 pub struct CameraState {
     /// Center of the viewport in UV coordinates
     center: (f32, f32),
-    /// Zoom level (1.0 = full matrix visible)
-    zoom: f32,
+    /// Horizontal zoom level (1.0 = full matrix width visible)
+    zoom_x: f32,
+    /// Vertical zoom level (1.0 = full matrix height visible)
+    zoom_y: f32,
     /// Canvas width in pixels
     canvas_width: f32,
     /// Canvas height in pixels
@@ -56,7 +58,8 @@ impl CameraState {
     pub fn new(canvas_width: f32, canvas_height: f32) -> Self {
         Self {
             center: (0.5, 0.5),
-            zoom: 1.0,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
             canvas_width,
             canvas_height,
             matrix_rows: 1,
@@ -79,10 +82,10 @@ impl CameraState {
     /// Get the camera uniforms for the GPU shader.
     ///
     /// Returns UV offset (top-left) and UV scale (visible width/height).
-    /// At zoom=1, offset=[0,0] and scale=[1,1] (entire matrix visible).
+    /// At zoom=(1,1), offset=[0,0] and scale=[1,1] (entire matrix visible).
     pub fn get_uniforms(&self) -> CameraUniforms {
-        let uv_width = 1.0 / self.zoom;
-        let uv_height = 1.0 / self.zoom;
+        let uv_width = 1.0 / self.zoom_x;
+        let uv_height = 1.0 / self.zoom_y;
 
         let uv_left = self.center.0 - uv_width / 2.0;
         let uv_top = self.center.1 - uv_height / 2.0;
@@ -93,23 +96,50 @@ impl CameraState {
         }
     }
 
-    /// Zoom at a specific screen position, keeping that point fixed.
+    /// Zoom both axes at a specific screen position, keeping that point fixed.
     ///
     /// `delta` is the scroll amount (positive = zoom in, negative = zoom out).
     /// The point under the cursor stays in place while the rest of the view scales.
     pub fn zoom_at(&mut self, screen_x: f32, screen_y: f32, delta: f32) {
-        // Convert screen position to UV before zoom
         let uv_before = self.screen_to_uv(screen_x, screen_y);
 
-        // Apply zoom (exponential for smooth feel)
         let zoom_factor = 1.0 + delta * ZOOM_SENSITIVITY;
-        self.zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom_x = (self.zoom_x * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom_y = (self.zoom_y * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
 
-        // Convert same screen position to UV after zoom
         let uv_after = self.screen_to_uv(screen_x, screen_y);
 
-        // Adjust center so the UV point under cursor stays fixed
         self.center.0 += uv_before.0 - uv_after.0;
+        self.center.1 += uv_before.1 - uv_after.1;
+
+        self.clamp_center();
+    }
+
+    /// Zoom only the X axis at a specific screen X position, keeping that
+    /// point fixed horizontally. Y zoom is unchanged.
+    pub fn zoom_at_x(&mut self, screen_x: f32, delta: f32) {
+        let uv_before = self.screen_to_uv(screen_x, 0.0);
+
+        let zoom_factor = 1.0 + delta * ZOOM_SENSITIVITY;
+        self.zoom_x = (self.zoom_x * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
+
+        let uv_after = self.screen_to_uv(screen_x, 0.0);
+
+        self.center.0 += uv_before.0 - uv_after.0;
+
+        self.clamp_center();
+    }
+
+    /// Zoom only the Y axis at a specific screen Y position, keeping that
+    /// point fixed vertically. X zoom is unchanged.
+    pub fn zoom_at_y(&mut self, screen_y: f32, delta: f32) {
+        let uv_before = self.screen_to_uv(0.0, screen_y);
+
+        let zoom_factor = 1.0 + delta * ZOOM_SENSITIVITY;
+        self.zoom_y = (self.zoom_y * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
+
+        let uv_after = self.screen_to_uv(0.0, screen_y);
+
         self.center.1 += uv_before.1 - uv_after.1;
 
         self.clamp_center();
@@ -119,13 +149,64 @@ impl CameraState {
     ///
     /// Converts pixel movement to UV movement based on current zoom level.
     pub fn pan(&mut self, dx: f32, dy: f32) {
-        // Convert pixel delta to UV delta
-        let uv_dx = -dx / (self.canvas_width * self.zoom);
-        let uv_dy = -dy / (self.canvas_height * self.zoom);
+        let uv_dx = -dx / (self.canvas_width * self.zoom_x);
+        let uv_dy = -dy / (self.canvas_height * self.zoom_y);
 
         self.center.0 += uv_dx;
         self.center.1 += uv_dy;
 
+        self.clamp_center();
+    }
+
+    /// Pan only the X axis by a screen-space delta.
+    pub fn pan_x(&mut self, dx: f32) {
+        let uv_dx = -dx / (self.canvas_width * self.zoom_x);
+        self.center.0 += uv_dx;
+        self.clamp_center();
+    }
+
+    /// Pan only the Y axis by a screen-space delta.
+    pub fn pan_y(&mut self, dy: f32) {
+        let uv_dy = -dy / (self.canvas_height * self.zoom_y);
+        self.center.1 += uv_dy;
+        self.clamp_center();
+    }
+
+    /// Zoom to frame a specific UV rectangle.
+    ///
+    /// Sets center and zoom so the given UV region fills the viewport.
+    /// Coordinates are in UV space [0,1]².
+    pub fn zoom_to_uv_rect(&mut self, u_min: f32, v_min: f32, u_max: f32, v_max: f32) {
+        let uv_width = (u_max - u_min).max(1e-6);
+        let uv_height = (v_max - v_min).max(1e-6);
+
+        self.zoom_x = (1.0 / uv_width).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom_y = (1.0 / uv_height).clamp(MIN_ZOOM, MAX_ZOOM);
+
+        self.center.0 = (u_min + u_max) / 2.0;
+        self.center.1 = (v_min + v_max) / 2.0;
+
+        self.clamp_center();
+    }
+
+    /// Reset both axes to the default full-matrix view.
+    pub fn reset_zoom(&mut self) {
+        self.zoom_x = 1.0;
+        self.zoom_y = 1.0;
+        self.center = (0.5, 0.5);
+    }
+
+    /// Reset only the X axis zoom, keeping Y unchanged.
+    pub fn reset_zoom_x(&mut self) {
+        self.zoom_x = 1.0;
+        self.center.0 = 0.5;
+        self.clamp_center();
+    }
+
+    /// Reset only the Y axis zoom, keeping X unchanged.
+    pub fn reset_zoom_y(&mut self) {
+        self.zoom_y = 1.0;
+        self.center.1 = 0.5;
         self.clamp_center();
     }
 
@@ -151,7 +232,6 @@ impl CameraState {
     ) -> Option<(u32, u32)> {
         let (u, v) = self.screen_to_uv(screen_x, screen_y);
 
-        // UV is in [0,1], map to matrix indices
         let col = (u * cols as f32).floor() as i32;
         let row = (v * rows as f32).floor() as i32;
 
@@ -164,8 +244,8 @@ impl CameraState {
 
     /// Clamp the center so the viewport doesn't go out of [0,1] bounds.
     fn clamp_center(&mut self) {
-        let half_width = 0.5 / self.zoom;
-        let half_height = 0.5 / self.zoom;
+        let half_width = 0.5 / self.zoom_x;
+        let half_height = 0.5 / self.zoom_y;
 
         self.center.0 = self.center.0.clamp(half_width, 1.0 - half_width);
         self.center.1 = self.center.1.clamp(half_height, 1.0 - half_height);
@@ -227,7 +307,8 @@ mod tests {
     fn test_zoom_2x_at_center() {
         let mut cam = CameraState::new(800.0, 600.0);
         // Manually set zoom to 2x (center stays at 0.5, 0.5)
-        cam.zoom = 2.0;
+        cam.zoom_x = 2.0;
+        cam.zoom_y = 2.0;
         let u = cam.get_uniforms();
         assert!((u.uv_offset[0] - 0.25).abs() < 1e-6);
         assert!((u.uv_offset[1] - 0.25).abs() < 1e-6);
@@ -263,7 +344,8 @@ mod tests {
     fn test_pan_moves_center() {
         let mut cam = CameraState::new(800.0, 600.0);
         // Must zoom in first — at zoom=1 you see the full matrix and can't pan
-        cam.zoom = 4.0;
+        cam.zoom_x = 4.0;
+        cam.zoom_y = 4.0;
         let center_before = cam.center;
 
         // Pan right by 80px → content shifts, center moves left in UV space
@@ -331,7 +413,8 @@ mod tests {
     fn test_zoom_clamp_minimum() {
         let mut cam = CameraState::new(800.0, 600.0);
         cam.zoom_at(400.0, 300.0, -10000.0);
-        assert!((cam.zoom - MIN_ZOOM).abs() < 1e-6);
+        assert!((cam.zoom_x - MIN_ZOOM).abs() < 1e-6);
+        assert!((cam.zoom_y - MIN_ZOOM).abs() < 1e-6);
     }
 
     #[test]
@@ -339,7 +422,8 @@ mod tests {
         let mut cam = CameraState::new(800.0, 600.0);
         // Zoom in with a massive delta to hit the ceiling
         cam.zoom_at(400.0, 300.0, 1_000_000.0);
-        assert!((cam.zoom - MAX_ZOOM).abs() < 1e-6);
+        assert!((cam.zoom_x - MAX_ZOOM).abs() < 1e-6);
+        assert!((cam.zoom_y - MAX_ZOOM).abs() < 1e-6);
     }
 
     #[test]
@@ -366,7 +450,8 @@ mod tests {
     #[test]
     fn test_pan_zero_delta() {
         let mut cam = CameraState::new(800.0, 600.0);
-        cam.zoom = 4.0;
+        cam.zoom_x = 4.0;
+        cam.zoom_y = 4.0;
         let center_before = cam.center;
 
         cam.pan(0.0, 0.0);
@@ -381,5 +466,177 @@ mod tests {
         // Exactly at the bottom-right edge → should be None (exclusive)
         let result = cam.screen_to_matrix(800.0, 600.0, 100, 200);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_independent_zoom_produces_different_scales() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom_x = 2.0;
+        cam.zoom_y = 4.0;
+        let u = cam.get_uniforms();
+        assert!((u.uv_scale[0] - 0.5).abs() < 1e-6, "X scale should be 0.5");
+        assert!(
+            (u.uv_scale[1] - 0.25).abs() < 1e-6,
+            "Y scale should be 0.25"
+        );
+    }
+
+    #[test]
+    fn test_zoom_at_x_keeps_point_fixed_and_preserves_y() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        let zoom_y_before = cam.zoom_y;
+
+        let uv_before = cam.screen_to_uv(200.0, 150.0);
+        cam.zoom_at_x(200.0, 500.0);
+        let uv_after = cam.screen_to_uv(200.0, 150.0);
+
+        assert!(
+            (uv_before.0 - uv_after.0).abs() < 1e-4,
+            "X UV should stay fixed: {} → {}",
+            uv_before.0,
+            uv_after.0
+        );
+        assert!(
+            (cam.zoom_y - zoom_y_before).abs() < 1e-6,
+            "Y zoom should be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_zoom_at_y_keeps_point_fixed_and_preserves_x() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        let zoom_x_before = cam.zoom_x;
+
+        let uv_before = cam.screen_to_uv(200.0, 150.0);
+        cam.zoom_at_y(150.0, 500.0);
+        let uv_after = cam.screen_to_uv(200.0, 150.0);
+
+        assert!(
+            (uv_before.1 - uv_after.1).abs() < 1e-4,
+            "Y UV should stay fixed: {} → {}",
+            uv_before.1,
+            uv_after.1
+        );
+        assert!(
+            (cam.zoom_x - zoom_x_before).abs() < 1e-6,
+            "X zoom should be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_zoom_to_uv_rect() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom_to_uv_rect(0.25, 0.25, 0.75, 0.75);
+
+        let u = cam.get_uniforms();
+        assert!((u.uv_offset[0] - 0.25).abs() < 1e-6);
+        assert!((u.uv_offset[1] - 0.25).abs() < 1e-6);
+        assert!((u.uv_scale[0] - 0.5).abs() < 1e-6);
+        assert!((u.uv_scale[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_zoom_to_uv_rect_asymmetric() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom_to_uv_rect(0.0, 0.25, 0.5, 0.75);
+
+        let u = cam.get_uniforms();
+        assert!((u.uv_scale[0] - 0.5).abs() < 1e-6, "X scale should be 0.5");
+        assert!((u.uv_scale[1] - 0.5).abs() < 1e-6, "Y scale should be 0.5");
+        assert!(
+            (u.uv_offset[0] - 0.0).abs() < 1e-6,
+            "X offset should be 0.0"
+        );
+        assert!(
+            (u.uv_offset[1] - 0.25).abs() < 1e-6,
+            "Y offset should be 0.25"
+        );
+    }
+
+    #[test]
+    fn test_pan_x_only_moves_horizontal() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom_x = 4.0;
+        cam.zoom_y = 4.0;
+        let center_before = cam.center;
+
+        cam.pan_x(80.0);
+
+        assert!(
+            (cam.center.0 - center_before.0).abs() > 1e-6,
+            "X center should move"
+        );
+        assert!(
+            (cam.center.1 - center_before.1).abs() < 1e-6,
+            "Y center should not move"
+        );
+    }
+
+    #[test]
+    fn test_pan_y_only_moves_vertical() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom_x = 4.0;
+        cam.zoom_y = 4.0;
+        let center_before = cam.center;
+
+        cam.pan_y(60.0);
+
+        assert!(
+            (cam.center.0 - center_before.0).abs() < 1e-6,
+            "X center should not move"
+        );
+        assert!(
+            (cam.center.1 - center_before.1).abs() > 1e-6,
+            "Y center should move"
+        );
+    }
+
+    #[test]
+    fn test_reset_zoom() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom_x = 5.0;
+        cam.zoom_y = 3.0;
+        cam.center = (0.7, 0.3);
+
+        cam.reset_zoom();
+
+        assert!((cam.zoom_x - 1.0).abs() < 1e-6);
+        assert!((cam.zoom_y - 1.0).abs() < 1e-6);
+        assert!((cam.center.0 - 0.5).abs() < 1e-6);
+        assert!((cam.center.1 - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_reset_zoom_x_keeps_y() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom_x = 5.0;
+        cam.zoom_y = 3.0;
+        cam.center = (0.7, 0.5);
+
+        cam.reset_zoom_x();
+
+        assert!((cam.zoom_x - 1.0).abs() < 1e-6, "X zoom should reset to 1");
+        assert!(
+            (cam.zoom_y - 3.0).abs() < 1e-6,
+            "Y zoom should be unchanged"
+        );
+        assert!((cam.center.0 - 0.5).abs() < 1e-6, "X center should reset");
+    }
+
+    #[test]
+    fn test_reset_zoom_y_keeps_x() {
+        let mut cam = CameraState::new(800.0, 600.0);
+        cam.zoom_x = 5.0;
+        cam.zoom_y = 3.0;
+        cam.center = (0.5, 0.7);
+
+        cam.reset_zoom_y();
+
+        assert!(
+            (cam.zoom_x - 5.0).abs() < 1e-6,
+            "X zoom should be unchanged"
+        );
+        assert!((cam.zoom_y - 1.0).abs() < 1e-6, "Y zoom should reset to 1");
+        assert!((cam.center.1 - 0.5).abs() < 1e-6, "Y center should reset");
     }
 }

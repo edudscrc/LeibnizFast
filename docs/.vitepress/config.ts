@@ -21,6 +21,7 @@ export default defineConfig({
           { text: 'Initialization', link: '/guide/initialization' },
           { text: 'Static Data', link: '/guide/static-data' },
           { text: 'Chart Customization', link: '/guide/chart-customization' },
+          { text: 'Mouse Interaction', link: '/guide/interaction' },
           {
             text: 'Streaming: Full Frame',
             link: '/guide/streaming-full-frame',

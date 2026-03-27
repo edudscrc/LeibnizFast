@@ -543,6 +543,72 @@ function drawYAxis(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Selection & highlight rendering
+// ---------------------------------------------------------------------------
+
+/** Semi-transparent blue for selection rectangles. */
+const SELECTION_FILL = 'rgba(59, 130, 246, 0.2)';
+/** Dashed border color for selection rectangles. */
+const SELECTION_STROKE = 'rgba(59, 130, 246, 0.8)';
+/** Subtle highlight for axis hover feedback. */
+const AXIS_HOVER_FILL = 'rgba(255, 255, 255, 0.05)';
+
+/**
+ * Draw a selection rectangle on the overlay canvas.
+ *
+ * @param ctx - 2D rendering context
+ * @param x - Left edge in CSS pixels
+ * @param y - Top edge in CSS pixels
+ * @param w - Width in CSS pixels
+ * @param h - Height in CSS pixels
+ */
+export function drawSelectionRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): void {
+  ctx.fillStyle = SELECTION_FILL;
+  ctx.fillRect(x, y, w, h);
+
+  ctx.strokeStyle = SELECTION_STROKE;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 3]);
+  ctx.strokeRect(x, y, w, h);
+  ctx.setLineDash([]);
+}
+
+/**
+ * Draw a subtle highlight strip on an axis region to indicate interactivity.
+ *
+ * @param ctx - 2D rendering context
+ * @param layout - Matrix area layout
+ * @param axis - Which axis to highlight ('x' or 'y')
+ * @param containerWidth - Full container width in CSS pixels
+ * @param containerHeight - Full container height in CSS pixels
+ */
+export function drawAxisHighlight(
+  ctx: CanvasRenderingContext2D,
+  layout: LayoutRect,
+  axis: 'x' | 'y',
+  containerWidth: number,
+  containerHeight: number,
+): void {
+  ctx.fillStyle = AXIS_HOVER_FILL;
+  if (axis === 'x') {
+    ctx.fillRect(
+      layout.x,
+      layout.y + layout.height,
+      layout.width,
+      containerHeight - layout.y - layout.height,
+    );
+  } else {
+    ctx.fillRect(0, layout.y, layout.x, layout.height);
+  }
+}
+
 /**
  * Map camera UV coordinates to data-space axis ranges.
  *

@@ -752,6 +752,86 @@ mod wasm_entry {
             Ok(())
         }
 
+        /// Zoom only the X axis at a screen position. Called from JS for axis-region scroll.
+        #[wasm_bindgen(js_name = zoomAtX)]
+        pub fn zoom_at_x(&mut self, screen_x: f32, delta: f32) -> Result<(), JsValue> {
+            self.camera.state.zoom_at_x(screen_x, delta);
+            self.camera.update_uniform(&self.renderer.queue);
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Zoom only the Y axis at a screen position. Called from JS for axis-region scroll.
+        #[wasm_bindgen(js_name = zoomAtY)]
+        pub fn zoom_at_y(&mut self, screen_y: f32, delta: f32) -> Result<(), JsValue> {
+            self.camera.state.zoom_at_y(screen_y, delta);
+            self.camera.update_uniform(&self.renderer.queue);
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Pan only the X axis. Called from JS for axis-region drag.
+        #[wasm_bindgen(js_name = panX)]
+        pub fn pan_x(&mut self, dx: f32) -> Result<(), JsValue> {
+            self.camera.state.pan_x(dx);
+            self.camera.update_uniform(&self.renderer.queue);
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Pan only the Y axis. Called from JS for axis-region drag.
+        #[wasm_bindgen(js_name = panY)]
+        pub fn pan_y(&mut self, dy: f32) -> Result<(), JsValue> {
+            self.camera.state.pan_y(dy);
+            self.camera.update_uniform(&self.renderer.queue);
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Zoom to frame a UV rectangle. Called from JS for selection-rect zoom.
+        #[wasm_bindgen(js_name = zoomToUvRect)]
+        pub fn zoom_to_uv_rect(
+            &mut self,
+            u_min: f32,
+            v_min: f32,
+            u_max: f32,
+            v_max: f32,
+        ) -> Result<(), JsValue> {
+            self.camera
+                .state
+                .zoom_to_uv_rect(u_min, v_min, u_max, v_max);
+            self.camera.update_uniform(&self.renderer.queue);
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Reset both axes to the default full-matrix view.
+        #[wasm_bindgen(js_name = resetZoom)]
+        pub fn reset_zoom(&mut self) -> Result<(), JsValue> {
+            self.camera.state.reset_zoom();
+            self.camera.update_uniform(&self.renderer.queue);
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Reset only the X axis zoom, keeping Y unchanged.
+        #[wasm_bindgen(js_name = resetZoomX)]
+        pub fn reset_zoom_x(&mut self) -> Result<(), JsValue> {
+            self.camera.state.reset_zoom_x();
+            self.camera.update_uniform(&self.renderer.queue);
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Reset only the Y axis zoom, keeping X unchanged.
+        #[wasm_bindgen(js_name = resetZoomY)]
+        pub fn reset_zoom_y(&mut self) -> Result<(), JsValue> {
+            self.camera.state.reset_zoom_y();
+            self.camera.update_uniform(&self.renderer.queue);
+            self.render_frame()?;
+            Ok(())
+        }
+
         /// Resize the canvas and update the rendering surface.
         #[wasm_bindgen]
         pub fn resize(&mut self, width: u32, height: u32) -> Result<(), JsValue> {

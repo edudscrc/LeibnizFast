@@ -48,11 +48,11 @@ Key entry point: `src/lib.rs` contains the `wasm_entry` module with the main `Le
 
 ### TypeScript Layer
 
-`js/index.ts` — thin wrapper that lazy-loads WASM, wraps the WASM instance with a typed API, manages DOM event listeners, and provides callbacks (`onCreate`, `onHover`).
+`js/index.ts` — thin wrapper that lazy-loads WASM, wraps the WASM instance with a typed API, manages DOM event listeners, and provides callbacks (`onCreate`, `onHover`). Also contains the TypeScript-side interaction state machine that routes mouse events based on hit region (matrix, X-axis, Y-axis) and button (left/right), handling independent axis zoom/pan, rectangle selection zoom, and axis range selection.
 
 `js/types.ts` — public API types (`ColormapName`, `CreateOptions`, `ChartConfig`, etc.).
 
-`js/axes.ts` — 2D canvas overlay renderer for axes, tick labels, and chart title.
+`js/axes.ts` — 2D canvas overlay renderer for axes, tick labels, chart title, selection rectangles, and axis hover highlights.
 
 ### GPU Resource Patterns
 
@@ -64,6 +64,7 @@ Key entry point: `src/lib.rs` contains the `wasm_entry` module with the main `Le
 - **Tiling:** Matrices exceeding `maxTextureDimension2D` are split into a grid of smaller textures (`tile_grid.rs`). Tile textures carry `COPY_SRC | COPY_DST` usage flags.
 - **Staging path:** If data exceeds `max_buffer_size`, the compute shader runs per-chunk instead of all-at-once.
 - **Camera-only updates:** Pan/zoom only updates a uniform buffer; compute shader does not re-run.
+- **Independent axis zoom:** `CameraState` stores separate `zoom_x` and `zoom_y` factors. The GPU shader already supports independent `uv_x_scale`/`uv_y_scale`, so no shader changes are needed. WASM exports `zoomAtX`, `zoomAtY`, `panX`, `panY`, `zoomToUvRect`, `resetZoom`, `resetZoomX`, `resetZoomY` for axis-specific operations.
 - **Ring cursor desync guard:** `set_data` (full re-render) always calls `reset_ring_cursor()` so the next `setDataScrolled` frame starts at cursor 0, matching the freshly allocated JS `WaterfallBuffer`.
 
 ### Render Shader UV Pipeline (render.wgsl)
