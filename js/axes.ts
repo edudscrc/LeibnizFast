@@ -448,9 +448,14 @@ function drawXAxis(
     ctx.lineTo(x, axisY + TICK_LENGTH);
     ctx.stroke();
 
-    // Tick label
+    // Tick label — clamp horizontally so text stays within axis region
+    const halfW = ctx.measureText(tick.label).width / 2;
+    const clampedX = Math.max(
+      layout.x + halfW,
+      Math.min(x, layout.x + layout.width - halfW),
+    );
     ctx.fillStyle = labelColor;
-    ctx.fillText(tick.label, x, axisY + TICK_LENGTH + 2);
+    ctx.fillText(tick.label, clampedX, axisY + TICK_LENGTH + 2);
   }
 
   // Axis label + unit
@@ -507,6 +512,12 @@ function drawYAxis(
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
 
+  const labelMetrics = ctx.measureText('0');
+  const halfLabelH =
+    (labelMetrics.actualBoundingBoxAscent +
+      labelMetrics.actualBoundingBoxDescent) /
+    2;
+
   for (const tick of ticks) {
     // No inversion: UV.y=0 is the top of the canvas, which corresponds to
     // yMin (row 0), so position=0 should map to the top of the matrix area.
@@ -519,9 +530,13 @@ function drawYAxis(
     ctx.lineTo(axisX, y);
     ctx.stroke();
 
-    // Tick label
+    // Tick label — clamp vertically so text stays within axis region
+    const clampedY = Math.max(
+      layout.y + halfLabelH,
+      Math.min(y, layout.y + layout.height - halfLabelH),
+    );
     ctx.fillStyle = labelColor;
-    ctx.fillText(tick.label, axisX - TICK_LENGTH - 2, y);
+    ctx.fillText(tick.label, axisX - TICK_LENGTH - 2, clampedY);
   }
 
   // Axis label + unit (rotated -90 degrees)
