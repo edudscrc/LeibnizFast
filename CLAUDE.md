@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-LeibnizFast is a GPU-accelerated 2D matrix visualization library for browsers, published as npm package `leibniz-fast`. It combines a Rust/WASM core (wgpu) with a thin TypeScript wrapper. WebGPU is the primary backend; WebGL2 is the fallback.
+LeibnizFast is a GPU-accelerated 2D matrix visualization library for browsers, published as npm package `leibniz-fast`. It combines a Rust/WASM core (wgpu) with a thin TypeScript wrapper. WebGPU is required; there is no CPU or WebGL2 fallback.
 
 ## Build & Dev Commands
 
@@ -12,7 +12,10 @@ LeibnizFast is a GPU-accelerated 2D matrix visualization library for browsers, p
 npm run build:wasm    # wasm-pack build --target web --release → pkg/
 npm run build:js      # tsup js/index.ts --format esm --dts → dist/
 npm run build         # both WASM + JS
-npm run dev           # build + serve at localhost:8080/examples/basic/
+npm run dev           # build + serve the chart example
+npm run example:chart
+npm run example:waterfall
+npm run example:cpp-stream
 ```
 
 ## Test & Lint
@@ -34,8 +37,8 @@ JavaScript Float32Array (column-major ring buffer)
   → TypeScript LeibnizFast class (js/index.ts) — event handling, WASM init
     → WASM exports (src/lib.rs, wasm_entry module)
       → Rust core: MatrixView (GPU buffer), ring cursor tracking
-        → GPU compute shader (shaders/colormap.wgsl): normalize + colormap → RGBA texture
-          → GPU render shader (shaders/render.wgsl): ring unwrap + camera transform → canvas
+        → GPU compute shader (shaders/colormap.wgsl): raw f32 copy → tiled R32Float textures
+          → GPU render shader (shaders/render.wgsl): range + colormap + ring unwrap → canvas
 ```
 
 ### Rust Modules
@@ -60,9 +63,9 @@ Key entry point: `src/lib.rs` contains the `wasm_entry` module with the main `Le
 - **Ring offset in full-matrix UV space:** `ring_offset = ring_cursor / total_cols` is computed once and kept in full-matrix UV space. The fragment shader applies `fract(full_x + ring_offset)` *before* mapping to tile-local UV. This is critical for correct multi-tile behavior — applying the offset in tile-local space would produce a different pixel shift per tile width, causing ghost images.
 - **Column-major JS buffer:** The JS-side ring buffer stores data column-major (`data[col * rows + row]`). New columns from the wire are a direct `TypedArray.set()` memcpy into the ring position — no row-major transpose or O(cols) shift.
 - **Compute shader column-major read:** When `col_major = 1` in `MatrixParams`, the colormap compute shader indexes staging data as `col * col_stride + row` instead of the row-major path. This avoids a transpose on the CPU.
-- **Chunked upload:** Large matrices split into ~16MB chunks, 16-row aligned (`chunked_upload.rs`).
+- **Chunked upload:** `setDataChunks()` accepts sequential row-major chunks and can skip CPU-side retention with `retainData: false`; hover then reports `valueAvailable: false`.
 - **Tiling:** Matrices exceeding `maxTextureDimension2D` are split into a grid of smaller textures (`tile_grid.rs`). Tile textures carry `COPY_SRC | COPY_DST` usage flags.
-- **Staging path:** If data exceeds `max_buffer_size`, the compute shader runs per-chunk instead of all-at-once.
+- **Staging path:** Matrix data moves through a bounded storage buffer into tiled `R32Float` textures; full-matrix GPU buffers are avoided.
 - **Camera-only updates:** Pan/zoom only updates a uniform buffer; compute shader does not re-run.
 - **Independent axis zoom:** `CameraState` stores separate `zoom_x` and `zoom_y` factors. The GPU shader already supports independent `uv_x_scale`/`uv_y_scale`, so no shader changes are needed. WASM exports `zoomAtX`, `zoomAtY`, `panX`, `panY`, `zoomToUvRect`, `resetZoom`, `resetZoomX`, `resetZoomY` for axis-specific operations.
 - **Ring cursor desync guard:** `set_data` (full re-render) always calls `reset_ring_cursor()` so the next `setDataScrolled` frame starts at cursor 0, matching the freshly allocated JS `WaterfallBuffer`.
@@ -83,9 +86,9 @@ Y (no ring, tile-local space):
 
 Y is pre-composed on the CPU to avoid extra math per fragment. X stays in full-matrix space until after the ring fract so the same `ring_offset` is correct for every tile.
 
-### WebGL2 Fallback Limitations
+### WebGPU Required
 
-No hover tooltips; colormap changes require full data reload; colormapping is CPU-side; ring buffer streaming not available (falls back to full `setData`).
+Adapter/device creation failures should surface the user-facing WebGPU-required message. Do not add CPU/WebGL fallback paths; use `LeibnizFast.checkSupport()` in examples/apps for friendly preflight errors.
 
 ## Toolchain
 

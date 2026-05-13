@@ -10,6 +10,28 @@ export type ColormapName =
   | 'grayscale';
 
 /**
+ * Result returned by {@link LeibnizFast.checkSupport}.
+ */
+export interface WebGpuSupport {
+  /** True only when navigator.gpu, adapter creation, and device creation work. */
+  supported: boolean;
+  /** Human-readable failure reason or troubleshooting hint. */
+  reason?: string;
+  /** Best-effort adapter metadata when the browser exposes it. */
+  adapterInfo?: Record<string, string | number | boolean>;
+}
+
+/**
+ * Explicit value range for colormap mapping.
+ */
+export interface DataRange {
+  /** Data value mapped to the first colormap color. */
+  min: number;
+  /** Data value mapped to the last colormap color. */
+  max: number;
+}
+
+/**
  * Configuration for a fixed-range axis (used for static charts and the Y axis
  * of streaming charts).
  *
@@ -118,6 +140,31 @@ export interface DataOptions {
 }
 
 /**
+ * A row-major chunk for {@link LeibnizFast.setDataChunks}.
+ */
+export interface DataChunk {
+  /** Zero-based first row represented by this chunk. Chunks must be sequential. */
+  startRow: number;
+  /** Row-major f32 data. Length must be a positive multiple of `cols`. */
+  data: Float32Array;
+}
+
+/**
+ * Options for chunked matrix upload.
+ */
+export interface ChunkedDataOptions extends DataOptions {
+  /**
+   * Retain a CPU-side Float32Array cache for hover values and future full
+   * recolorization. Defaults to false to minimize peak CPU memory.
+   */
+  retainData?: boolean;
+  /**
+   * Explicit data range. When omitted, chunks are scanned once while uploading.
+   */
+  range?: DataRange;
+}
+
+/**
  * Information about a hovered matrix cell, enriched with axis coordinates
  * when a chart configuration is present.
  */
@@ -128,6 +175,11 @@ export interface HoverInfo {
   col: number;
   /** Raw data value at (row, col). */
   value: number;
+  /**
+   * Whether `value` is available. False when data was uploaded with
+   * `retainData: false`; in that case `value` is `NaN`.
+   */
+  valueAvailable: boolean;
   /** Y axis value mapped from the row index (present when yAxis is configured). */
   y?: number;
   /** X axis value mapped from the column index (present when xAxis is configured). */
@@ -171,4 +223,14 @@ export interface StreamingDataOptions {
   rows: number;
   /** Number of columns in the matrix. */
   cols: number;
+  /**
+   * Explicit data range. When set, streaming uploads skip per-chunk min/max
+   * tracking and use this fixed colormap range.
+   */
+  range?: DataRange;
+  /**
+   * Streaming uploads retain CPU-side data for hover values. Use
+   * `setDataChunks(..., { retainData: false })` for a no-retention upload.
+   */
+  retainData?: boolean;
 }

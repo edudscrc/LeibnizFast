@@ -7,6 +7,10 @@ import type {
   ColormapName,
   CreateOptions,
   DataOptions,
+  DataChunk,
+  ChunkedDataOptions,
+  DataRange,
+  WebGpuSupport,
   ScrolledDataOptions,
   StreamingDataOptions,
   ChartConfig,
@@ -84,6 +88,66 @@ Options for [`LeibnizFast.setData()`](/api/leibniz-fast#setdata).
 
 ---
 
+## WebGpuSupport
+
+```ts
+interface WebGpuSupport {
+  supported: boolean;
+  reason?: string;
+  adapterInfo?: Record<string, string | number | boolean>;
+}
+```
+
+Returned by [`LeibnizFast.checkSupport()`](/api/leibniz-fast#checksupport).
+
+---
+
+## DataRange
+
+```ts
+interface DataRange {
+  min: number;
+  max: number;
+}
+```
+
+Explicit colormap range used by streaming and chunked upload options.
+
+---
+
+## DataChunk
+
+```ts
+interface DataChunk {
+  startRow: number;
+  data: Float32Array;
+}
+```
+
+One row-major chunk for [`setDataChunks()`](/api/leibniz-fast#setdatachunks).
+
+---
+
+## ChunkedDataOptions
+
+```ts
+interface ChunkedDataOptions extends DataOptions {
+  retainData?: boolean;
+  range?: DataRange;
+}
+```
+
+Options for [`setDataChunks()`](/api/leibniz-fast#setdatachunks).
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `rows` | `number` | **Yes** | Number of rows in the matrix |
+| `cols` | `number` | **Yes** | Number of columns in the matrix |
+| `retainData` | `boolean` | No | Keep CPU-side values for hover callbacks. Defaults to `false`. |
+| `range` | [`DataRange`](#datarange) | No | Fixed colormap range. When omitted, chunks are scanned once while uploading. |
+
+---
+
 ## ScrolledDataOptions
 
 ```ts
@@ -109,6 +173,8 @@ Options for [`LeibnizFast.setDataScrolled()`](/api/leibniz-fast#setdatascrolled)
 interface StreamingDataOptions {
   rows: number;
   cols: number;
+  range?: DataRange;
+  retainData?: boolean;
 }
 ```
 
@@ -118,6 +184,8 @@ Options for [`LeibnizFast.beginData()`](/api/leibniz-fast#begindata) and [`Leibn
 |---|---|---|---|
 | `rows` | `number` | **Yes** | Number of rows in the matrix |
 | `cols` | `number` | **Yes** | Number of columns in the matrix |
+| `range` | [`DataRange`](#datarange) | No | Fixed colormap range |
+| `retainData` | `boolean` | No | Streaming uploads retain data. Use `setDataChunks()` for `retainData: false`. |
 
 ---
 
@@ -214,6 +282,7 @@ interface HoverInfo {
   row: number;
   col: number;
   value: number;
+  valueAvailable: boolean;
   y?: number;
   x?: number;
   yUnit?: string;
@@ -229,6 +298,7 @@ Passed to the [`HoverCallback`](#hovercallback) registered via [`LeibnizFast.onH
 | `row` | `number` | Zero-based row index of the hovered cell |
 | `col` | `number` | Zero-based column index of the hovered cell |
 | `value` | `number` | Raw data value at `(row, col)` |
+| `valueAvailable` | `boolean` | False when data was uploaded with `retainData: false`; then `value` is `NaN`. |
 | `y` | `number?` | Interpolated Y axis value. Present only when `yAxis` is configured in [`ChartConfig`](#chartconfig). |
 | `x` | `number?` | Interpolated X axis value. Present only when `xAxis` is configured. |
 | `yUnit` | `string?` | Y axis `unit` string from `AxisConfig` |
@@ -247,7 +317,8 @@ Function type for the hover event callback registered via [`LeibnizFast.onHover(
 
 ```ts
 const onHover: HoverCallback = (info) => {
-  displayTooltip(`${info.value.toFixed(3)} at [${info.row}, ${info.col}]`);
+  const value = info.valueAvailable ? info.value.toFixed(3) : 'unavailable';
+  displayTooltip(`${value} at [${info.row}, ${info.col}]`);
 };
 viewer.onHover(onHover);
 ```

@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - **Node.js 18+** for bundling your application
-- **WebGPU-capable browser**: Chrome 113+, Edge 113+, or Firefox Nightly with the `dom.webgpu.enabled` flag. All other browsers use the WebGL2 fallback automatically.
+- **WebGPU-capable browser** served from HTTPS or localhost. LeibnizFast has no CPU/WebGL fallback.
 
 ## Installation
 
@@ -20,12 +20,18 @@ import { LeibnizFast } from 'leibniz-fast';
 
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
 
-// 1. Initialize — lazy-loads WASM and acquires the GPU context.
+// 1. Optional support probe for friendly errors.
+const support = await LeibnizFast.checkSupport();
+if (!support.supported) {
+  throw new Error(support.reason);
+}
+
+// 2. Initialize — lazy-loads WASM and acquires the WebGPU context.
 const viewer = await LeibnizFast.create(canvas, {
   colormap: 'viridis',
 });
 
-// 2. Build a Float32Array in row-major order.
+// 3. Build a Float32Array in row-major order.
 const rows = 512;
 const cols = 1024;
 const data = new Float32Array(rows * cols);
@@ -35,15 +41,15 @@ for (let r = 0; r < rows; r++) {
   }
 }
 
-// 3. Upload and render.
+// 4. Upload and render.
 viewer.setData(data, { rows, cols });
 
-// 4. Register a hover callback.
+// 5. Register a hover callback.
 viewer.onHover((info) => {
   console.log(`[${info.row}, ${info.col}] = ${info.value.toFixed(4)}`);
 });
 
-// 5. Clean up when the component unmounts.
+// 6. Clean up when the component unmounts.
 // viewer.destroy();
 ```
 
@@ -51,7 +57,7 @@ viewer.onHover((info) => {
 
 On the first `LeibnizFast.create()` call, the library fetches and compiles the WASM module. Subsequent calls reuse the cached module, so initialization is fast after the first viewer. The GPU context is tied to the `<canvas>` element passed in — one viewer per canvas.
 
-`setData()` uploads the Float32Array to a GPU staging buffer, runs a compute shader to map values through the colormap, and renders the result. Pan and zoom are handled automatically via pointer and wheel events registered on the canvas.
+`setData()` uploads the Float32Array through a bounded GPU staging buffer into tiled `R32Float` textures and renders the result. The fragment shader applies the active colormap/range. Pan and zoom are handled automatically via pointer and wheel events registered on the canvas.
 
 ## Next Steps
 

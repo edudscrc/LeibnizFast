@@ -45,6 +45,8 @@ impl TileGrid {
     /// Panics if `max_dim` is 0.
     pub fn new(total_rows: u32, total_cols: u32, max_dim: u32) -> Self {
         assert!(max_dim > 0, "max_dim must be > 0");
+        assert!(total_rows > 0, "total_rows must be > 0");
+        assert!(total_cols > 0, "total_cols must be > 0");
         let tiles_x = total_cols.div_ceil(max_dim);
         let tiles_y = total_rows.div_ceil(max_dim);
         Self {
@@ -58,7 +60,9 @@ impl TileGrid {
 
     /// Total number of tiles in the grid.
     pub fn tile_count(&self) -> usize {
-        (self.tiles_x * self.tiles_y) as usize
+        (self.tiles_x as usize)
+            .checked_mul(self.tiles_y as usize)
+            .expect("tile count overflow")
     }
 
     /// Returns `true` when the matrix fits in a single tile (common fast path).
@@ -111,7 +115,10 @@ impl TileGrid {
 
     /// Flat index for tile (tx, ty): `ty * tiles_x + tx`.
     pub fn tile_index(&self, tx: u32, ty: u32) -> usize {
-        (ty * self.tiles_x + tx) as usize
+        (ty as usize)
+            .checked_mul(self.tiles_x as usize)
+            .and_then(|base| base.checked_add(tx as usize))
+            .expect("tile index overflow")
     }
 
     /// Fraction [0.0, 1.0] of the full matrix width covered by column-tiles 0..tx_end.

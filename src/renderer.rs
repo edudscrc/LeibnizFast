@@ -3,9 +3,8 @@
 //! Manages the wgpu device, surface, and rendering pipeline. Handles
 //! initialization of the GPU context and orchestrates compute and render passes.
 //!
-//! Supports two rendering paths:
-//! - **WebGPU (compute)**: compute shader applies colormap on GPU
-//! - **WebGL2 (CPU fallback)**: colormap applied on CPU, uploaded as RGBA texture
+//! Uses WebGPU compute + render pipelines. WebGL/CPU fallbacks are intentionally
+//! not supported.
 //!
 //! ## Tiling
 //! When matrix dimensions exceed `maxTextureDimension2D`, the output texture is
@@ -81,8 +80,6 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
-    /// Whether the device supports compute shaders
-    pub has_compute: bool,
     /// Maximum 2D texture dimension reported by the device
     pub max_texture_dimension: u32,
 
@@ -120,8 +117,6 @@ pub struct Renderer {
     matrix_rows: u32,
     matrix_cols: u32,
 
-    /// Whether the colormap has already been applied to the textures (staged path).
-    colormap_applied: bool,
     /// Enable performance timing logs.
     debug: bool,
 
@@ -135,24 +130,14 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Borrow the reusable chunk buffer, growing it if needed.
-    ///
-    /// Returns a mutable slice of exactly `len` elements, resizing the
-    /// internal Vec only when the current capacity is too small.
-    pub fn chunk_buf_mut(&mut self, len: usize) -> &mut [f32] {
-        if self.chunk_buffer.len() < len {
-            self.chunk_buffer.resize(len, 0.0f32);
-        }
-        &mut self.chunk_buffer[..len]
-    }
     /// Create a new Renderer from an HTML canvas element.
     pub async fn new(canvas: &web_sys::HtmlCanvasElement, debug: bool) -> Result<Self, String> {
         let _timer = PerfTimer::new("Renderer::new", debug);
-        let width = canvas.width();
-        let height = canvas.height();
+        let width = canvas.width().max(1);
+        let height = canvas.height().max(1);
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: wgpu::Backends::BROWSER_WEBGPU,
             ..Default::default()
         });
 
@@ -168,7 +153,7 @@ impl Renderer {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or("Failed to find a suitable GPU adapter")?;
+            .ok_or_else(Self::webgpu_required_message)?;
         t_adapter.finish();
 
         log::info!("Adapter: {:?}", adapter.get_info().name);
@@ -187,19 +172,16 @@ impl Renderer {
                 None,
             )
             .await
-            .map_err(|e| format!("Failed to create device: {e}"))?;
+            .map_err(|e| format!("{}\n\nDetails: {e}", Self::webgpu_required_message()))?;
         t_device.finish();
 
         let device_limits = device.limits();
-        let has_compute = device_limits.max_storage_buffers_per_shader_stage > 0;
+        if device_limits.max_storage_buffers_per_shader_stage == 0 {
+            return Err(Self::webgpu_required_message());
+        }
         let max_texture_dimension = device_limits.max_texture_dimension_2d;
         log::info!(
-            "Compute shaders: {} (storage buffers: {})",
-            if has_compute {
-                "available"
-            } else {
-                "unavailable (WebGL2 fallback)"
-            },
+            "WebGPU compute shaders available (storage buffers: {})",
             device_limits.max_storage_buffers_per_shader_stage
         );
         log::info!("Max texture dimension: {max_texture_dimension}");
@@ -229,7 +211,6 @@ impl Renderer {
             queue,
             surface,
             surface_config,
-            has_compute,
             max_texture_dimension,
             compute_pipeline: None,
             compute_bind_group_layout: None,
@@ -247,11 +228,14 @@ impl Renderer {
             tile_grid: None,
             matrix_rows: 0,
             matrix_cols: 0,
-            colormap_applied: false,
             debug,
             chunk_buffer: Vec::new(),
             ring_cursor: 0,
         })
+    }
+
+    fn webgpu_required_message() -> String {
+        "LeibnizFast requires WebGPU. Use a WebGPU-capable browser, enable hardware acceleration, and serve the page from HTTPS or localhost. No CPU/WebGL fallback is available.".to_string()
     }
 
     /// Resize the rendering surface to new dimensions.
@@ -262,6 +246,37 @@ impl Renderer {
             self.surface.configure(&self.device, &self.surface_config);
         }
         Ok(())
+    }
+
+    fn acquire_surface_texture(&self) -> Result<Option<wgpu::SurfaceTexture>, String> {
+        match self.surface.get_current_texture() {
+            Ok(output) => Ok(Some(output)),
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                log::warn!("WebGPU surface was lost or outdated; reconfiguring.");
+                self.surface.configure(&self.device, &self.surface_config);
+                match self.surface.get_current_texture() {
+                    Ok(output) => Ok(Some(output)),
+                    Err(wgpu::SurfaceError::Timeout) => {
+                        log::warn!("Timed out acquiring WebGPU surface texture after reconfigure.");
+                        Ok(None)
+                    }
+                    Err(wgpu::SurfaceError::OutOfMemory) => {
+                        Err("WebGPU surface is out of memory.".to_string())
+                    }
+                    Err(e) => Err(format!(
+                        "Failed to acquire WebGPU surface texture after reconfigure: {e}"
+                    )),
+                }
+            }
+            Err(wgpu::SurfaceError::Timeout) => {
+                log::warn!("Timed out acquiring WebGPU surface texture; skipping frame.");
+                Ok(None)
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                Err("WebGPU surface is out of memory.".to_string())
+            }
+            Err(wgpu::SurfaceError::Other) => Err("WebGPU surface acquisition failed.".to_string()),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -291,8 +306,6 @@ impl Renderer {
 
         self.matrix_rows = rows;
         self.matrix_cols = cols;
-        self.colormap_applied = false;
-
         let grid = TileGrid::new(rows, cols, self.max_texture_dimension);
         log::info!(
             "Tiling: {}×{} matrix → {}×{} tiles ({} total)",
@@ -330,66 +343,53 @@ impl Renderer {
             factory.create_colormap_bind_group(&colormap_layout, colormap, &range_buffer);
 
         // --- Per-tile resources ---
-        let needs_storage = self.has_compute;
-        let tile_tex_pairs = factory.create_tiled_textures(&grid, needs_storage);
+        let tile_tex_pairs = factory.create_tiled_textures(&grid);
 
         let (tile_textures, tile_texture_views): (Vec<_>, Vec<_>) =
             tile_tex_pairs.into_iter().unzip();
 
-        // Per-tile params buffers and compute bind groups (WebGPU only)
-        let (tile_params_buffers, tile_compute_bind_groups) = if self.has_compute {
-            use crate::matrix::MatrixParams;
-            use wgpu::util::DeviceExt;
+        let matrix = matrix.as_ref().ok_or("No matrix data set")?;
+        let mut tile_params_buffers = Vec::with_capacity(grid.tile_count());
+        let mut tile_compute_bind_groups = Vec::with_capacity(grid.tile_count());
 
-            let matrix = matrix
-                .as_ref()
-                .ok_or("No matrix data set (WebGPU path requires MatrixView)")?;
+        for (tx, ty) in grid.iter_tiles() {
+            let (row_start, _) = grid.tile_row_range(ty);
+            let (col_start, _) = grid.tile_col_range(tx);
+            let tile_w = grid.tile_width(tx);
+            let tile_h = grid.tile_height(ty);
 
-            let mut params_bufs = Vec::with_capacity(grid.tile_count());
-            let mut bind_groups = Vec::with_capacity(grid.tile_count());
+            let params = MatrixParams {
+                rows: tile_h,
+                cols: tile_w,
+                min_val: 0.0,
+                max_val: 1.0,
+                row_offset: row_start,
+                col_offset: col_start,
+                total_cols: cols,
+                texture_row_offset: 0,
+                texture_col_offset: 0,
+                col_major: 0,
+                col_stride: 0,
+                _pad2: 0,
+            };
+            let params_buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Tile Params Buffer"),
+                    contents: bytemuck::cast_slice(&[params]),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
 
-            for (tx, ty) in grid.iter_tiles() {
-                let (row_start, _) = grid.tile_row_range(ty);
-                let (col_start, _) = grid.tile_col_range(tx);
-                let tile_w = grid.tile_width(tx);
-                let tile_h = grid.tile_height(ty);
-
-                let params = MatrixParams {
-                    rows: tile_h,
-                    cols: tile_w,
-                    min_val: 0.0, // updated when colormap is applied
-                    max_val: 1.0,
-                    row_offset: row_start,
-                    col_offset: col_start,
-                    total_cols: cols,
-                    texture_row_offset: 0,
-                    texture_col_offset: 0,
-                    col_major: 0,
-                    col_stride: 0,
-                    _pad2: 0,
-                };
-                let params_buf =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Tile Params Buffer"),
-                            contents: bytemuck::cast_slice(&[params]),
-                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        });
-
-                let idx = grid.tile_index(tx, ty);
-                let bg = factory.create_compute_bind_group(
-                    &compute_layout,
-                    &matrix.data_buffer,
-                    &params_buf,
-                    &tile_texture_views[idx],
-                );
-                params_bufs.push(params_buf);
-                bind_groups.push(bg);
-            }
-            (params_bufs, bind_groups)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+            let idx = grid.tile_index(tx, ty);
+            let bg = factory.create_compute_bind_group(
+                &compute_layout,
+                &matrix.data_buffer,
+                &params_buf,
+                &tile_texture_views[idx],
+            );
+            tile_params_buffers.push(params_buf);
+            tile_compute_bind_groups.push(bg);
+        }
 
         // Per-tile camera buffers and render bind groups
         let (tile_camera_buffers, tile_render_bind_groups) =
@@ -557,48 +557,6 @@ impl Renderer {
     }
 
     // -----------------------------------------------------------------------
-    // Texture uploads (WebGL2 fallback)
-    // -----------------------------------------------------------------------
-
-    /// Upload a region of CPU-colormapped RGBA data (WebGL2, tiled or chunked).
-    ///
-    /// For non-tiled cases `tile_index = 0` and the row_offset is relative to
-    /// the texture top. For tiled cases we write to the correct tile texture.
-    pub fn upload_colored_texture_region(
-        &self,
-        rgba_data: &[u8],
-        cols: u32,
-        chunk_rows: u32,
-        row_offset: u32,
-    ) {
-        if let Some(texture) = self.tile_textures.first() {
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: row_offset,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba_data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(cols * 4),
-                    rows_per_image: Some(chunk_rows),
-                },
-                wgpu::Extent3d {
-                    width: cols,
-                    height: chunk_rows,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Compute (colormap) dispatch
     // -----------------------------------------------------------------------
 
@@ -650,11 +608,29 @@ impl Renderer {
                 let abs_row_start = row_start + current_tile_row;
 
                 // Read full rows once for all X-tiles in this band
-                let chunk_len = (chunk_rows as usize) * (cols as usize);
+                let chunk_len = match (chunk_rows as u64)
+                    .checked_mul(cols as u64)
+                    .and_then(|len| usize::try_from(len).ok())
+                {
+                    Some(len) => len,
+                    None => {
+                        log::error!("Chunk buffer length overflow.");
+                        return;
+                    }
+                };
                 if self.chunk_buffer.len() < chunk_len {
                     self.chunk_buffer.resize(chunk_len, 0.0f32);
                 }
-                let start_idx = (abs_row_start as usize) * (cols as usize);
+                let start_idx = match (abs_row_start as u64)
+                    .checked_mul(cols as u64)
+                    .and_then(|idx| usize::try_from(idx).ok())
+                {
+                    Some(idx) => idx,
+                    None => {
+                        log::error!("Chunk start index overflow.");
+                        return;
+                    }
+                };
                 read_fn(start_idx, &mut self.chunk_buffer[..chunk_len]);
                 matrix.write_staging_chunk(&self.queue, &self.chunk_buffer[..chunk_len]);
 
@@ -708,8 +684,117 @@ impl Renderer {
                 current_tile_row += chunk_rows;
             }
         }
+    }
 
-        self.colormap_applied = true;
+    /// Upload a sequential row chunk into the tiled R32Float textures.
+    ///
+    /// `read_fn(chunk_relative_start, buffer)` reads from the provided chunk, not
+    /// from the full matrix. The chunk is row-major and spans all matrix columns.
+    pub fn upload_rows_tiled(
+        &mut self,
+        matrix: &MatrixView,
+        start_row: u32,
+        rows: u32,
+        total_cols: u32,
+        read_fn: &dyn Fn(usize, &mut [f32]),
+    ) -> Result<(), String> {
+        let _timer = PerfTimer::new("upload_rows_tiled", self.debug);
+        if rows == 0 {
+            return Ok(());
+        }
+
+        let grid = match &self.tile_grid {
+            Some(g) => g.clone(),
+            None => return Err("Pipelines not initialized".to_string()),
+        };
+        let compute_pipeline = self
+            .compute_pipeline
+            .as_ref()
+            .ok_or_else(|| "Compute pipeline not initialized".to_string())?;
+        let staging_rows = matrix.staging_capacity_rows();
+        let end_row = start_row
+            .checked_add(rows)
+            .ok_or_else(|| "Chunk row range overflow".to_string())?;
+        if end_row > self.matrix_rows || total_cols != self.matrix_cols {
+            return Err("Chunk dimensions do not match the active matrix".to_string());
+        }
+
+        for ty in 0..grid.tiles_y {
+            let (tile_row_start, tile_row_end) = grid.tile_row_range(ty);
+            let overlap_start = start_row.max(tile_row_start);
+            let overlap_end = end_row.min(tile_row_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let mut abs_row_start = overlap_start;
+            while abs_row_start < overlap_end {
+                let chunk_rows = staging_rows.min(overlap_end - abs_row_start);
+                let chunk_len = (chunk_rows as u64)
+                    .checked_mul(total_cols as u64)
+                    .and_then(|len| usize::try_from(len).ok())
+                    .ok_or_else(|| "Chunk buffer length overflow".to_string())?;
+                if self.chunk_buffer.len() < chunk_len {
+                    self.chunk_buffer.resize(chunk_len, 0.0);
+                }
+
+                let relative_start = ((abs_row_start - start_row) as u64)
+                    .checked_mul(total_cols as u64)
+                    .and_then(|start| usize::try_from(start).ok())
+                    .ok_or_else(|| "Chunk source index overflow".to_string())?;
+                read_fn(relative_start, &mut self.chunk_buffer[..chunk_len]);
+                matrix.write_staging_chunk(&self.queue, &self.chunk_buffer[..chunk_len]);
+
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Chunked Row Upload Encoder"),
+                        });
+
+                for tx in 0..grid.tiles_x {
+                    let tile_idx = grid.tile_index(tx, ty);
+                    let (col_start, _) = grid.tile_col_range(tx);
+                    let tile_w = grid.tile_width(tx);
+
+                    self.write_tile_params(
+                        tile_idx,
+                        &MatrixParams {
+                            rows: chunk_rows,
+                            cols: tile_w,
+                            min_val: 0.0,
+                            max_val: 1.0,
+                            row_offset: 0,
+                            col_offset: col_start,
+                            total_cols,
+                            texture_row_offset: abs_row_start - tile_row_start,
+                            texture_col_offset: 0,
+                            col_major: 0,
+                            col_stride: 0,
+                            _pad2: 0,
+                        },
+                    );
+
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Chunked Row Upload Pass"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(compute_pipeline);
+                        pass.set_bind_group(0, &self.tile_compute_bind_groups[tile_idx], &[]);
+                        pass.dispatch_workgroups(
+                            tile_w.div_ceil(WORKGROUP_ALIGNMENT),
+                            chunk_rows.div_ceil(WORKGROUP_ALIGNMENT),
+                            1,
+                        );
+                    }
+                }
+
+                self.queue.submit(std::iter::once(encoder.finish()));
+                abs_row_start += chunk_rows;
+            }
+        }
+
+        Ok(())
     }
 
     /// Ring-buffer scrolled update: write new columns at `ring_cursor` and advance.
@@ -753,7 +838,13 @@ impl Renderer {
         let new_cols = new_cols.min(cols);
 
         let rows = self.matrix_rows;
-        let rows_usize = rows as usize;
+        let rows_usize = match usize::try_from(rows) {
+            Ok(rows) => rows,
+            Err(_) => {
+                log::error!("Matrix row count does not fit in usize.");
+                return;
+            }
+        };
         let staging_rows = matrix.staging_capacity_rows();
 
         // Split at the wrap boundary: [cursor..cols) then [0..remainder)
@@ -772,73 +863,125 @@ impl Renderer {
             }
             let seg_end = seg_start + seg_cols;
 
-            for tx in 0..grid.tiles_x {
-                let (tile_col_start, tile_col_end) = grid.tile_col_range(tx);
-
-                // Clip segment to this tile's column range
-                let clip_start = seg_start.max(tile_col_start);
-                let clip_end = seg_end.min(tile_col_end);
-                if clip_start >= clip_end {
-                    continue;
+            let seg_cols_usize = match usize::try_from(seg_cols) {
+                Ok(cols) => cols,
+                Err(_) => {
+                    log::error!("Ring segment column count does not fit in usize.");
+                    return;
                 }
-                let tile_new_cols = clip_end - clip_start;
-                let tile_new_cols_usize = tile_new_cols as usize;
+            };
 
-                // Texture-local write offset within this tile
-                let tex_col_offset = clip_start - tile_col_start;
+            for ty in 0..grid.tiles_y {
+                let (row_start, row_end) = grid.tile_row_range(ty);
+                let tile_h = row_end - row_start;
+                let mut current_tile_row: u32 = 0;
 
-                for ty in 0..grid.tiles_y {
-                    let tile_idx = grid.tile_index(tx, ty);
-                    let (row_start, row_end) = grid.tile_row_range(ty);
-                    let tile_h = row_end - row_start;
-                    let mut current_tile_row: u32 = 0;
-
-                    while current_tile_row < tile_h {
-                        let chunk_rows = staging_rows.min(tile_h - current_tile_row);
-                        let abs_row_start = row_start + current_tile_row;
-                        let chunk_rows_usize = chunk_rows as usize;
-
-                        let staging_len = tile_new_cols_usize * chunk_rows_usize;
-                        if self.chunk_buffer.len() < staging_len {
-                            self.chunk_buffer.resize(staging_len, 0.0f32);
+                while current_tile_row < tile_h {
+                    let chunk_rows = staging_rows.min(tile_h - current_tile_row);
+                    let abs_row_start = row_start + current_tile_row;
+                    let chunk_rows_usize = match usize::try_from(chunk_rows) {
+                        Ok(rows) => rows,
+                        Err(_) => {
+                            log::error!("Ring chunk row count does not fit in usize.");
+                            return;
                         }
+                    };
 
-                        // Read new columns from column-major ring buffer.
-                        //
-                        // The JS buffer stores column c at data[c*rows .. (c+1)*rows].
-                        // For the common case where all rows fit in one chunk
-                        // (chunk_rows == tile_h), columns clip_start..clip_end are
-                        // contiguous in memory — one read_fn call copies everything.
-                        //
-                        // For multi-chunk (large row counts), each column's portion
-                        // is non-contiguous, so we fall back to per-column reads.
-                        if chunk_rows == tile_h {
-                            // Fast path: contiguous block covering all tile rows
-                            let js_start = clip_start as usize * rows_usize;
-                            read_fn(js_start, &mut self.chunk_buffer[..staging_len]);
-                        } else {
-                            // Slow path: multiple row chunks, read per column
-                            for c in 0..tile_new_cols_usize {
-                                let js_col = clip_start as usize + c;
-                                let js_off = js_col * rows_usize + abs_row_start as usize;
-                                let stage_start = c * chunk_rows_usize;
-                                read_fn(
-                                    js_off,
-                                    &mut self.chunk_buffer
-                                        [stage_start..stage_start + chunk_rows_usize],
-                                );
+                    let staging_len = match seg_cols_usize.checked_mul(chunk_rows_usize) {
+                        Some(len) => len,
+                        None => {
+                            log::error!("Ring staging buffer length overflow.");
+                            return;
+                        }
+                    };
+                    if self.chunk_buffer.len() < staging_len {
+                        self.chunk_buffer.resize(staging_len, 0.0f32);
+                    }
+
+                    // Read the whole ring segment for this row band once, then
+                    // dispatch every X tile that overlaps it in one submit.
+                    if abs_row_start == 0 && chunk_rows == rows {
+                        let js_start = match (seg_start as usize).checked_mul(rows_usize) {
+                            Some(start) => start,
+                            None => {
+                                log::error!("Ring source index overflow.");
+                                return;
                             }
+                        };
+                        read_fn(js_start, &mut self.chunk_buffer[..staging_len]);
+                    } else {
+                        for c in 0..seg_cols_usize {
+                            let js_col = match (seg_start as usize).checked_add(c) {
+                                Some(col) => col,
+                                None => {
+                                    log::error!("Ring source column overflow.");
+                                    return;
+                                }
+                            };
+                            let js_off = match js_col
+                                .checked_mul(rows_usize)
+                                .and_then(|base| base.checked_add(abs_row_start as usize))
+                            {
+                                Some(offset) => offset,
+                                None => {
+                                    log::error!("Ring source index overflow.");
+                                    return;
+                                }
+                            };
+                            let stage_start = match c.checked_mul(chunk_rows_usize) {
+                                Some(start) => start,
+                                None => {
+                                    log::error!("Ring staging index overflow.");
+                                    return;
+                                }
+                            };
+                            read_fn(
+                                js_off,
+                                &mut self.chunk_buffer[stage_start..stage_start + chunk_rows_usize],
+                            );
+                        }
+                    }
+
+                    matrix.write_staging_chunk(&self.queue, &self.chunk_buffer[..staging_len]);
+
+                    let mut encoder =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("Ring Colormap Encoder"),
+                            });
+                    let mut dispatched = false;
+
+                    for tx in 0..grid.tiles_x {
+                        let (tile_col_start, tile_col_end) = grid.tile_col_range(tx);
+                        let clip_start = seg_start.max(tile_col_start);
+                        let clip_end = seg_end.min(tile_col_end);
+                        if clip_start >= clip_end {
+                            continue;
                         }
 
-                        matrix.write_staging_chunk(&self.queue, &self.chunk_buffer[..staging_len]);
+                        let tile_idx = grid.tile_index(tx, ty);
+                        let tile_new_cols = clip_end - clip_start;
+                        let tex_col_offset = clip_start - tile_col_start;
+                        let staging_col_offset = clip_start - seg_start;
 
-                        // Dispatch compute: column-major staging, no row/col offsets
-                        // needed since the staging buffer is tile-local.
-                        let mut encoder =
-                            self.device
-                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                    label: Some("Ring Colormap Encoder"),
-                                });
+                        self.write_tile_params(
+                            tile_idx,
+                            &MatrixParams {
+                                rows: chunk_rows,
+                                cols: tile_new_cols,
+                                min_val: 0.0,
+                                max_val: 1.0,
+                                row_offset: 0,
+                                col_offset: staging_col_offset,
+                                total_cols: 0,
+                                texture_row_offset: current_tile_row,
+                                texture_col_offset: tex_col_offset,
+                                col_major: 1,
+                                col_stride: chunk_rows,
+                                _pad2: 0,
+                            },
+                        );
+
                         {
                             let mut pass =
                                 encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -847,39 +990,24 @@ impl Renderer {
                                 });
                             pass.set_pipeline(compute_pipeline);
                             pass.set_bind_group(0, &self.tile_compute_bind_groups[tile_idx], &[]);
-                            self.write_tile_params(
-                                tile_idx,
-                                &MatrixParams {
-                                    rows: chunk_rows,
-                                    cols: tile_new_cols,
-                                    min_val: 0.0,
-                                    max_val: 1.0,
-                                    row_offset: 0,
-                                    col_offset: 0,
-                                    total_cols: 0,
-                                    texture_row_offset: current_tile_row,
-                                    texture_col_offset: tex_col_offset,
-                                    col_major: 1,
-                                    col_stride: chunk_rows,
-                                    _pad2: 0,
-                                },
-                            );
                             pass.dispatch_workgroups(
                                 tile_new_cols.div_ceil(WORKGROUP_ALIGNMENT),
                                 chunk_rows.div_ceil(WORKGROUP_ALIGNMENT),
                                 1,
                             );
                         }
-                        self.queue.submit(std::iter::once(encoder.finish()));
-
-                        current_tile_row += chunk_rows;
+                        dispatched = true;
                     }
+
+                    if dispatched {
+                        self.queue.submit(std::iter::once(encoder.finish()));
+                    }
+                    current_tile_row += chunk_rows;
                 }
             }
         }
 
         self.ring_cursor = (cursor + new_cols) % cols;
-        self.colormap_applied = true;
     }
 
     /// Get the current ring buffer offset as a fraction of texture width [0, 1).
@@ -932,10 +1060,9 @@ impl Renderer {
             None => return self.render_clear(),
         };
 
-        let output = self
-            .surface
-            .get_current_texture()
-            .map_err(|e| format!("Failed to get surface texture: {e}"))?;
+        let Some(output) = self.acquire_surface_texture()? else {
+            return Ok(());
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -985,10 +1112,9 @@ impl Renderer {
 
     /// Render a clear frame (no data loaded yet).
     fn render_clear(&self) -> Result<(), String> {
-        let output = self
-            .surface
-            .get_current_texture()
-            .map_err(|e| format!("Failed to get surface texture: {e}"))?;
+        let Some(output) = self.acquire_surface_texture()? else {
+            return Ok(());
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());

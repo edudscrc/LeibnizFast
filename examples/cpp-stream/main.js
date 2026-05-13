@@ -352,11 +352,22 @@ function sendResize(size) {
 // ---- Main ----------------------------------------------------------------
 
 async function main() {
-  viewer = await LeibnizFast.create(canvas, {
-    colormap: colormapSelect.value,
-    debug: debugEnabled,
-    chart: buildChartConfig(),
-  });
+  const support = await LeibnizFast.checkSupport();
+  if (!support.supported) {
+    showError(support.reason || 'WebGPU is required for LeibnizFast.');
+    return;
+  }
+
+  try {
+    viewer = await LeibnizFast.create(canvas, {
+      colormap: colormapSelect.value,
+      debug: debugEnabled,
+      chart: buildChartConfig(),
+    });
+  } catch (err) {
+    showError(`Failed to initialize LeibnizFast: ${err}`);
+    return;
+  }
 
   applyRange();
 
@@ -366,10 +377,13 @@ async function main() {
   // ---- Hover tooltip -----------------------------------------------------
   viewer.onHover((info) => {
     tooltip.style.display = 'block';
+    const valueText = info.valueAvailable
+      ? info.value.toFixed(4)
+      : 'unavailable';
     tooltip.innerHTML =
       `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
       `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
-      `Value: ${info.value.toFixed(4)}${info.valueUnit ? ' ' + info.valueUnit : ''}`;
+      `Value: ${valueText}${info.valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
   });
 
   canvas.addEventListener('mousemove', (e) => {

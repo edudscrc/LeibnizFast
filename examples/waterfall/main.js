@@ -337,8 +337,7 @@ function processMessage(buf) {
 function renderLoop() {
   if (dirty && viewer && buffer) {
     // Use scrolled update: GPU texture shifts left, only new columns are
-    // colormapped. Falls back to full setData if no range is set or on
-    // the first frame.
+    // uploaded. A fixed range is required and is set during initialization.
     const newCols = Math.min(pendingNewCols, buffer.cols);
     viewer.setDataScrolled(buffer.data, {
       rows: buffer.rows,
@@ -514,11 +513,22 @@ function saveParams() {
 }
 
 async function main() {
-  viewer = await LeibnizFast.create(canvas, {
-    colormap: colormapSelect.value,
-    debug: debugEnabled,
-    chart: buildChartConfig(genParams),
-  });
+  const support = await LeibnizFast.checkSupport();
+  if (!support.supported) {
+    showError(support.reason || 'WebGPU is required for LeibnizFast.');
+    return;
+  }
+
+  try {
+    viewer = await LeibnizFast.create(canvas, {
+      colormap: colormapSelect.value,
+      debug: debugEnabled,
+      chart: buildChartConfig(genParams),
+    });
+  } catch (err) {
+    showError(`Failed to initialize LeibnizFast: ${err}`);
+    return;
+  }
 
   // Initialize waterfall buffer and do an initial setData so the canvas isn't blank
   buffer = new WaterfallBuffer(rows, displayCols);
@@ -532,10 +542,13 @@ async function main() {
   // ---- Hover tooltip ---------------------------------------------------
   viewer.onHover((info) => {
     tooltip.style.display = 'block';
+    const valueText = info.valueAvailable
+      ? info.value.toFixed(4)
+      : 'unavailable';
     tooltip.innerHTML =
       `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
       `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
-      `Value: ${info.value.toFixed(4)}${info.valueUnit ? ' ' + info.valueUnit : ''}`;
+      `Value: ${valueText}${info.valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
   });
 
   canvas.addEventListener('mousemove', (e) => {

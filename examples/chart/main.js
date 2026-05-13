@@ -229,13 +229,18 @@ async function generateAndLoad(rows, cols) {
   const useStreaming = matrixBytes > 1e9;
 
   if (useStreaming) {
-    viewer.beginData({ rows, cols });
-    for (let startRow = 0; startRow < rows; startRow += chunkRows) {
-      const chunkSize = Math.min(chunkRows, rows - startRow);
-      const chunk = await generator.generateChunk(chunkSize, cols, startRow, rows);
-      viewer.appendChunk(chunk, startRow);
+    async function* generatedChunks() {
+      for (let startRow = 0; startRow < rows; startRow += chunkRows) {
+        const chunkSize = Math.min(chunkRows, rows - startRow);
+        const data = await generator.generateChunk(chunkSize, cols, startRow, rows);
+        yield { startRow, data };
+      }
     }
-    viewer.endData();
+    await viewer.setDataChunks(generatedChunks(), {
+      rows,
+      cols,
+      retainData: false,
+    });
   } else {
     // For smaller matrices, generate all chunks and concatenate
     if (rows <= chunkRows) {
@@ -283,29 +288,38 @@ async function load() {
 
   viewer.onHover((info) => {
     tooltip.style.display = 'block';
+    const valueText = info.valueAvailable
+      ? info.value.toFixed(4)
+      : 'unavailable';
     tooltip.innerHTML =
       `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
       `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
-      `Value: ${info.value.toFixed(4)}${info.valueUnit ? ' ' + info.valueUnit : ''}`;
+      `Value: ${valueText}${info.valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
   });
 }
 
 async function main() {
   // ---- WebGPU availability check -----------------------------------------
-  if (!navigator.gpu) {
-    showError(
-      'WebGPU is not supported in this browser. ' +
-      'Chrome 113+, Edge 113+, or Firefox Nightly required.',
-    );
+  const support = await LeibnizFast.checkSupport();
+  if (!support.supported) {
+    showError(support.reason || 'WebGPU is required for LeibnizFast.');
     return;
   }
 
-  const adapter = await navigator.gpu.requestAdapter();
+  const adapter = await navigator.gpu.requestAdapter({
+    powerPreference: 'high-performance',
+  });
   if (!adapter) {
     showError('No WebGPU adapter available.');
     return;
   }
-  const gpuDevice = await adapter.requestDevice();
+  let gpuDevice;
+  try {
+    gpuDevice = await adapter.requestDevice();
+  } catch (err) {
+    showError(`Failed to create WebGPU device: ${err}`);
+    return;
+  }
   generator = new GpuSineGenerator(gpuDevice);
 
   // ---- Initial load ------------------------------------------------------

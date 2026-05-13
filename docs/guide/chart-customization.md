@@ -123,11 +123,12 @@ Register a callback to receive per-cell hover information:
 
 ```ts
 viewer.onHover((info) => {
+  const value = info.valueAvailable ? info.value.toFixed(4) : 'unavailable';
   tooltip.textContent =
     `${info.yUnit ? info.y?.toFixed(1) + ' ' + info.yUnit : `row ${info.row}`}` +
     ` × ` +
     `${info.xUnit ? info.x?.toFixed(3) + ' ' + info.xUnit : `col ${info.col}`}` +
-    ` = ${info.value.toFixed(4)}${info.valueUnit ? ' ' + info.valueUnit : ''}`;
+    ` = ${value}${info.valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
 });
 ```
 
@@ -138,6 +139,7 @@ The [`HoverInfo`](/api/types#hoverinfo) object contains:
 | `row` | `number` | Zero-based row index |
 | `col` | `number` | Zero-based column index |
 | `value` | `number` | Raw data value at `(row, col)` |
+| `valueAvailable` | `boolean` | False when chunked upload skipped CPU-side retention |
 | `y` | `number?` | Interpolated Y axis value (present when `yAxis` is configured) |
 | `x` | `number?` | Interpolated X axis value (present when `xAxis` is configured) |
 | `yUnit` | `string?` | Y axis unit string |

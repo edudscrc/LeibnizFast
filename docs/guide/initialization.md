@@ -12,7 +12,7 @@ static async create(
 `create()` is the only way to construct a `LeibnizFast` instance. It:
 
 1. Lazy-loads and compiles the WASM module (cached after the first call across all viewers on the page).
-2. Acquires a WebGPU adapter and device from the canvas. Falls back to WebGL2 if WebGPU is unavailable.
+2. Acquires a WebGPU adapter and device from the canvas. If WebGPU is unavailable, initialization fails with a user-facing error.
 3. Registers pointer, wheel, and resize event listeners on the canvas for pan/zoom interactions.
 4. If `options.chart` is provided, creates the 2D Canvas overlay for axes and labels.
 
@@ -20,6 +20,12 @@ static async create(
 import { LeibnizFast } from 'leibniz-fast';
 
 const canvas = document.getElementById('viz') as HTMLCanvasElement;
+
+const support = await LeibnizFast.checkSupport();
+if (!support.supported) {
+  throw new Error(support.reason);
+}
+
 const viewer = await LeibnizFast.create(canvas, {
   colormap: 'inferno',
   debug: false,
@@ -53,7 +59,7 @@ Sample console output:
 
 ## Device Limits
 
-Before uploading a very large matrix, query the device's GPU limits to avoid runtime errors.
+For single-array uploads, query the device's GPU limits to avoid runtime errors.
 
 ```ts
 const maxElements = viewer.getMaxMatrixElements();
@@ -72,8 +78,8 @@ if (rows > maxDim || cols > maxDim) {
 
 | Method | Returns | Description |
 |---|---|---|
-| `getMaxMatrixElements()` | `number` | Maximum `rows × cols` that fits in a single GPU buffer (typically 256 M–1 B elements) |
-| `getMaxTextureDimension()` | `number` | Maximum value for `rows` or `cols` (typically 8192–16384 on integrated, 16384–32768 on discrete GPUs) |
+| `getMaxMatrixElements()` | `number` | Maximum `rows × cols` that fits in one GPU staging buffer. Use `setDataChunks()` when a full matrix array is too large. |
+| `getMaxTextureDimension()` | `number` | Maximum size of one texture tile. Matrices larger than this are tiled automatically. |
 
 ::: tip Tiling
 Matrices where `rows` or `cols` exceed `getMaxTextureDimension()` are automatically split into a grid of tiles. The limit is per-tile, not total. For most devices this is not a concern unless a single dimension exceeds ~16 k.
