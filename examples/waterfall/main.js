@@ -20,39 +20,39 @@
 import { LeibnizFast } from '../../dist/index.js';
 
 // ---- DOM refs ----------------------------------------------------------
-const canvas           = document.getElementById('canvas');
-const colormapSelect   = document.getElementById('colormap');
-const rangeMinInput    = document.getElementById('range-min');
-const rangeMaxInput    = document.getElementById('range-max');
-const debugCheckbox    = document.getElementById('debug');
-const statusBadge      = document.getElementById('status-badge');
-const statusText       = document.getElementById('status-text');
-const fpsCounter       = document.getElementById('fps-counter');
-const dataRateEl       = document.getElementById('data-rate');
-const tooltip          = document.getElementById('tooltip');
-const errorBanner      = document.getElementById('error-banner');
+const canvas = document.getElementById('canvas');
+const colormapSelect = document.getElementById('colormap');
+const rangeMinInput = document.getElementById('range-min');
+const rangeMaxInput = document.getElementById('range-max');
+const debugCheckbox = document.getElementById('debug');
+const statusBadge = document.getElementById('status-badge');
+const statusText = document.getElementById('status-text');
+const fpsCounter = document.getElementById('fps-counter');
+const dataRateEl = document.getElementById('data-rate');
+const tooltip = document.getElementById('tooltip');
+const errorBanner = document.getElementById('error-banner');
 
 // Generator parameter inputs
-const genSpatialStartInput  = document.getElementById('gen-spatial-start');
-const genSpatialEndInput    = document.getElementById('gen-spatial-end');
-const genSamplingRateInput  = document.getElementById('gen-sampling-rate');
+const genSpatialStartInput = document.getElementById('gen-spatial-start');
+const genSpatialEndInput = document.getElementById('gen-spatial-end');
+const genSamplingRateInput = document.getElementById('gen-sampling-rate');
 const genRepetitionRateInput = document.getElementById('gen-repetition-rate');
-const genSpatialDsInput     = document.getElementById('gen-spatial-downsample');
-const genTimeBufferInput    = document.getElementById('gen-time-buffer');
-const genTimeWindowInput    = document.getElementById('gen-time-window');
-const genSaveButton         = document.getElementById('gen-save');
-const genStatusEl           = document.getElementById('gen-status');
+const genSpatialDsInput = document.getElementById('gen-spatial-downsample');
+const genTimeBufferInput = document.getElementById('gen-time-buffer');
+const genTimeWindowInput = document.getElementById('gen-time-window');
+const genSaveButton = document.getElementById('gen-save');
+const genStatusEl = document.getElementById('gen-status');
 
 // ---- Constants ---------------------------------------------------------
 
-const WATERFALL_MAGIC    = 0x4C465A10;
-const HEADER_BYTES       = 16;  // 4 × uint32
-const PROPAGATION_VELOCITY = 2.0432e8;  // m/s (fixed physical constant)
-const BRIDGE_MAX_ROWS    = 65536;
+const WATERFALL_MAGIC = 0x4c465a10;
+const HEADER_BYTES = 16; // 4 × uint32
+const PROPAGATION_VELOCITY = 2.0432e8; // m/s (fixed physical constant)
+const BRIDGE_MAX_ROWS = 65536;
 
-const WS_URL       = 'ws://localhost:8765';
+const WS_URL = 'ws://localhost:8765';
 const RECONNECT_MS = 2000;
-const FPS_WINDOW   = 10;
+const FPS_WINDOW = 10;
 
 // ---- Generator parameters (mirrors generator.cpp defaults) -------------
 
@@ -65,12 +65,12 @@ const FPS_WINDOW   = 10;
  */
 function readInitialGenParams() {
   return {
-    spatialStart:      parseFloat(genSpatialStartInput.value)   || 10000,
-    spatialEnd:        parseFloat(genSpatialEndInput.value)     || 15000,
-    samplingRate:      parseInt(genSamplingRateInput.value)     || 400,
-    repetitionRate:    parseInt(genRepetitionRateInput.value)   || 1000,
-    spatialDownsample: parseInt(genSpatialDsInput.value)        || 5,
-    timeBuffer:        parseFloat(genTimeBufferInput.value)     || 0.15,
+    spatialStart: parseFloat(genSpatialStartInput.value) || 10000,
+    spatialEnd: parseFloat(genSpatialEndInput.value) || 15000,
+    samplingRate: parseInt(genSamplingRateInput.value) || 400,
+    repetitionRate: parseInt(genRepetitionRateInput.value) || 1000,
+    spatialDownsample: parseInt(genSpatialDsInput.value) || 5,
+    timeBuffer: parseFloat(genTimeBufferInput.value) || 0.15,
   };
 }
 
@@ -83,9 +83,9 @@ let genParams = readInitialGenParams();
  * @returns {number}
  */
 function computeSpatialRows(p) {
-  const extent        = p.spatialEnd - p.spatialStart;
-  const roundTripTime = 2.0 * extent / PROPAGATION_VELOCITY;
-  const pointsPerSeg  = Math.round(p.samplingRate * 1e6 * roundTripTime);
+  const extent = p.spatialEnd - p.spatialStart;
+  const roundTripTime = (2.0 * extent) / PROPAGATION_VELOCITY;
+  const pointsPerSeg = Math.round(p.samplingRate * 1e6 * roundTripTime);
   return Math.ceil(pointsPerSeg / p.spatialDownsample);
 }
 
@@ -95,9 +95,9 @@ function computeSpatialRows(p) {
  * @returns {{ rows: number, colsPerMsg: number, rateMbs: number }}
  */
 function computeStats(p) {
-  const rows       = computeSpatialRows(p);
+  const rows = computeSpatialRows(p);
   const colsPerMsg = Math.round(p.repetitionRate * p.timeBuffer);
-  const rateMbs    = (rows * colsPerMsg * 4 * (1.0 / p.timeBuffer)) / 1e6;
+  const rateMbs = (rows * colsPerMsg * 4 * (1.0 / p.timeBuffer)) / 1e6;
   return { rows, colsPerMsg, rateMbs };
 }
 
@@ -107,9 +107,12 @@ function computeStats(p) {
  */
 function updateStats(p) {
   const { rows, colsPerMsg, rateMbs } = computeStats(p);
-  document.getElementById('stat-rows').textContent = `Rows: ${rows.toLocaleString()}`;
-  document.getElementById('stat-cols').textContent = `Cols/msg: ${colsPerMsg.toLocaleString()}`;
-  document.getElementById('stat-rate').textContent = `Rate: ${rateMbs.toFixed(1)} MB/s`;
+  document.getElementById('stat-rows').textContent =
+    `Rows: ${rows.toLocaleString()}`;
+  document.getElementById('stat-cols').textContent =
+    `Cols/msg: ${colsPerMsg.toLocaleString()}`;
+  document.getElementById('stat-rate').textContent =
+    `Rate: ${rateMbs.toFixed(1)} MB/s`;
 }
 
 // ---- State -------------------------------------------------------------
@@ -136,10 +139,12 @@ let bytesThisSecond = 0;
 let lastRateUpdate = performance.now();
 
 // Inter-message arrival tracking for debug timing
-let tLastMessage = 0;  // performance.now() of the last processMessage call
+let tLastMessage = 0; // performance.now() of the last processMessage call
 
 // Waterfall buffer
-let displayCols = Math.round(parseFloat(genTimeWindowInput.value) * genParams.repetitionRate);
+let displayCols = Math.round(
+  parseFloat(genTimeWindowInput.value) * genParams.repetitionRate,
+);
 let rows = computeSpatialRows(genParams);
 
 // ---- Waterfall Buffer --------------------------------------------------
@@ -188,6 +193,33 @@ class WaterfallBuffer {
 
     this.ringCursor = (this.ringCursor + effectiveCols) % c;
   }
+
+  /**
+   * Rebase the column-major ring into visual left-to-right order and reset the
+   * next write position to zero. Returns a row-major copy for viewer.setData().
+   *
+   * @returns {Float32Array}
+   */
+  rebaseToVisualOrder() {
+    const { rows: r, cols: c, data } = this;
+    const rebased = new Float32Array(data.length);
+    const rowMajor = new Float32Array(data.length);
+
+    for (let visualCol = 0; visualCol < c; visualCol++) {
+      const srcCol = (this.ringCursor + visualCol) % c;
+      const srcStart = srcCol * r;
+      const dstStart = visualCol * r;
+      rebased.set(data.subarray(srcStart, srcStart + r), dstStart);
+
+      for (let row = 0; row < r; row++) {
+        rowMajor[row * c + visualCol] = data[srcStart + row];
+      }
+    }
+
+    this.data = rebased;
+    this.ringCursor = 0;
+    return rowMajor;
+  }
 }
 
 /** @type {WaterfallBuffer|null} */
@@ -195,6 +227,7 @@ let buffer = null;
 let dirty = false;
 /** Number of new columns added since last render (for scrolled update). */
 let pendingNewCols = 0;
+let renderErrorShown = false;
 
 // ---- Utilities ---------------------------------------------------------
 
@@ -210,9 +243,11 @@ function showError(msg) {
 function setStatus(state) {
   statusBadge.className = `status-badge ${state}`;
   statusText.textContent =
-    state === 'connecting'   ? 'Connecting\u2026' :
-    state === 'connected'    ? 'Connected'         :
-                               'Disconnected';
+    state === 'connecting'
+      ? 'Connecting\u2026'
+      : state === 'connected'
+        ? 'Connected'
+        : 'Disconnected';
 }
 
 function updateFps() {
@@ -230,7 +265,7 @@ function updateDataRate(bytes) {
   const now = performance.now();
   const elapsed = now - lastRateUpdate;
   if (elapsed >= 1000) {
-    const mbps = (bytesThisSecond / elapsed) * 1000 / 1e6;
+    const mbps = ((bytesThisSecond / elapsed) * 1000) / 1e6;
     dataRateEl.textContent = `${mbps.toFixed(1)} MB/s`;
     bytesThisSecond = 0;
     lastRateUpdate = now;
@@ -255,7 +290,7 @@ function applyRange() {
 function parseHeader(buf) {
   if (buf.byteLength < HEADER_BYTES) return null;
 
-  const view  = new DataView(buf);
+  const view = new DataView(buf);
   const magic = view.getUint32(0, true);
 
   if (magic !== WATERFALL_MAGIC) {
@@ -263,13 +298,15 @@ function parseHeader(buf) {
     return null;
   }
 
-  const msgRows  = view.getUint32(4, true);
-  const newCols  = view.getUint32(8, true);
-  const msgId    = view.getUint32(12, true);
+  const msgRows = view.getUint32(4, true);
+  const newCols = view.getUint32(8, true);
+  const msgId = view.getUint32(12, true);
 
   const expectedBytes = HEADER_BYTES + msgRows * newCols * 4;
   if (buf.byteLength < expectedBytes) {
-    console.warn(`[waterfall] Message too short: ${buf.byteLength} < ${expectedBytes}`);
+    console.warn(
+      `[waterfall] Message too short: ${buf.byteLength} < ${expectedBytes}`,
+    );
     return null;
   }
 
@@ -293,7 +330,7 @@ function processMessage(buf) {
   if (pendingRestart) {
     const expectedRows = computeSpatialRows(genParams);
     if (h.rows !== expectedRows) {
-      return;  // stale message from old generator — discard
+      return; // stale message from old generator — discard
     }
     pendingRestart = false;
   }
@@ -304,6 +341,8 @@ function processMessage(buf) {
   if (h.rows !== buffer.rows) {
     rows = h.rows;
     buffer = new WaterfallBuffer(rows, displayCols);
+    pendingNewCols = 0;
+    dirty = false;
     updateStats(genParams);
   }
 
@@ -321,13 +360,13 @@ function processMessage(buf) {
 
   if (debugEnabled) {
     const parseMs = tAfterParse - tRecv;
-    const pushMs  = tAfterPush - tAfterParse;
+    const pushMs = tAfterPush - tAfterParse;
     console.log(
       `[perf] msg_id=${h.msgId}` +
-      `  gap=${gapMs.toFixed(2)}ms` +
-      `  parse=${parseMs.toFixed(2)}ms` +
-      `  push=${pushMs.toFixed(2)}ms` +
-      `  bytes=${buf.byteLength}`
+        `  gap=${gapMs.toFixed(2)}ms` +
+        `  parse=${parseMs.toFixed(2)}ms` +
+        `  push=${pushMs.toFixed(2)}ms` +
+        `  bytes=${buf.byteLength}`,
     );
   }
 }
@@ -336,18 +375,36 @@ function processMessage(buf) {
 
 function renderLoop() {
   if (dirty && viewer && buffer) {
-    // Use scrolled update: GPU texture shifts left, only new columns are
-    // uploaded. A fixed range is required and is set during initialization.
-    const newCols = Math.min(pendingNewCols, buffer.cols);
-    viewer.setDataScrolled(buffer.data, {
-      rows: buffer.rows,
-      cols: buffer.cols,
-      newCols,
-      xOffset: totalColsReceived,
-    });
-    pendingNewCols = 0;
-    dirty = false;
-    updateFps();
+    try {
+      if (pendingNewCols >= buffer.cols) {
+        const rowMajor = buffer.rebaseToVisualOrder();
+        viewer.setData(rowMajor, {
+          rows: buffer.rows,
+          cols: buffer.cols,
+          xOffset: totalColsReceived,
+        });
+      } else {
+        // Use scrolled update: GPU texture shifts left, only new columns are
+        // uploaded. A fixed range is required and is set during initialization.
+        viewer.setDataScrolled(buffer.data, {
+          rows: buffer.rows,
+          cols: buffer.cols,
+          newCols: pendingNewCols,
+          xOffset: totalColsReceived,
+        });
+      }
+      pendingNewCols = 0;
+      dirty = false;
+      renderErrorShown = false;
+      updateFps();
+    } catch (err) {
+      dirty = false;
+      pendingNewCols = 0;
+      if (!renderErrorShown) {
+        showError(`Waterfall render failed: ${err}`);
+        renderErrorShown = true;
+      }
+    }
   }
   requestAnimationFrame(renderLoop);
 }
@@ -408,7 +465,12 @@ function buildChartConfig(p) {
   return {
     title: 'Live Waterfall',
     xAxis: { label: 'Time', unit: 's', unitsPerCell: 1 / p.repetitionRate },
-    yAxis: { label: 'Depth', unit: 'm', min: p.spatialStart, max: p.spatialEnd },
+    yAxis: {
+      label: 'Depth',
+      unit: 'm',
+      min: p.spatialStart,
+      max: p.spatialEnd,
+    },
   };
 }
 
@@ -418,12 +480,12 @@ function buildChartConfig(p) {
  * @returns {GenParams|null}
  */
 function readGenParamInputs() {
-  const spatialStart     = parseFloat(genSpatialStartInput.value);
-  const spatialEnd       = parseFloat(genSpatialEndInput.value);
-  const samplingRate     = parseInt(genSamplingRateInput.value);
-  const repetitionRate   = parseInt(genRepetitionRateInput.value);
+  const spatialStart = parseFloat(genSpatialStartInput.value);
+  const spatialEnd = parseFloat(genSpatialEndInput.value);
+  const samplingRate = parseInt(genSamplingRateInput.value);
+  const repetitionRate = parseInt(genRepetitionRateInput.value);
   const spatialDownsample = parseInt(genSpatialDsInput.value);
-  const timeBuffer       = parseFloat(genTimeBufferInput.value);
+  const timeBuffer = parseFloat(genTimeBufferInput.value);
 
   if (!isFinite(spatialStart) || spatialStart < 0 || spatialStart > 1e6) {
     showError('Spatial Start must be 0–1,000,000 m');
@@ -441,11 +503,19 @@ function readGenParamInputs() {
     showError('Sampling Rate must be 1–10,000 MHz');
     return null;
   }
-  if (!isFinite(repetitionRate) || repetitionRate < 1 || repetitionRate > 1000000) {
+  if (
+    !isFinite(repetitionRate) ||
+    repetitionRate < 1 ||
+    repetitionRate > 1000000
+  ) {
     showError('Repetition Rate must be 1–1,000,000 Hz');
     return null;
   }
-  if (!isFinite(spatialDownsample) || spatialDownsample < 1 || spatialDownsample > 1000) {
+  if (
+    !isFinite(spatialDownsample) ||
+    spatialDownsample < 1 ||
+    spatialDownsample > 1000
+  ) {
     showError('Spatial Downsample must be 1–1,000');
     return null;
   }
@@ -454,7 +524,14 @@ function readGenParamInputs() {
     return null;
   }
 
-  return { spatialStart, spatialEnd, samplingRate, repetitionRate, spatialDownsample, timeBuffer };
+  return {
+    spatialStart,
+    spatialEnd,
+    samplingRate,
+    repetitionRate,
+    spatialDownsample,
+    timeBuffer,
+  };
 }
 
 /**
@@ -469,7 +546,7 @@ function saveParams() {
   if (newRows > BRIDGE_MAX_ROWS) {
     showError(
       `Computed rows (${newRows.toLocaleString()}) exceeds bridge limit (${BRIDGE_MAX_ROWS.toLocaleString()}). ` +
-      `Increase Spatial Downsample or reduce the spatial range.`
+        `Increase Spatial Downsample or reduce the spatial range.`,
     );
     return;
   }
@@ -483,28 +560,37 @@ function saveParams() {
 
   // Send restart message to bridge — bridge will kill + respawn the generator
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
-      type: 'restart',
-      spatialStart:      params.spatialStart,
-      spatialEnd:        params.spatialEnd,
-      samplingRate:      params.samplingRate,
-      repetitionRate:    params.repetitionRate,
-      spatialDownsample: params.spatialDownsample,
-      timeBuffer:        params.timeBuffer,
-    }));
+    ws.send(
+      JSON.stringify({
+        type: 'restart',
+        spatialStart: params.spatialStart,
+        spatialEnd: params.spatialEnd,
+        samplingRate: params.samplingRate,
+        repetitionRate: params.repetitionRate,
+        spatialDownsample: params.spatialDownsample,
+        timeBuffer: params.timeBuffer,
+      }),
+    );
     genStatusEl.textContent = 'Restart sent…';
-    setTimeout(() => { genStatusEl.textContent = ''; }, 3000);
+    setTimeout(() => {
+      genStatusEl.textContent = '';
+    }, 3000);
   } else {
     genStatusEl.textContent = 'Not connected — parameters saved locally';
-    setTimeout(() => { genStatusEl.textContent = ''; }, 3000);
+    setTimeout(() => {
+      genStatusEl.textContent = '';
+    }, 3000);
   }
 
   // Reset buffer and counters for new geometry
   rows = newRows;
   buffer = new WaterfallBuffer(rows, displayCols);
   totalColsReceived = 0;
+  pendingNewCols = 0;
+  dirty = false;
 
   if (viewer) {
+    applyRange();
     viewer.setData(buffer.data, { rows, cols: displayCols, xOffset: 0 });
     viewer.setChart(buildChartConfig(params));
   }
@@ -532,8 +618,8 @@ async function main() {
 
   // Initialize waterfall buffer and do an initial setData so the canvas isn't blank
   buffer = new WaterfallBuffer(rows, displayCols);
-  viewer.setData(buffer.data, { rows, cols: displayCols, xOffset: 0 });
   applyRange();
+  viewer.setData(buffer.data, { rows, cols: displayCols, xOffset: 0 });
   updateStats(genParams);
 
   // Start decoupled render loop
@@ -553,7 +639,7 @@ async function main() {
 
   canvas.addEventListener('mousemove', (e) => {
     tooltip.style.left = `${e.clientX + 12}px`;
-    tooltip.style.top  = `${e.clientY + 12}px`;
+    tooltip.style.top = `${e.clientY + 12}px`;
   });
 
   canvas.addEventListener('mouseleave', () => {
@@ -565,7 +651,10 @@ async function main() {
   colormapSelect.addEventListener('change', () => {
     const t = debugEnabled ? performance.now() : 0;
     viewer.setColormap(colormapSelect.value);
-    if (debugEnabled) console.log(`[perf] setColormap: ${(performance.now() - t).toFixed(2)}ms`);
+    if (debugEnabled)
+      console.log(
+        `[perf] setColormap: ${(performance.now() - t).toFixed(2)}ms`,
+      );
   });
 
   genSaveButton.addEventListener('click', saveParams);

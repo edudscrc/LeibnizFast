@@ -29,13 +29,20 @@ npm run example:waterfall
 npm run example:cpp-stream
 ```
 
-The streaming examples also compile their C++ generator, create/use `venv`, install `examples/requirements.txt`, start the Python bridge, and clean up child processes on Ctrl+C.
+The streaming examples also compile their native generator, create/use `venv`, install `examples/requirements.txt`, start the Python bridge, and clean up child processes on Ctrl+C.
 
-Streaming example system dependency:
+Waterfall example system dependencies:
 
 ```bash
 # Debian/Ubuntu
 sudo apt install g++ libzmq3-dev python3-venv
+```
+
+The cpp-stream example is CUDA-only. It requires `nvcc`, `libzmq`, an NVIDIA CUDA-capable GPU, and a working NVIDIA driver. The runner compiles the generator with `nvcc` and runs a CUDA preflight before serving the page; if CUDA is unavailable, it exits with an informative error instead of falling back to CPU simulation.
+
+```bash
+# Debian/Ubuntu package names vary by distro/CUDA setup
+sudo apt install nvidia-cuda-toolkit libzmq3-dev python3-venv
 ```
 
 The runner does not auto-open a browser because the right browser depends on WebGPU support on your platform. Open the printed `http://localhost:...` URL in a supported browser.
@@ -183,9 +190,13 @@ Enable hardware acceleration, update GPU drivers, and check whether your browser
 
 Call `viewer.setRange(min, max)` before the first scrolled update.
 
-`g++` or `zmq.h` not found
+`g++` or `zmq.h` not found when running the waterfall example
 
-Install the streaming example system dependencies. On Debian/Ubuntu: `sudo apt install g++ libzmq3-dev python3-venv`.
+Install the waterfall example system dependencies. On Debian/Ubuntu: `sudo apt install g++ libzmq3-dev python3-venv`.
+
+`nvcc` missing, no CUDA-capable GPU, or CUDA driver errors when running cpp-stream
+
+The cpp-stream example runs its wave generator on CUDA and has no CPU fallback. Install the NVIDIA CUDA Toolkit, use an NVIDIA CUDA-capable GPU, and make sure the NVIDIA driver is loaded and compatible with the installed toolkit.
 
 ## License
 

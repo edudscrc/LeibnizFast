@@ -32,6 +32,8 @@ const vmaxInput = document.getElementById('vmax');
 
 /** Maximum rows per GPU compute chunk (keeps storage buffer bounded). */
 const GPU_CHUNK_ROWS = 1000;
+/** Above this size the example uploads chunks without retaining CPU hover data. */
+const CHUNKED_UPLOAD_THRESHOLD_BYTES = 1_000_000_000;
 
 // ---- GPU sine-wave generator ---------------------------------------------
 
@@ -205,6 +207,27 @@ function readConfig() {
   };
 }
 
+/**
+ * Mirror the WGSL sine-wave generator for tooltip values when large chunked
+ * uploads skip CPU-side retention.
+ *
+ * @param {number} row
+ * @param {number} col
+ * @param {number} rows
+ * @param {number} cols
+ * @returns {number}
+ */
+function generatedSineValue(row, col, rows, cols) {
+  const x = col / cols;
+  const y = row / rows;
+
+  return (
+    Math.sin(x * 20.0) * Math.cos(y * 20.0) +
+    Math.sin((x + y) * 10.0) * 0.5 +
+    Math.sin(Math.sqrt(x * x + y * y) * 30.0) * 0.3
+  );
+}
+
 // ---- Main ----------------------------------------------------------------
 
 /** @type {LeibnizFast|null} */
@@ -212,6 +235,9 @@ let viewer = null;
 
 /** @type {GpuSineGenerator|null} */
 let generator = null;
+
+let currentRows = 0;
+let currentCols = 0;
 
 /**
  * Generate data on the GPU and load it into the viewer.
@@ -224,15 +250,23 @@ async function generateAndLoad(rows, cols) {
   const matrixBytes = rows * cols * 4;
   const maxBindingBytes = generator._device.limits.maxStorageBufferBindingSize;
   const maxRowsByBinding = Math.floor(maxBindingBytes / (cols * 4));
-  const chunkRows = Math.max(1, Math.min(GPU_CHUNK_ROWS, rows, maxRowsByBinding));
+  const chunkRows = Math.max(
+    1,
+    Math.min(GPU_CHUNK_ROWS, rows, maxRowsByBinding),
+  );
 
-  const useStreaming = matrixBytes > 1e9;
+  const useStreaming = matrixBytes > CHUNKED_UPLOAD_THRESHOLD_BYTES;
 
   if (useStreaming) {
     async function* generatedChunks() {
       for (let startRow = 0; startRow < rows; startRow += chunkRows) {
         const chunkSize = Math.min(chunkRows, rows - startRow);
-        const data = await generator.generateChunk(chunkSize, cols, startRow, rows);
+        const data = await generator.generateChunk(
+          chunkSize,
+          cols,
+          startRow,
+          rows,
+        );
         yield { startRow, data };
       }
     }
@@ -250,7 +284,12 @@ async function generateAndLoad(rows, cols) {
       const data = new Float32Array(rows * cols);
       for (let startRow = 0; startRow < rows; startRow += chunkRows) {
         const chunkSize = Math.min(chunkRows, rows - startRow);
-        const chunk = await generator.generateChunk(chunkSize, cols, startRow, rows);
+        const chunk = await generator.generateChunk(
+          chunkSize,
+          cols,
+          startRow,
+          rows,
+        );
         data.set(chunk, startRow * cols);
       }
       viewer.setData(data, { rows, cols });
@@ -278,6 +317,8 @@ async function load() {
     showError(`Failed to generate ${config.rows}x${config.cols}: ${err}`);
     return;
   }
+  currentRows = config.rows;
+  currentCols = config.cols;
 
   // Apply vmin/vmax if set
   const vmin = parseFloat(vminInput.value);
@@ -288,13 +329,15 @@ async function load() {
 
   viewer.onHover((info) => {
     tooltip.style.display = 'block';
-    const valueText = info.valueAvailable
-      ? info.value.toFixed(4)
-      : 'unavailable';
+    const value = info.valueAvailable
+      ? info.value
+      : generatedSineValue(info.row, info.col, currentRows, currentCols);
+    const valueAvailable = Number.isFinite(value);
+    const valueText = valueAvailable ? value.toFixed(4) : 'unavailable';
     tooltip.innerHTML =
       `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
       `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
-      `Value: ${valueText}${info.valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
+      `Value: ${valueText}${valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
   });
 }
 

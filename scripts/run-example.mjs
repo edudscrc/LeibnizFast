@@ -18,6 +18,8 @@ const examples = new Map([
       path: '/examples/cpp-stream/',
       generatorDir: 'examples/cpp-stream',
       bridge: 'examples/cpp-stream/bridge.py',
+      compiler: 'nvcc',
+      requiresCuda: true,
     },
   ],
   [
@@ -26,6 +28,7 @@ const examples = new Map([
       path: '/examples/waterfall/',
       generatorDir: 'examples/waterfall',
       bridge: 'examples/waterfall/bridge.py',
+      compiler: 'g++',
     },
   ],
 ]);
@@ -92,14 +95,55 @@ async function ensurePythonEnv() {
   if (!existsSync(python)) {
     await run('python3', ['-m', 'venv', 'venv']);
   }
-  await run(python, ['-m', 'pip', 'install', '-r', 'examples/requirements.txt']);
+  await run(python, [
+    '-m',
+    'pip',
+    'install',
+    '-r',
+    'examples/requirements.txt',
+  ]);
   return python;
 }
 
-async function compileGenerator(generatorDir) {
-  const out = join(generatorDir, 'generator');
-  const src = join(generatorDir, 'generator.cpp');
+async function compileGenerator(generatorConfig) {
+  const out = join(generatorConfig.generatorDir, 'generator');
+  const src = join(generatorConfig.generatorDir, 'generator.cpp');
+  if (generatorConfig.compiler === 'nvcc') {
+    try {
+      await run('nvcc', [
+        '-x',
+        'cu',
+        '-std=c++17',
+        '-O2',
+        '-o',
+        out,
+        src,
+        '-lzmq',
+      ]);
+    } catch (error) {
+      throw new Error(
+        `Failed to build the CUDA cpp-stream generator with nvcc. ` +
+          `Install the NVIDIA CUDA Toolkit, libzmq headers, and ensure nvcc is on PATH.\n` +
+          `${error instanceof Error ? error.message : error}`,
+      );
+    }
+    return;
+  }
+
   await run('g++', ['-std=c++17', '-O2', '-o', out, src, '-lzmq']);
+}
+
+async function preflightGenerator(generatorConfig) {
+  if (!generatorConfig.requiresCuda) return;
+  const generatorPath = join(root, generatorConfig.generatorDir, 'generator');
+  try {
+    await run(generatorPath, ['--check-cuda']);
+  } catch (error) {
+    throw new Error(
+      `The cpp-stream example requires an NVIDIA CUDA-capable GPU and a working CUDA driver.\n` +
+        `${error instanceof Error ? error.message : error}`,
+    );
+  }
 }
 
 function contentType(pathname) {
@@ -123,25 +167,42 @@ function contentType(pathname) {
   }
 }
 
-function resolveRequestPath(urlPath) {
-  const decoded = decodeURIComponent(urlPath.split('?')[0] ?? '/');
+function resolveRequest(urlPath) {
+  const [rawPath = '/', rawQuery = ''] = (urlPath ?? '/').split('?');
+  const decoded = decodeURIComponent(rawPath);
   const normalized = normalize(decoded).replace(/^(\.\.[/\\])+/, '');
   let filePath = join(root, normalized);
   if (!filePath.startsWith(root)) {
     return null;
   }
   if (existsSync(filePath) && statSync(filePath).isDirectory()) {
+    if (!rawPath.endsWith('/')) {
+      return {
+        redirectPath: `${rawPath}/${rawQuery ? `?${rawQuery}` : ''}`,
+      };
+    }
     filePath = join(filePath, 'index.html');
   }
-  return filePath;
+  return { filePath };
 }
 
 function startServer(preferredPort = 8080) {
   return new Promise((resolveServer, reject) => {
     const tryPort = (port) => {
       const candidate = createServer((req, res) => {
-        const filePath = resolveRequestPath(req.url ?? '/');
-        if (!filePath || !existsSync(filePath) || statSync(filePath).isDirectory()) {
+        const resolved = resolveRequest(req.url ?? '/');
+        if (resolved?.redirectPath) {
+          res.writeHead(308, { location: resolved.redirectPath });
+          res.end();
+          return;
+        }
+
+        const filePath = resolved?.filePath;
+        if (
+          !filePath ||
+          !existsSync(filePath) ||
+          statSync(filePath).isDirectory()
+        ) {
           res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
           res.end('Not found');
           return;
@@ -173,15 +234,16 @@ function startServer(preferredPort = 8080) {
 async function startStreamingProcesses() {
   if (!config.generatorDir || !config.bridge) return;
 
-  await compileGenerator(config.generatorDir);
+  await compileGenerator(config);
+  await preflightGenerator(config);
   const python = await ensurePythonEnv();
 
   const generatorArgs = debug ? ['--debug'] : [];
   const bridgeArgs = [config.bridge];
   if (debug) bridgeArgs.push('--debug');
 
-  start(join(root, config.generatorDir, 'generator'), generatorArgs);
   start(python, bridgeArgs);
+  start(join(root, config.generatorDir, 'generator'), generatorArgs);
 }
 
 function cleanup() {

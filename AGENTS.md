@@ -78,6 +78,9 @@ overlay for axes, labels, title, selections, and hover highlights.
 - Prefer `interface` over `type` for public API shapes, and keep exports
   limited to the intentional public surface.
 - Public-facing classes, interfaces, and functions need useful JSDoc.
+- When a change affects documented behavior, public APIs, examples, build
+  steps, or user-facing usage, update the relevant docs in the same change;
+  skip only when there is no meaningful docs impact.
 - Keep the TypeScript layer focused on API wrapping, memory coordination,
   WASM interaction, and browser events.
 - Rust production code should avoid `unwrap()` and `expect()`. Propagate

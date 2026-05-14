@@ -2,6 +2,10 @@
 
 Use this pattern when each new data event replaces the entire matrix — for example, a physics simulation frame, a radar sweep, or any source that sends complete snapshots.
 
+::: warning CUDA requirement for the cpp-stream example
+The bundled `npm run example:cpp-stream` wave generator is CUDA-only. It requires `nvcc`, `libzmq`, an NVIDIA CUDA-capable GPU, and a working NVIDIA driver. The example runner builds the generator with `nvcc` and runs `./generator --check-cuda` before serving; if CUDA is unavailable, it exits with a clear error instead of falling back to CPU generation.
+:::
+
 ## The rAF Decoupling Pattern
 
 Network data arrives at an unpredictable or variable rate. Calling `setData()` directly inside a WebSocket `message` handler blocks the GPU work on the network thread's schedule, which causes jank when frames arrive faster than 60 Hz and wastes GPU work when they arrive slower.
@@ -67,7 +71,9 @@ When each frame exceeds ~16 MB, avoid allocating a single large `Float32Array`. 
 
 ```ts
 // Called once per frame inside the rAF loop or network handler.
-async function uploadFrame(chunks: AsyncIterable<{ data: Float32Array; startRow: number }>) {
+async function uploadFrame(
+  chunks: AsyncIterable<{ data: Float32Array; startRow: number }>,
+) {
   viewer.beginUpdate({ rows, cols }); // reuses buffers if dims unchanged
   try {
     for await (const chunk of chunks) {
@@ -82,9 +88,9 @@ async function uploadFrame(chunks: AsyncIterable<{ data: Float32Array; startRow:
 
 ### `beginUpdate()` vs `beginData()`
 
-| Method | When to use |
-|---|---|
-| `beginData({ rows, cols })` | First upload, or when matrix dimensions change |
+| Method                        | When to use                                                                                              |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `beginData({ rows, cols })`   | First upload, or when matrix dimensions change                                                           |
 | `beginUpdate({ rows, cols })` | Subsequent frames with the same dimensions — reuses the GPU staging buffer and avoids a pipeline rebuild |
 
 `beginUpdate()` automatically falls back to `beginData()` if the dimensions differ from the previous frame.
