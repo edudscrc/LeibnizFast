@@ -35,6 +35,7 @@
     "@typescript-eslint/parser": "^8.0",
     "eslint": "^9.0",
     "prettier": "^3.2",
+    "prettier-plugin-wgsl": "^0.1.12",
     "tsup": "^8.0",
     "typescript": "^5.4",
     "typescript-eslint": "^8.0",
