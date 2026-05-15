@@ -26,6 +26,14 @@ const PADDING = 10;
 const MIN_TICK_SPACING = 50;
 /** Extra padding at container edges so labels don't clip. */
 const EDGE_PADDING = 16;
+/** Width of the vertical colorbar in CSS pixels. */
+const COLORBAR_WIDTH = 16;
+/** Gap between the matrix and the colorbar. */
+const COLORBAR_GAP = 16;
+/** Reserved width for colorbar tick labels. */
+const COLORBAR_TICK_LABEL_WIDTH = 72;
+/** Gap between colorbar tick labels and the rotated colorbar label. */
+const COLORBAR_LABEL_GAP = 3;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -61,6 +69,18 @@ export interface VisibleRange {
   yMax: number;
 }
 
+/** Data needed to render the chart colorbar. */
+export interface ColorbarData {
+  /** Data value mapped to the first colormap color. */
+  min: number;
+  /** Data value mapped to the last colormap color. */
+  max: number;
+  /** Packed 256-entry RGB lookup table in RGBRGB... order. */
+  colors: Uint8Array;
+  /** Optional vertical label, usually the matrix value unit. */
+  label?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Type guards
 // ---------------------------------------------------------------------------
@@ -72,6 +92,26 @@ export function isStreamingAxis(
   axis: AxisConfig | StreamingAxisConfig,
 ): axis is StreamingAxisConfig {
   return 'unitsPerCell' in axis;
+}
+
+/** Returns true when the default chart colorbar should reserve layout space. */
+function isColorbarEnabled(chart: ChartConfig): boolean {
+  return chart.colorbar !== false;
+}
+
+/**
+ * Keep edge tick strokes visually inside the chart bounds while preserving
+ * interior tick positions.
+ */
+function alignAxisTickPosition(
+  position: number,
+  axisLength: number,
+  lineWidth: number,
+): number {
+  const edgeInset = lineWidth / 2;
+  if (position <= edgeInset) return edgeInset;
+  if (axisLength - position <= edgeInset) return axisLength - edgeInset;
+  return position;
 }
 
 // ---------------------------------------------------------------------------
@@ -249,8 +289,17 @@ export function computeLayout(
     }
   }
 
-  // --- Right margin ---
-  const rightMargin = EDGE_PADDING;
+  // --- Right margin: optional colorbar ---
+  let rightMargin = EDGE_PADDING;
+  if (isColorbarEnabled(chart)) {
+    const maxTickWidth = getColorbarTickLabelWidth(ctx, font);
+    rightMargin +=
+      COLORBAR_GAP + COLORBAR_WIDTH + TICK_LENGTH + 2 + maxTickWidth;
+
+    if (chart.valueUnit) {
+      rightMargin += tickLabelHeight + COLORBAR_LABEL_GAP;
+    }
+  }
 
   return {
     x: leftMargin,
@@ -294,6 +343,35 @@ function formatAxisLabel(label?: string, unit?: string): string {
   return '';
 }
 
+/**
+ * Reserve enough width for finite colorbar tick labels across normal and
+ * exponential notation, including larger custom fonts.
+ */
+function getColorbarTickLabelWidth(
+  ctx: CanvasRenderingContext2D,
+  font: string,
+): number {
+  ctx.font = font;
+  return Math.max(
+    COLORBAR_TICK_LABEL_WIDTH,
+    ctx.measureText('-1.0e+308').width,
+  );
+}
+
+/** Measure the widest label in an already generated tick set. */
+function getMaxTickLabelWidth(
+  ticks: Tick[],
+  ctx: CanvasRenderingContext2D,
+  font: string,
+): number {
+  ctx.font = font;
+  let maxWidth = 0;
+  for (const tick of ticks) {
+    maxWidth = Math.max(maxWidth, ctx.measureText(tick.label).width);
+  }
+  return maxWidth;
+}
+
 // ---------------------------------------------------------------------------
 // Overlay rendering
 // ---------------------------------------------------------------------------
@@ -318,6 +396,7 @@ export function renderOverlay(
   containerWidth: number,
   containerHeight: number,
   dpr: number,
+  colorbar?: ColorbarData | null,
 ): void {
   const font = chart.font ?? DEFAULT_FONT;
   const titleFont = chart.titleFont ?? DEFAULT_TITLE_FONT;
@@ -348,6 +427,10 @@ export function renderOverlay(
   // Draw Y axis
   if (chart.yAxis) {
     drawYAxis(ctx, layout, chart.yAxis, visible, font, tickColor, labelColor);
+  }
+
+  if (isColorbarEnabled(chart) && colorbar) {
+    drawColorbar(ctx, layout, colorbar, font, tickColor, labelColor);
   }
 
   ctx.restore();
@@ -439,7 +522,9 @@ function drawXAxis(
   ctx.textBaseline = 'top';
 
   for (const tick of ticks) {
-    const x = layout.x + tick.position;
+    const x =
+      layout.x +
+      alignAxisTickPosition(tick.position, layout.width, ctx.lineWidth);
 
     // Tick mark
     ctx.strokeStyle = tickColor;
@@ -521,7 +606,9 @@ function drawYAxis(
   for (const tick of ticks) {
     // No inversion: UV.y=0 is the top of the canvas, which corresponds to
     // yMin (row 0), so position=0 should map to the top of the matrix area.
-    const y = layout.y + tick.position;
+    const y =
+      layout.y +
+      alignAxisTickPosition(tick.position, layout.height, ctx.lineWidth);
 
     // Tick mark
     ctx.strokeStyle = tickColor;
@@ -554,6 +641,98 @@ function drawYAxis(
     ctx.translate(EDGE_PADDING, centerY);
     ctx.rotate(-Math.PI / 2);
     ctx.fillText(axisLabel, 0, 0);
+    ctx.restore();
+  }
+}
+
+/**
+ * Draw the right-side colorbar: colormap gradient, value ticks, and label.
+ */
+function drawColorbar(
+  ctx: CanvasRenderingContext2D,
+  layout: LayoutRect,
+  colorbar: ColorbarData,
+  font: string,
+  tickColor: string,
+  labelColor: string,
+): void {
+  if (
+    colorbar.colors.length < 3 ||
+    !Number.isFinite(colorbar.min) ||
+    !Number.isFinite(colorbar.max) ||
+    colorbar.max <= colorbar.min
+  ) {
+    return;
+  }
+
+  const barX = layout.x + layout.width + COLORBAR_GAP;
+  const barY = layout.y;
+  const barHeight = layout.height;
+  const gradient = ctx.createLinearGradient(0, barY + barHeight, 0, barY);
+  const entries = Math.floor(colorbar.colors.length / 3);
+
+  for (let i = 0; i < entries; i++) {
+    const offset = i * 3;
+    gradient.addColorStop(
+      entries === 1 ? 0 : i / (entries - 1),
+      `rgb(${colorbar.colors[offset]}, ${colorbar.colors[offset + 1]}, ${
+        colorbar.colors[offset + 2]
+      })`,
+    );
+  }
+
+  ctx.fillStyle = gradient;
+  ctx.fillRect(barX, barY, COLORBAR_WIDTH, barHeight);
+  ctx.strokeStyle = tickColor;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(barX, barY, COLORBAR_WIDTH, barHeight);
+
+  const ticks = generateTicks(colorbar.min, colorbar.max, barHeight, ctx, font);
+  const maxTickLabelWidth = getMaxTickLabelWidth(ticks, ctx, font);
+
+  ctx.font = font;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+
+  const sampleMetrics = ctx.measureText('0');
+  const halfLabelH =
+    (sampleMetrics.actualBoundingBoxAscent +
+      sampleMetrics.actualBoundingBoxDescent) /
+    2;
+  const tickStartX = barX + COLORBAR_WIDTH;
+  const tickEndX = tickStartX + TICK_LENGTH;
+  const labelX = tickEndX + 2;
+
+  for (const tick of ticks) {
+    const y = barY + barHeight - tick.position;
+
+    ctx.strokeStyle = tickColor;
+    ctx.beginPath();
+    ctx.moveTo(tickStartX, y);
+    ctx.lineTo(tickEndX, y);
+    ctx.stroke();
+
+    const clampedY = Math.max(
+      barY + halfLabelH,
+      Math.min(y, barY + barHeight - halfLabelH),
+    );
+    ctx.fillStyle = labelColor;
+    ctx.fillText(tick.label, labelX, clampedY);
+  }
+
+  if (colorbar.label) {
+    ctx.save();
+    ctx.font = font;
+    ctx.fillStyle = labelColor;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+
+    const centerY = barY + barHeight / 2;
+    const labelOffset =
+      COLORBAR_WIDTH + TICK_LENGTH + 2 + maxTickLabelWidth + COLORBAR_LABEL_GAP;
+    ctx.translate(barX + labelOffset, centerY);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText(colorbar.label, 0, 0);
     ctx.restore();
   }
 }

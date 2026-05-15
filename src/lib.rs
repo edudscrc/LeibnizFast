@@ -170,6 +170,8 @@ mod wasm_entry {
         hover_callback: Option<js_sys::Function>,
         /// Current colormap name
         current_colormap: String,
+        /// Active data range used for colormap normalization.
+        active_range: Option<(f32, f32)>,
         /// In-progress streaming upload, if any
         pending_upload: Option<PendingUpload>,
         /// In-progress chunked upload, if any
@@ -220,6 +222,7 @@ mod wasm_entry {
                 js_data: None,
                 hover_callback: None,
                 current_colormap: colormap_name,
+                active_range: None,
                 pending_upload: None,
                 pending_chunk_upload: None,
                 sticky_range: None,
@@ -268,6 +271,7 @@ mod wasm_entry {
             } else {
                 matrix::JsDataSource::new(data, rows, cols, self.debug)
             };
+            self.active_range = Some(js_data.range());
             self.js_data = Some(js_data);
 
             // Fast path: if the GPU pipeline already exists for the same dimensions,
@@ -368,6 +372,7 @@ mod wasm_entry {
                     ));
                 }
             };
+            self.active_range = Some((min_val, max_val));
 
             let expected_len = checked_element_count(rows, cols)?;
             if data.length() != expected_len {
@@ -478,6 +483,7 @@ mod wasm_entry {
             validate_range(min, max)?;
             // Persist as sticky range so future setData calls use it without rescanning
             self.sticky_range = Some((min, max));
+            self.active_range = Some((min, max));
             if let Some(ref mut jd) = self.js_data {
                 jd.set_range(min, max);
             }
@@ -737,6 +743,7 @@ mod wasm_entry {
             } else {
                 pending.js_data.finalize();
             }
+            self.active_range = Some(pending.js_data.range());
 
             self.js_data = Some(pending.js_data);
             self.matrix = Some(pending.matrix_view);
@@ -963,6 +970,7 @@ mod wasm_entry {
             let (min_val, max_val) = pending
                 .fixed_range
                 .unwrap_or_else(|| finalize_range(pending.min_val, pending.max_val));
+            self.active_range = Some((min_val, max_val));
 
             if let Some(ref mut jd) = pending.js_data {
                 jd.set_range(min_val, max_val);
@@ -1004,6 +1012,36 @@ mod wasm_entry {
                 uniforms.uv_scale[0],
                 uniforms.uv_scale[1],
             ]
+        }
+
+        /// Get the active data range used for colormap normalization.
+        ///
+        /// Returns an empty array when no explicit range or uploaded data has
+        /// established the range yet.
+        #[wasm_bindgen(js_name = getColorRange)]
+        pub fn get_color_range(&self) -> Vec<f32> {
+            self.active_range
+                .map(|(min, max)| vec![min, max])
+                .unwrap_or_default()
+        }
+
+        /// Get the active colormap as packed RGB bytes.
+        ///
+        /// The returned array contains 256 entries in RGBRGB... order and is
+        /// sourced from the same lookup table used to build the GPU LUT.
+        #[wasm_bindgen(js_name = getColormapLut)]
+        pub fn get_colormap_lut(&self) -> Vec<u8> {
+            use colormap::ColormapProvider;
+            let provider = colormap::BuiltinColormaps;
+            let Some(rgb_data) = provider.get_colormap_rgb(&self.current_colormap) else {
+                return Vec::new();
+            };
+
+            let mut lut = Vec::with_capacity(rgb_data.len() * 3);
+            for rgb in rgb_data {
+                lut.extend_from_slice(rgb);
+            }
+            lut
         }
 
         /// Register a callback for hover events.

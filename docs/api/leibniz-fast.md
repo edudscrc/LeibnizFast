@@ -139,7 +139,7 @@ await viewer.setDataChunks(chunks(), {
 setColormap(name: ColormapName): void
 ```
 
-Changes the colormap used to render data values. Takes effect on the next render call. No data reload is needed.
+Changes the colormap used to render data values and the chart colorbar. Takes effect on the next render call. No data reload is needed.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -157,7 +157,7 @@ viewer.setColormap('plasma');
 setRange(min: number, max: number): void
 ```
 
-Sets the data range for colormap mapping. Values at or below `min` render as the first colormap color; values at or above `max` render as the last.
+Sets the data range for colormap mapping and colorbar ticks. Values at or below `min` render as the first colormap color; values at or above `max` render as the last.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -300,7 +300,7 @@ requestAnimationFrame(renderLoop);
 setChart(config: ChartConfig | null): void
 ```
 
-Updates the chart configuration (axes, title, fonts, colors). Creates the 2D overlay if it does not exist yet. Passing `null` removes the overlay entirely and reverts to raw matrix mode.
+Updates the chart configuration (axes, colorbar, title, fonts, colors). Creates the 2D overlay if it does not exist yet. Passing `null` removes the overlay entirely and reverts to raw matrix mode.
 
 | Parameter | Type | Description |
 |---|---|---|

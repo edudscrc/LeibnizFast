@@ -1,6 +1,6 @@
 # Chart Customization
 
-The chart overlay renders axes, tick marks, a title, and a hover tooltip on top of the GPU canvas using a 2D Canvas element. It is entirely optional — omit `chart` from `CreateOptions` for a raw matrix view.
+The chart overlay renders axes, tick marks, a title, a colorbar, and a hover tooltip on top of the GPU canvas using a 2D Canvas element. It is entirely optional — omit `chart` from `CreateOptions` for a raw matrix view.
 
 ## Enabling the Overlay
 
@@ -40,7 +40,8 @@ viewer.setChart(null); // reverts to raw matrix mode
 | `title` | `string` | — | Text displayed centered above the matrix |
 | `xAxis` | [`AxisConfig`](/api/types#axisconfig) \| [`StreamingAxisConfig`](/api/types#streamingaxisconfig) | — | X axis configuration |
 | `yAxis` | [`AxisConfig`](/api/types#axisconfig) | — | Y axis configuration |
-| `valueUnit` | `string` | — | Unit appended to the value in the hover tooltip (e.g. `'dBFS'`, `'°C'`) |
+| `valueUnit` | `string` | — | Unit appended to the value in the hover tooltip and used as the colorbar label (e.g. `'dBFS'`, `'°C'`) |
+| `colorbar` | `boolean` | `true` | Show the right-side colorbar. Set to `false` to hide it. |
 | `font` | `string` (CSS) | `'12px sans-serif'` | Font for tick labels |
 | `titleFont` | `string` (CSS) | `'bold 16px sans-serif'` | Font for the chart title |
 | `tickColor` | `string` (CSS color) | `'#999'` | Color of tick marks and axis lines |
@@ -105,6 +106,20 @@ Change the colormap at any time without reloading data:
 
 ```ts
 viewer.setColormap('inferno');
+```
+
+## Colorbar
+
+Chart overlays show a right-side vertical colorbar by default. It uses the same colormap and value range as the WebGPU renderer. The top tick is the current color range maximum, and the bottom tick is the minimum.
+
+When `valueUnit` is set, it is drawn as the vertical colorbar label. Hide the colorbar with:
+
+```ts
+viewer.setChart({
+  xAxis: { label: 'Time', unit: 's', min: 0, max: 10 },
+  yAxis: { label: 'Frequency', unit: 'Hz', min: 0, max: 24000 },
+  colorbar: false,
+});
 ```
 
 ## Color Range

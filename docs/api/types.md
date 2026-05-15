@@ -197,6 +197,7 @@ interface ChartConfig {
   xAxis?: AxisConfig | StreamingAxisConfig;
   yAxis?: AxisConfig;
   valueUnit?: string;
+  colorbar?: boolean;
   font?: string;
   titleFont?: string;
   tickColor?: string;
@@ -212,7 +213,8 @@ Configuration for the 2D chart overlay rendered on top of the GPU canvas. All fi
 | `title` | `string` | — | Text centered above the matrix |
 | `xAxis` | [`AxisConfig`](#axisconfig) \| [`StreamingAxisConfig`](#streamingaxisconfig) | — | X axis configuration |
 | `yAxis` | [`AxisConfig`](#axisconfig) | — | Y axis configuration |
-| `valueUnit` | `string` | — | Unit string appended to hover tooltip values (e.g. `'dBFS'`, `'°C'`) |
+| `valueUnit` | `string` | — | Unit string appended to hover tooltip values and used as the default colorbar label (e.g. `'dBFS'`, `'°C'`) |
+| `colorbar` | `boolean` | `true` | Show the right-side colorbar. Set to `false` to hide it. |
 | `font` | `string` (CSS font) | `'12px sans-serif'` | Font for tick labels |
 | `titleFont` | `string` (CSS font) | `'bold 16px sans-serif'` | Font for the chart title |
 | `tickColor` | `string` (CSS color) | `'#999'` | Color of tick marks and axis lines |

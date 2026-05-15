@@ -25,6 +25,7 @@ const yUnitInput = document.getElementById('y-unit');
 const yMinInput = document.getElementById('y-min');
 const yMaxInput = document.getElementById('y-max');
 const valueUnitInput = document.getElementById('value-unit');
+const colorbarInput = document.getElementById('show-colorbar');
 const vminInput = document.getElementById('vmin');
 const vmaxInput = document.getElementById('vmax');
 
@@ -203,6 +204,7 @@ function readConfig() {
         max: parseFloat(yMaxInput.value),
       },
       valueUnit: valueUnitInput.value || undefined,
+      colorbar: colorbarInput.checked,
     },
   };
 }

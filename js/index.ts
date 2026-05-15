@@ -40,7 +40,7 @@ import {
   renderOverlay,
   uvToVisibleRange,
 } from './axes';
-import type { LayoutRect, VisibleRange } from './axes';
+import type { ColorbarData, LayoutRect, VisibleRange } from './axes';
 
 // ---------------------------------------------------------------------------
 // Interaction types
@@ -112,6 +112,11 @@ type WebGpuNavigatorLike = Navigator & {
       options?: Record<string, unknown>,
     ) => Promise<WebGpuAdapterLike | null>;
   };
+};
+
+type WasmLeibnizFastInner = WasmLeibnizFast & {
+  getColorRange(): Float32Array;
+  getColormapLut(): Uint8Array;
 };
 
 function normalizeAdapterInfo(
@@ -220,7 +225,7 @@ export class LeibnizFast {
   private zoomAnimationId: number | null = null;
 
   // --- Chart overlay state ---
-  /** Chart configuration (axes, title, labels). Null when no chart mode. */
+  /** Chart configuration (axes, colorbar, title, labels). Null when no chart mode. */
   private chartConfig: ChartConfig | null = null;
   /** Wrapper div that contains both canvases. */
   private wrapperDiv: HTMLDivElement | null = null;
@@ -246,6 +251,8 @@ export class LeibnizFast {
   private dataColMajor: boolean = false;
   /** Ring cursor position for scrolled streaming data (0 when not streaming). */
   private ringCursor: number = 0;
+  /** Active colormap lookup table for the overlay colorbar. */
+  private colorbarLut: Uint8Array | null = null;
 
   private constructor(
     inner: WasmLeibnizFast,
@@ -256,6 +263,7 @@ export class LeibnizFast {
     this.inner = inner;
     this.canvas = canvas;
     this.debug = debug;
+    this.refreshColorbarLut();
 
     // Bind DOM event handlers (must happen before setupChartOverlay,
     // which calls removeEventListeners/registerEventListeners)
@@ -408,6 +416,37 @@ export class LeibnizFast {
     return result;
   }
 
+  /** Refresh the cached colormap LUT used by the 2D overlay colorbar. */
+  private refreshColorbarLut(): void {
+    const lut = (this.inner as WasmLeibnizFastInner).getColormapLut();
+    this.colorbarLut = lut.length > 0 ? lut : null;
+  }
+
+  /** Build colorbar render data from the current WASM colormap range. */
+  private getColorbarData(): ColorbarData | null {
+    if (!this.chartConfig || this.chartConfig.colorbar === false) return null;
+    if (!this.colorbarLut) return null;
+
+    const range = (this.inner as WasmLeibnizFastInner).getColorRange();
+    if (range.length < 2) return null;
+
+    const min = range[0];
+    const max = range[1];
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+      return null;
+    }
+
+    const colorbar: ColorbarData = {
+      min,
+      max,
+      colors: this.colorbarLut,
+    };
+    if (this.chartConfig.valueUnit) {
+      colorbar.label = this.chartConfig.valueUnit;
+    }
+    return colorbar;
+  }
+
   /**
    * Set the matrix data to visualize.
    *
@@ -479,6 +518,8 @@ export class LeibnizFast {
    */
   setColormap(name: ColormapName): void {
     this.timeSync('JS setColormap', () => this.inner.setColormap(name));
+    this.refreshColorbarLut();
+    this.updateOverlay();
   }
 
   /**
@@ -493,6 +534,7 @@ export class LeibnizFast {
   setRange(min: number, max: number): void {
     assertValidRange({ min, max });
     this.inner.setRange(min, max);
+    this.updateOverlay();
   }
 
   /**
@@ -537,8 +579,7 @@ export class LeibnizFast {
       );
     }
     if (options.range) {
-      assertValidRange(options.range);
-      this.inner.setRange(options.range.min, options.range.max);
+      this.setRange(options.range.min, options.range.max);
     }
     this.matrixRows = options.rows;
     this.matrixCols = options.cols;
@@ -567,8 +608,7 @@ export class LeibnizFast {
       );
     }
     if (options.range) {
-      assertValidRange(options.range);
-      this.inner.setRange(options.range.min, options.range.max);
+      this.setRange(options.range.min, options.range.max);
     }
     this.timeSync('JS beginUpdate', () =>
       this.inner.beginUpdate(options.rows, options.cols),
@@ -701,7 +741,7 @@ export class LeibnizFast {
   }
 
   /**
-   * Update the chart configuration (axes, title, labels).
+   * Update the chart configuration (axes, colorbar, title, labels).
    *
    * If no chart overlay exists yet, it will be created. If called with
    * `null`, the overlay is removed and the viewer reverts to raw matrix mode.
@@ -1346,6 +1386,7 @@ export class LeibnizFast {
       containerW,
       containerH,
       dpr,
+      this.getColorbarData(),
     );
 
     // Draw interaction overlays on top of axes (inside the same DPR transform)

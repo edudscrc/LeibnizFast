@@ -38,7 +38,7 @@ const viewer = await LeibnizFast.create(canvas, {
 |---|---|---|---|
 | `colormap` | [`ColormapName`](/api/types#colormapname) | `'viridis'` | Initial colormap applied to all data values |
 | `debug` | `boolean` | `false` | Log performance timings to the browser console |
-| `chart` | [`ChartConfig`](/api/types#chartconfig) | `undefined` | Axes, title, and label configuration. Omit for a raw matrix view with no overlays. |
+| `chart` | [`ChartConfig`](/api/types#chartconfig) | `undefined` | Axes, colorbar, title, and label configuration. Omit for a raw matrix view with no overlays. |
 
 ## Debug Mode
 

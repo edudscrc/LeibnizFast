@@ -19,7 +19,7 @@ features:
   - title: Real-Time Streaming
     details: Ring buffer waterfall pattern delivers O(rows × newCols) GPU cost per frame — independent of display window width. Ingest at network rate, render at display rate.
   - title: Chart Overlays
-    details: 2D Canvas overlay renders axes, tick marks, axis labels, and a chart title on top of the GPU canvas. Hover callback delivers interpolated axis coordinates per cell.
+    details: 2D Canvas overlay renders axes, tick marks, axis labels, a colorbar, and a chart title on top of the GPU canvas. Hover callback delivers interpolated axis coordinates per cell.
 ---
 
 ## Installation

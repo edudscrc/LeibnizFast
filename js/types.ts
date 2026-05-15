@@ -71,7 +71,7 @@ export interface StreamingAxisConfig {
 }
 
 /**
- * Chart configuration: axes, labels, units, and title.
+ * Chart configuration: axes, colorbar, labels, units, and title.
  *
  * @example
  * ```ts
@@ -95,9 +95,15 @@ export interface ChartConfig {
   yAxis?: AxisConfig;
   /**
    * Unit string for pixel values displayed in the tooltip (e.g. "rad", "dB").
-   * When set, the tooltip value line shows "Value: 0.21 rad".
+   * When set, the tooltip value line shows "Value: 0.21 rad" and the
+   * default colorbar uses the unit as its vertical label.
    */
   valueUnit?: string;
+  /**
+   * Whether to show the default right-side colorbar. Defaults to true when a
+   * chart overlay is configured.
+   */
+  colorbar?: boolean;
   /** CSS font string for tick labels. Defaults to "12px sans-serif". */
   font?: string;
   /** CSS font string for the chart title. Defaults to "bold 16px sans-serif". */
@@ -118,7 +124,7 @@ export interface CreateOptions {
   colormap?: ColormapName;
   /** Enable performance timing logs in the browser console. Defaults to false. */
   debug?: boolean;
-  /** Chart configuration (axes, title, labels). Omit for raw matrix view. */
+  /** Chart configuration (axes, colorbar, title, labels). Omit for raw matrix view. */
   chart?: ChartConfig;
 }
 
