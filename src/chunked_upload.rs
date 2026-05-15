@@ -44,11 +44,15 @@ impl ChunkedUploader {
                         current_row: 0,
                     };
                 }
-                let row_bytes = cols as usize * 4; // f32 = 4 bytes
+                let row_bytes = (cols as usize).saturating_mul(4); // f32 = 4 bytes
                 let raw_rows = TARGET_CHUNK_BYTES / row_bytes;
                 // Align down to WORKGROUP_ALIGNMENT, minimum WORKGROUP_ALIGNMENT
-                let aligned = (raw_rows as u32 / WORKGROUP_ALIGNMENT) * WORKGROUP_ALIGNMENT;
-                aligned.max(WORKGROUP_ALIGNMENT).min(rows)
+                if raw_rows == 0 {
+                    1.min(rows)
+                } else {
+                    let aligned = (raw_rows as u32 / WORKGROUP_ALIGNMENT) * WORKGROUP_ALIGNMENT;
+                    aligned.max(WORKGROUP_ALIGNMENT).min(rows)
+                }
             }
         };
 
@@ -67,14 +71,20 @@ impl ChunkedUploader {
         if self.current_row >= self.rows {
             return None;
         }
-        let end = (self.current_row + self.chunk_rows).min(self.rows);
+        let end = self
+            .current_row
+            .saturating_add(self.chunk_rows)
+            .min(self.rows);
         Some((self.current_row, end))
     }
 
     /// Advance past the current chunk.
     pub fn advance(&mut self) {
         if self.current_row < self.rows {
-            self.current_row = (self.current_row + self.chunk_rows).min(self.rows);
+            self.current_row = self
+                .current_row
+                .saturating_add(self.chunk_rows)
+                .min(self.rows);
         }
     }
 

@@ -15,11 +15,11 @@ hero:
 
 features:
   - title: WebGPU Powered
-    details: Rust/WASM core via wgpu renders millions of cells at interactive framerates. Falls back gracefully to WebGL2 for broader browser compatibility.
+    details: Rust/WASM core via wgpu renders millions of cells at interactive framerates. WebGPU is required; missing adapter/device support produces a clear error.
   - title: Real-Time Streaming
     details: Ring buffer waterfall pattern delivers O(rows × newCols) GPU cost per frame — independent of display window width. Ingest at network rate, render at display rate.
   - title: Chart Overlays
-    details: 2D Canvas overlay renders axes, tick marks, axis labels, and a chart title on top of the GPU canvas. Hover callback delivers interpolated axis coordinates per cell.
+    details: 2D Canvas overlay renders axes, tick marks, axis labels, a colorbar, and a chart title on top of the GPU canvas. Hover callback delivers interpolated axis coordinates per cell.
 ---
 
 ## Installation
@@ -32,11 +32,10 @@ npm install leibniz-fast
 
 | Browser | Version | Notes |
 |---|---|---|
-| Chrome / Edge | 113+ | Full WebGPU support |
-| Firefox | Nightly | Requires `dom.webgpu.enabled` flag |
-| Safari | Technology Preview | Full WebGPU support |
-| All others | Any | WebGL2 fallback (no hover, no ring streaming) |
+| Chrome / Edge | 113+ on supported platforms | WebGPU enabled by default on major desktop targets |
+| Firefox | 141+ on Windows | Other platforms are still rolling out |
+| Safari | 26+ | macOS/iOS/iPadOS/visionOS support |
 
-::: info WebGL2 Fallback
-When WebGPU is unavailable, LeibnizFast automatically falls back to a WebGL2 renderer. The fallback does not support hover tooltips, ring buffer streaming, or live colormap changes without a full data reload.
+::: warning WebGPU Required
+LeibnizFast does not provide CPU or WebGL2 fallback rendering. Serve from HTTPS or localhost and use `LeibnizFast.checkSupport()` to show a friendly message when `navigator.gpu`, adapter creation, or device creation fails.
 :::

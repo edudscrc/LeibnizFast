@@ -25,6 +25,7 @@ const yUnitInput = document.getElementById('y-unit');
 const yMinInput = document.getElementById('y-min');
 const yMaxInput = document.getElementById('y-max');
 const valueUnitInput = document.getElementById('value-unit');
+const colorbarInput = document.getElementById('show-colorbar');
 const vminInput = document.getElementById('vmin');
 const vmaxInput = document.getElementById('vmax');
 
@@ -32,6 +33,8 @@ const vmaxInput = document.getElementById('vmax');
 
 /** Maximum rows per GPU compute chunk (keeps storage buffer bounded). */
 const GPU_CHUNK_ROWS = 1000;
+/** Above this size the example uploads chunks without retaining CPU hover data. */
+const CHUNKED_UPLOAD_THRESHOLD_BYTES = 1_000_000_000;
 
 // ---- GPU sine-wave generator ---------------------------------------------
 
@@ -201,8 +204,30 @@ function readConfig() {
         max: parseFloat(yMaxInput.value),
       },
       valueUnit: valueUnitInput.value || undefined,
+      colorbar: colorbarInput.checked,
     },
   };
+}
+
+/**
+ * Mirror the WGSL sine-wave generator for tooltip values when large chunked
+ * uploads skip CPU-side retention.
+ *
+ * @param {number} row
+ * @param {number} col
+ * @param {number} rows
+ * @param {number} cols
+ * @returns {number}
+ */
+function generatedSineValue(row, col, rows, cols) {
+  const x = col / cols;
+  const y = row / rows;
+
+  return (
+    Math.sin(x * 20.0) * Math.cos(y * 20.0) +
+    Math.sin((x + y) * 10.0) * 0.5 +
+    Math.sin(Math.sqrt(x * x + y * y) * 30.0) * 0.3
+  );
 }
 
 // ---- Main ----------------------------------------------------------------
@@ -212,6 +237,9 @@ let viewer = null;
 
 /** @type {GpuSineGenerator|null} */
 let generator = null;
+
+let currentRows = 0;
+let currentCols = 0;
 
 /**
  * Generate data on the GPU and load it into the viewer.
@@ -224,18 +252,31 @@ async function generateAndLoad(rows, cols) {
   const matrixBytes = rows * cols * 4;
   const maxBindingBytes = generator._device.limits.maxStorageBufferBindingSize;
   const maxRowsByBinding = Math.floor(maxBindingBytes / (cols * 4));
-  const chunkRows = Math.max(1, Math.min(GPU_CHUNK_ROWS, rows, maxRowsByBinding));
+  const chunkRows = Math.max(
+    1,
+    Math.min(GPU_CHUNK_ROWS, rows, maxRowsByBinding),
+  );
 
-  const useStreaming = matrixBytes > 1e9;
+  const useStreaming = matrixBytes > CHUNKED_UPLOAD_THRESHOLD_BYTES;
 
   if (useStreaming) {
-    viewer.beginData({ rows, cols });
-    for (let startRow = 0; startRow < rows; startRow += chunkRows) {
-      const chunkSize = Math.min(chunkRows, rows - startRow);
-      const chunk = await generator.generateChunk(chunkSize, cols, startRow, rows);
-      viewer.appendChunk(chunk, startRow);
+    async function* generatedChunks() {
+      for (let startRow = 0; startRow < rows; startRow += chunkRows) {
+        const chunkSize = Math.min(chunkRows, rows - startRow);
+        const data = await generator.generateChunk(
+          chunkSize,
+          cols,
+          startRow,
+          rows,
+        );
+        yield { startRow, data };
+      }
     }
-    viewer.endData();
+    await viewer.setDataChunks(generatedChunks(), {
+      rows,
+      cols,
+      retainData: false,
+    });
   } else {
     // For smaller matrices, generate all chunks and concatenate
     if (rows <= chunkRows) {
@@ -245,7 +286,12 @@ async function generateAndLoad(rows, cols) {
       const data = new Float32Array(rows * cols);
       for (let startRow = 0; startRow < rows; startRow += chunkRows) {
         const chunkSize = Math.min(chunkRows, rows - startRow);
-        const chunk = await generator.generateChunk(chunkSize, cols, startRow, rows);
+        const chunk = await generator.generateChunk(
+          chunkSize,
+          cols,
+          startRow,
+          rows,
+        );
         data.set(chunk, startRow * cols);
       }
       viewer.setData(data, { rows, cols });
@@ -273,6 +319,8 @@ async function load() {
     showError(`Failed to generate ${config.rows}x${config.cols}: ${err}`);
     return;
   }
+  currentRows = config.rows;
+  currentCols = config.cols;
 
   // Apply vmin/vmax if set
   const vmin = parseFloat(vminInput.value);
@@ -283,29 +331,40 @@ async function load() {
 
   viewer.onHover((info) => {
     tooltip.style.display = 'block';
+    const value = info.valueAvailable
+      ? info.value
+      : generatedSineValue(info.row, info.col, currentRows, currentCols);
+    const valueAvailable = Number.isFinite(value);
+    const valueText = valueAvailable ? value.toFixed(4) : 'unavailable';
     tooltip.innerHTML =
       `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
       `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
-      `Value: ${info.value.toFixed(4)}${info.valueUnit ? ' ' + info.valueUnit : ''}`;
+      `Value: ${valueText}${valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
   });
 }
 
 async function main() {
   // ---- WebGPU availability check -----------------------------------------
-  if (!navigator.gpu) {
-    showError(
-      'WebGPU is not supported in this browser. ' +
-      'Chrome 113+, Edge 113+, or Firefox Nightly required.',
-    );
+  const support = await LeibnizFast.checkSupport();
+  if (!support.supported) {
+    showError(support.reason || 'WebGPU is required for LeibnizFast.');
     return;
   }
 
-  const adapter = await navigator.gpu.requestAdapter();
+  const adapter = await navigator.gpu.requestAdapter({
+    powerPreference: 'high-performance',
+  });
   if (!adapter) {
     showError('No WebGPU adapter available.');
     return;
   }
-  const gpuDevice = await adapter.requestDevice();
+  let gpuDevice;
+  try {
+    gpuDevice = await adapter.requestDevice();
+  } catch (err) {
+    showError(`Failed to create WebGPU device: ${err}`);
+    return;
+  }
   generator = new GpuSineGenerator(gpuDevice);
 
   // ---- Initial load ------------------------------------------------------

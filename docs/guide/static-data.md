@@ -6,7 +6,7 @@
 setData(data: Float32Array, options: DataOptions): void
 ```
 
-The primary method for loading a matrix into the viewer. It uploads `data` to the GPU, runs the colormap compute shader over all cells, and renders the result in a single call.
+The primary method for loading a matrix into the viewer. It uploads `data` through a bounded GPU staging buffer into tiled textures and renders the result in a single call.
 
 **Data layout:** Row-major `Float32Array`. Element at row `r`, column `c` lives at index `r * cols + c`.
 
@@ -39,28 +39,36 @@ After `setData()` returns:
 
 ## Chunked Upload for Large Matrices
 
-For matrices larger than ~1 GB (`rows × cols × 4 bytes`), use the three-step chunked API to avoid allocating a single massive `Float32Array` in JavaScript.
+For matrices that should not exist as one giant JavaScript `Float32Array`, use `setDataChunks()`. Chunks are uploaded directly into tiled GPU textures. Set `retainData: false` to avoid keeping CPU-side hover data.
 
 ```ts
 const rows = 8000;
 const cols = 8000;
 const chunkRows = 1000;
 
-viewer.beginData({ rows, cols });
-
-for (let startRow = 0; startRow < rows; startRow += chunkRows) {
-  const actualRows = Math.min(chunkRows, rows - startRow);
-  const chunk = generateChunk(startRow, actualRows, cols); // your data source
-  viewer.appendChunk(chunk, startRow);
+async function* chunks() {
+  for (let startRow = 0; startRow < rows; startRow += chunkRows) {
+    const actualRows = Math.min(chunkRows, rows - startRow);
+    yield {
+      startRow,
+      data: await generateChunk(startRow, actualRows, cols),
+    };
+  }
 }
 
-viewer.endData();
+await viewer.setDataChunks(chunks(), {
+  rows,
+  cols,
+  retainData: false,
+  range: { min: -1, max: 1 },
+});
 ```
 
 ### Chunked API Methods
 
 | Method | Description |
 |---|---|
+| `setDataChunks(chunks, options)` | Uploads sequential row-major chunks and optionally skips CPU-side retention. |
 | `beginData({ rows, cols })` | Allocates GPU buffers for the full matrix. Must be called before `appendChunk`. |
 | `appendChunk(data, startRow)` | Uploads a slice of rows. `data` must contain exactly `actualRows × cols` elements. `startRow` is zero-based. |
 | `endData()` | Finalizes the upload: auto-detects range, rebuilds the render pipeline, and draws the first frame. |
@@ -90,7 +98,7 @@ try {
 
 ## Auto Range Detection
 
-Both `setData()` and `endData()` automatically scan the uploaded data to find its min and max, then set the colormap range accordingly. You can override this at any time:
+`setData()`, `endData()`, and `setDataChunks()` automatically scan the uploaded data to find its min and max unless a fixed range is supplied. Explicit ranges are faster for large data:
 
 ```ts
 viewer.setData(data, { rows, cols });
@@ -98,12 +106,13 @@ viewer.setRange(-1.0, 1.0); // override auto-detected range
 ```
 
 ::: warning Waterfall requirement
-`setDataScrolled()` (waterfall streaming) does **not** auto-detect the range. You must call `setRange()` before the first `setDataScrolled()` call, or it will fall back to a full `setData()`. See [Streaming: Waterfall](/guide/streaming-waterfall) for details.
+`setDataScrolled()` (waterfall streaming) does **not** auto-detect the range. You must call `setRange()` before the first `setDataScrolled()` call, or it will throw. See [Streaming: Waterfall](/guide/streaming-waterfall) for details.
 :::
 
 ## See Also
 
 - [API: setData()](/api/leibniz-fast#setdata)
+- [API: setDataChunks()](/api/leibniz-fast#setdatachunks)
 - [API: DataOptions](/api/types#dataoptions)
 - [API: beginData()](/api/leibniz-fast#begindata) / [appendChunk()](/api/leibniz-fast#appendchunk) / [endData()](/api/leibniz-fast#enddata)
 - [API: abortData()](/api/leibniz-fast#abortdata)

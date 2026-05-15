@@ -1,8 +1,7 @@
 //! # Pipeline Factory
 //!
 //! Centralizes creation of wgpu compute and render pipelines, bind group layouts,
-//! and bind groups. Keeps the Renderer clean and allows future swapping of
-//! pipeline configurations (e.g., WebGL2 fallback).
+//! and bind groups. Keeps the Renderer clean.
 //!
 //! Tiling support: for matrices larger than `maxTextureDimension2D`, we create
 //! multiple smaller textures (tiles) and render each as a separate quad.
@@ -30,30 +29,8 @@ impl<'a> PipelineFactory<'a> {
         Self { device, debug }
     }
 
-    /// Create a single tile texture with the given dimensions.
-    ///
-    /// When `needs_storage` is true (WebGPU compute path), creates an R32Float
-    /// texture with STORAGE_BINDING for the compute shader to write raw floats.
-    /// When false (WebGL2 fallback), creates an Rgba8Unorm texture with COPY_DST
-    /// for CPU-side colormap upload.
-    fn create_tile_texture(
-        &self,
-        width: u32,
-        height: u32,
-        needs_storage: bool,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let (format, usage) = if needs_storage {
-            (
-                wgpu::TextureFormat::R32Float,
-                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            )
-        } else {
-            (
-                wgpu::TextureFormat::Rgba8Unorm,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            )
-        };
-
+    /// Create a single WebGPU tile texture with the given dimensions.
+    fn create_tile_texture(&self, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Matrix Data Texture"),
             size: wgpu::Extent3d {
@@ -64,8 +41,8 @@ impl<'a> PipelineFactory<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format,
-            usage,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -78,7 +55,6 @@ impl<'a> PipelineFactory<'a> {
     pub fn create_tiled_textures(
         &self,
         tile_grid: &TileGrid,
-        needs_storage: bool,
     ) -> Vec<(wgpu::Texture, wgpu::TextureView)> {
         let _timer = PerfTimer::new("create_tiled_textures", self.debug);
         tile_grid
@@ -86,7 +62,7 @@ impl<'a> PipelineFactory<'a> {
             .map(|(tx, ty)| {
                 let w = tile_grid.tile_width(tx);
                 let h = tile_grid.tile_height(ty);
-                self.create_tile_texture(w, h, needs_storage)
+                self.create_tile_texture(w, h)
             })
             .collect()
     }

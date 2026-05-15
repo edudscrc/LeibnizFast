@@ -8,6 +8,26 @@ import { LeibnizFast } from 'leibniz-fast';
 
 ---
 
+## checkSupport()
+
+```ts
+static async checkSupport(): Promise<WebGpuSupport>
+```
+
+Checks whether the current page can create a WebGPU adapter and device. Use this before `create()` when you want to show a friendly troubleshooting message.
+
+**Returns:** [`WebGpuSupport`](/api/types#webgpusupport)
+
+```ts
+const support = await LeibnizFast.checkSupport();
+if (!support.supported) {
+  showError(support.reason);
+  return;
+}
+```
+
+---
+
 ## create()
 
 ```ts
@@ -28,7 +48,7 @@ On the first call, the WASM module is fetched, compiled, and cached. Subsequent 
 
 **Returns:** `Promise<LeibnizFast>`
 
-**Throws** if neither WebGPU nor WebGL2 is available in the current browser.
+**Throws** if WebGPU is unavailable, adapter creation fails, or device creation fails.
 
 ```ts
 const viewer = await LeibnizFast.create(canvas, {
@@ -72,7 +92,7 @@ Efficient waterfall update: only the `newCols` newest columns are colorized on t
 Data must be in **column-major order**: element at row `r`, column `c` is at `data[c * rows + r]`.
 
 ::: warning
-`setRange()` must be called before the first `setDataScrolled()`. Without a range, this method falls back to a full `setData()`.
+`setRange()` must be called before the first `setDataScrolled()`. Without a fixed range, this method throws instead of falling back to a full upload.
 :::
 
 | Parameter | Type | Description |
@@ -84,13 +104,42 @@ See [Guide: Streaming: Waterfall](/guide/streaming-waterfall) for the complete r
 
 ---
 
+## setDataChunks()
+
+```ts
+setDataChunks(
+  chunks: Iterable<DataChunk> | AsyncIterable<DataChunk>,
+  options: ChunkedDataOptions
+): Promise<void>
+```
+
+Uploads a matrix as sequential row-major chunks. This avoids requiring one giant JavaScript `Float32Array` and can avoid retaining CPU-side values.
+
+With `retainData: false`, hover callbacks still include coordinates but `valueAvailable` is `false` and `value` is `NaN`.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `chunks` | `Iterable<DataChunk> \| AsyncIterable<DataChunk>` | Sequential row-major chunks |
+| `options` | [`ChunkedDataOptions`](/api/types#chunkeddataoptions) | Matrix dimensions, optional fixed range, optional hover-data retention |
+
+```ts
+await viewer.setDataChunks(chunks(), {
+  rows,
+  cols,
+  retainData: false,
+  range: { min: -1, max: 1 },
+});
+```
+
+---
+
 ## setColormap()
 
 ```ts
 setColormap(name: ColormapName): void
 ```
 
-Changes the colormap used to render data values. Takes effect on the next render call. No data reload is needed.
+Changes the colormap used to render data values and the chart colorbar. Takes effect on the next render call. No data reload is needed.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -108,7 +157,7 @@ viewer.setColormap('plasma');
 setRange(min: number, max: number): void
 ```
 
-Sets the data range for colormap mapping. Values at or below `min` render as the first colormap color; values at or above `max` render as the last.
+Sets the data range for colormap mapping and colorbar ticks. Values at or below `min` render as the first colormap color; values at or above `max` render as the last.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -153,9 +202,11 @@ viewer.onHover((info) => {
 beginData(options: StreamingDataOptions): void
 ```
 
-Begins a chunked matrix upload. Allocates GPU staging buffers for the specified dimensions. Must be followed by one or more [`appendChunk()`](#appendchunk) calls, then [`endData()`](#enddata).
+Begins a chunked matrix upload that retains CPU-side data for hover values. Allocates GPU staging buffers for the specified dimensions. Must be followed by one or more [`appendChunk()`](#appendchunk) calls, then [`endData()`](#enddata).
 
 Use [`beginUpdate()`](#beginupdate) instead of `beginData()` in real-time streaming loops where dimensions stay constant — it reuses the existing staging buffer.
+
+Use [`setDataChunks()`](#setdatachunks) for no-retention uploads with `retainData: false`.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -209,7 +260,7 @@ Appends a block of rows to an in-progress upload started by [`beginData()`](#beg
 endData(): void
 ```
 
-Finalizes a chunked upload: auto-detects the data range, rebuilds render pipelines, and renders the first frame. Must be called after all [`appendChunk()`](#appendchunk) calls.
+Finalizes a retained streaming upload: auto-detects the data range unless a fixed range was set, updates GPU textures, and renders the first frame. Must be called after all [`appendChunk()`](#appendchunk) calls.
 
 ---
 
@@ -249,7 +300,7 @@ requestAnimationFrame(renderLoop);
 setChart(config: ChartConfig | null): void
 ```
 
-Updates the chart configuration (axes, title, fonts, colors). Creates the 2D overlay if it does not exist yet. Passing `null` removes the overlay entirely and reverts to raw matrix mode.
+Updates the chart configuration (axes, colorbar, title, fonts, colors). Creates the 2D overlay if it does not exist yet. Passing `null` removes the overlay entirely and reverts to raw matrix mode.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -293,6 +344,8 @@ getMaxMatrixElements(): number
 ```
 
 Returns the maximum number of `Float32` elements (`rows × cols`) that fit in a single GPU buffer on this device. Typical values: 64 M–256 M on integrated GPUs, 256 M–1 B on discrete GPUs.
+
+For large matrices, prefer [`setDataChunks()`](#setdatachunks); matrix size is then limited by tiled GPU texture memory and per-row staging constraints, not by a single full-matrix buffer.
 
 **Returns:** `number`
 

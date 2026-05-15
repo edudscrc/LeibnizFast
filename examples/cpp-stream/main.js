@@ -28,38 +28,39 @@
 import { LeibnizFast } from '../../dist/index.js';
 
 // ---- DOM refs ------------------------------------------------------------
-const canvas         = document.getElementById('canvas');
+const canvas = document.getElementById('canvas');
 const colormapSelect = document.getElementById('colormap');
-const sizeSelect     = document.getElementById('size');
-const rangeMinInput  = document.getElementById('range-min');
-const rangeMaxInput  = document.getElementById('range-max');
-const debugCheckbox  = document.getElementById('debug');
-const statusBadge    = document.getElementById('status-badge');
-const statusText     = document.getElementById('status-text');
-const fpsCounter     = document.getElementById('fps-counter');
-const dataRateEl     = document.getElementById('data-rate');
-const tooltip        = document.getElementById('tooltip');
-const errorBanner    = document.getElementById('error-banner');
+const sizeSelect = document.getElementById('size');
+const rangeMinInput = document.getElementById('range-min');
+const rangeMaxInput = document.getElementById('range-max');
+const debugCheckbox = document.getElementById('debug');
+const statusBadge = document.getElementById('status-badge');
+const statusText = document.getElementById('status-text');
+const fpsCounter = document.getElementById('fps-counter');
+const dataRateEl = document.getElementById('data-rate');
+const tooltip = document.getElementById('tooltip');
+const errorBanner = document.getElementById('error-banner');
 
 // Axis config inputs
-const xLabelInput    = document.getElementById('x-label');
-const xUnitInput     = document.getElementById('x-unit');
-const xMinInput      = document.getElementById('x-min');
-const xMaxInput      = document.getElementById('x-max');
-const yLabelInput    = document.getElementById('y-label');
-const yUnitInput     = document.getElementById('y-unit');
-const yMinInput      = document.getElementById('y-min');
-const yMaxInput      = document.getElementById('y-max');
+const xLabelInput = document.getElementById('x-label');
+const xUnitInput = document.getElementById('x-unit');
+const xMinInput = document.getElementById('x-min');
+const xMaxInput = document.getElementById('x-max');
+const yLabelInput = document.getElementById('y-label');
+const yUnitInput = document.getElementById('y-unit');
+const yMinInput = document.getElementById('y-min');
+const yMaxInput = document.getElementById('y-max');
 const valueUnitInput = document.getElementById('value-unit');
 
 // ---- Constants -----------------------------------------------------------
 
-const CHUNK_MAGIC        = 0x4C465A01;
-const CHUNK_HEADER_BYTES = 32;  // 8 x uint32
+const CHUNK_MAGIC = 0x4c465a01;
+const CHUNK_HEADER_BYTES = 32; // 8 x uint32
 
-const WS_URL       = 'ws://localhost:8765';
+const WS_URL = 'ws://localhost:8765';
 const RECONNECT_MS = 2000;
-const FPS_WINDOW   = 10;
+const FPS_WINDOW = 10;
+const FIRST_FRAME_TIMEOUT_MS = 5000;
 
 // ---- State ---------------------------------------------------------------
 /** @type {LeibnizFast|null} */
@@ -68,6 +69,10 @@ let viewer = null;
 let ws = null;
 let reconnectTimer = null;
 let debugEnabled = debugCheckbox.checked;
+let firstFrameTimer = null;
+let receivedFrame = false;
+let requestedSize = parseInt(sizeSelect.value);
+let resizePending = false;
 
 // FPS tracking
 const frameTimes = [];
@@ -103,6 +108,75 @@ function showError(msg) {
   }, 6000);
 }
 
+function clearFirstFrameTimer() {
+  if (firstFrameTimer !== null) {
+    clearTimeout(firstFrameTimer);
+    firstFrameTimer = null;
+  }
+}
+
+function startFirstFrameTimer() {
+  clearFirstFrameTimer();
+  receivedFrame = false;
+  firstFrameTimer = setTimeout(() => {
+    if (!receivedFrame) {
+      showError(
+        'Connected to the WebSocket bridge, but no CUDA frames arrived. ' +
+          'The cpp-stream generator may have exited; check the terminal for CUDA-capable GPU or driver errors.',
+      );
+    }
+  }, FIRST_FRAME_TIMEOUT_MS);
+}
+
+/**
+ * Reset all frame assembly/render state so a resized stream starts cleanly.
+ * @param {{ clearBuffers?: boolean, resetStats?: boolean, clearTimer?: boolean }} [options]
+ */
+function resetFrameState({
+  clearBuffers = true,
+  resetStats = true,
+  clearTimer = true,
+} = {}) {
+  dirty = false;
+  accumFrameId = null;
+  accumReceived = 0;
+  accumTotalChunks = 0;
+
+  if (clearBuffers) {
+    frameBuffer = null;
+    frameBufferRows = 0;
+    frameBufferCols = 0;
+  }
+
+  if (resetStats) {
+    frameTimes.length = 0;
+    fpsCounter.textContent = '-- FPS';
+    bytesThisSecond = 0;
+    lastRateUpdate = performance.now();
+    dataRateEl.textContent = '-- MB/s';
+  }
+
+  if (clearTimer) {
+    clearFirstFrameTimer();
+    receivedFrame = false;
+  }
+}
+
+/**
+ * Request a generator resize and prepare to ignore stale in-flight frames.
+ * @param {number} size
+ */
+function requestResize(size) {
+  requestedSize = size;
+  resizePending = true;
+  resetFrameState();
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    startFirstFrameTimer();
+    sendResize(size);
+  }
+}
+
 /**
  * Update the connection status badge.
  * @param {'connecting'|'connected'|'disconnected'} state
@@ -110,9 +184,11 @@ function showError(msg) {
 function setStatus(state) {
   statusBadge.className = `status-badge ${state}`;
   statusText.textContent =
-    state === 'connecting'   ? 'Connecting\u2026' :
-    state === 'connected'    ? 'Connected'         :
-                               'Disconnected';
+    state === 'connecting'
+      ? 'Connecting\u2026'
+      : state === 'connected'
+        ? 'Connected'
+        : 'Disconnected';
 }
 
 /**
@@ -137,7 +213,7 @@ function updateDataRate(bytes) {
   const now = performance.now();
   const elapsed = now - lastRateUpdate;
   if (elapsed >= 1000) {
-    const mbps = (bytesThisSecond / elapsed) * 1000 / 1e6;
+    const mbps = ((bytesThisSecond / elapsed) * 1000) / 1e6;
     dataRateEl.textContent = `${mbps.toFixed(1)} MB/s`;
     bytesThisSecond = 0;
     lastRateUpdate = now;
@@ -161,7 +237,7 @@ function applyRange() {
  */
 function buildChartConfig() {
   return {
-    title: 'C++ Wave Simulation',
+    title: 'CUDA C++ Wave Simulation',
     xAxis: {
       label: xLabelInput.value || undefined,
       unit: xUnitInput.value || undefined,
@@ -192,7 +268,7 @@ function buildChartConfig() {
 function parseChunkHeader(buf) {
   if (buf.byteLength < CHUNK_HEADER_BYTES) return null;
 
-  const view  = new DataView(buf);
+  const view = new DataView(buf);
   const magic = view.getUint32(0, true);
 
   if (magic !== CHUNK_MAGIC) {
@@ -200,23 +276,31 @@ function parseChunkHeader(buf) {
     return null;
   }
 
-  const totalRows   = view.getUint32(4,  true);
-  const cols        = view.getUint32(8,  true);
-  const frameId     = view.getUint32(12, true);
-  const chunkIndex  = view.getUint32(16, true);
+  const totalRows = view.getUint32(4, true);
+  const cols = view.getUint32(8, true);
+  const frameId = view.getUint32(12, true);
+  const chunkIndex = view.getUint32(16, true);
   const totalChunks = view.getUint32(20, true);
-  const rowStart    = view.getUint32(24, true);
-  const chunkRows   = view.getUint32(28, true);
+  const rowStart = view.getUint32(24, true);
+  const chunkRows = view.getUint32(28, true);
 
   const expectedBytes = CHUNK_HEADER_BYTES + chunkRows * cols * 4;
   if (buf.byteLength < expectedBytes) {
     console.warn(
       `[cpp-stream] Chunk too short: ${buf.byteLength} bytes, ` +
-      `expected ${expectedBytes} (chunkRows=${chunkRows} cols=${cols})`,
+        `expected ${expectedBytes} (chunkRows=${chunkRows} cols=${cols})`,
     );
     return null;
   }
-  return { totalRows, cols, frameId, chunkIndex, totalChunks, rowStart, chunkRows };
+  return {
+    totalRows,
+    cols,
+    frameId,
+    chunkIndex,
+    totalChunks,
+    rowStart,
+    chunkRows,
+  };
 }
 
 // ---- Frame processing (network -> buffer, decoupled from render) ---------
@@ -234,9 +318,27 @@ function processFrame(buf) {
   const h = parseChunkHeader(buf);
   if (!h) return;
 
+  if (resizePending) {
+    if (h.totalRows !== requestedSize || h.cols !== requestedSize) {
+      return;
+    }
+    resizePending = false;
+    accumFrameId = null;
+  }
+
+  if (
+    frameBufferRows !== 0 &&
+    (h.totalRows !== frameBufferRows || h.cols !== frameBufferCols)
+  ) {
+    resetFrameState({ clearTimer: false });
+  }
+
   // Frame dropping: if a newer frame starts while accumulating, discard the old one.
   if (accumFrameId !== null && h.frameId > accumFrameId) {
-    if (debugEnabled) console.log(`[v1] dropping incomplete frame ${accumFrameId} for ${h.frameId}`);
+    if (debugEnabled)
+      console.log(
+        `[v1] dropping incomplete frame ${accumFrameId} for ${h.frameId}`,
+      );
     accumFrameId = null;
   }
 
@@ -245,7 +347,11 @@ function processFrame(buf) {
 
   // Start accumulating a new frame
   if (accumFrameId === null || h.frameId !== accumFrameId) {
-    if (!frameBuffer || frameBufferRows !== h.totalRows || frameBufferCols !== h.cols) {
+    if (
+      !frameBuffer ||
+      frameBufferRows !== h.totalRows ||
+      frameBufferCols !== h.cols
+    ) {
       frameBuffer = new Float32Array(h.totalRows * h.cols);
       frameBufferRows = h.totalRows;
       frameBufferCols = h.cols;
@@ -256,13 +362,19 @@ function processFrame(buf) {
   }
 
   // Copy chunk into the reusable frame buffer
-  const chunkData = new Float32Array(buf, CHUNK_HEADER_BYTES, h.chunkRows * h.cols);
+  const chunkData = new Float32Array(
+    buf,
+    CHUNK_HEADER_BYTES,
+    h.chunkRows * h.cols,
+  );
   frameBuffer.set(chunkData, h.rowStart * h.cols);
   accumReceived++;
 
   if (accumReceived === accumTotalChunks) {
     // Full frame ready — mark dirty for the rAF loop
     dirty = true;
+    receivedFrame = true;
+    clearFirstFrameTimer();
     accumFrameId = null;
   }
 
@@ -275,10 +387,18 @@ function renderLoop() {
   if (dirty && viewer && frameBuffer) {
     if (debugEnabled) {
       const t0 = performance.now();
-      viewer.setData(frameBuffer, { rows: frameBufferRows, cols: frameBufferCols });
-      console.log(`[perf] setData (${frameBufferRows}x${frameBufferCols}): ${(performance.now() - t0).toFixed(2)}ms`);
+      viewer.setData(frameBuffer, {
+        rows: frameBufferRows,
+        cols: frameBufferCols,
+      });
+      console.log(
+        `[perf] setData (${frameBufferRows}x${frameBufferCols}): ${(performance.now() - t0).toFixed(2)}ms`,
+      );
     } else {
-      viewer.setData(frameBuffer, { rows: frameBufferRows, cols: frameBufferCols });
+      viewer.setData(frameBuffer, {
+        rows: frameBufferRows,
+        cols: frameBufferCols,
+      });
     }
     dirty = false;
     updateFps();
@@ -308,14 +428,8 @@ function connect() {
 
   ws.addEventListener('open', () => {
     setStatus('connected');
-    frameTimes.length = 0;
-    fpsCounter.textContent = '-- FPS';
-    bytesThisSecond = 0;
-    lastRateUpdate = performance.now();
-    dataRateEl.textContent = '-- MB/s';
-    accumFrameId = null;
     // Sync the size selector with the generator on reconnect
-    sendResize(parseInt(sizeSelect.value));
+    requestResize(parseInt(sizeSelect.value));
   });
 
   ws.addEventListener('message', (e) => {
@@ -328,6 +442,7 @@ function connect() {
 
   ws.addEventListener('close', () => {
     ws = null;
+    clearFirstFrameTimer();
     setStatus('disconnected');
     scheduleReconnect();
   });
@@ -352,11 +467,22 @@ function sendResize(size) {
 // ---- Main ----------------------------------------------------------------
 
 async function main() {
-  viewer = await LeibnizFast.create(canvas, {
-    colormap: colormapSelect.value,
-    debug: debugEnabled,
-    chart: buildChartConfig(),
-  });
+  const support = await LeibnizFast.checkSupport();
+  if (!support.supported) {
+    showError(support.reason || 'WebGPU is required for LeibnizFast.');
+    return;
+  }
+
+  try {
+    viewer = await LeibnizFast.create(canvas, {
+      colormap: colormapSelect.value,
+      debug: debugEnabled,
+      chart: buildChartConfig(),
+    });
+  } catch (err) {
+    showError(`Failed to initialize LeibnizFast: ${err}`);
+    return;
+  }
 
   applyRange();
 
@@ -366,15 +492,18 @@ async function main() {
   // ---- Hover tooltip -----------------------------------------------------
   viewer.onHover((info) => {
     tooltip.style.display = 'block';
+    const valueText = info.valueAvailable
+      ? info.value.toFixed(4)
+      : 'unavailable';
     tooltip.innerHTML =
       `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
       `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
-      `Value: ${info.value.toFixed(4)}${info.valueUnit ? ' ' + info.valueUnit : ''}`;
+      `Value: ${valueText}${info.valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
   });
 
   canvas.addEventListener('mousemove', (e) => {
     tooltip.style.left = `${e.clientX + 12}px`;
-    tooltip.style.top  = `${e.clientY + 12}px`;
+    tooltip.style.top = `${e.clientY + 12}px`;
   });
 
   canvas.addEventListener('mouseleave', () => {
@@ -388,8 +517,7 @@ async function main() {
   });
 
   sizeSelect.addEventListener('change', () => {
-    accumFrameId = null;
-    sendResize(parseInt(sizeSelect.value));
+    requestResize(parseInt(sizeSelect.value));
   });
 
   rangeMinInput.addEventListener('input', applyRange);

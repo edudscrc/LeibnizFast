@@ -11,16 +11,12 @@ use crate::colormap_data;
 #[cfg(target_arch = "wasm32")]
 const COLORMAP_SIZE: u32 = 256;
 
-/// Maximum valid colormap LUT index (0-based).
-const COLORMAP_MAX_INDEX: usize = 255;
-
-/// Float version of `COLORMAP_MAX_INDEX` for normalisation arithmetic.
-const COLORMAP_MAX_INDEX_F32: f32 = 255.0;
-
 /// Number of bytes per pixel in an RGBA image.
+#[cfg(target_arch = "wasm32")]
 const RGBA_CHANNELS: usize = 4;
 
 /// Fully opaque alpha channel value.
+#[cfg(target_arch = "wasm32")]
 const RGBA_ALPHA_OPAQUE: u8 = 255;
 
 /// Trait for colormap data resolution — allows testing without GPU.
@@ -48,58 +44,10 @@ impl ColormapProvider for BuiltinColormaps {
     }
 }
 
-/// Apply a colormap to matrix data on the CPU, producing RGBA bytes.
-///
-/// This is the WebGL2 fallback when compute shaders are unavailable.
-/// Each value is normalized to [0,1] using (min,max), then looked up in the LUT.
-pub fn apply_colormap_cpu(
-    data: &[f32],
-    min_val: f32,
-    max_val: f32,
-    lut: &[[u8; 3]; 256],
-) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(data.len() * RGBA_CHANNELS);
-    apply_colormap_cpu_into(data, min_val, max_val, lut, &mut rgba);
-    rgba
-}
-
-/// Apply a colormap to matrix data on the CPU, writing into a reusable buffer.
-///
-/// Like `apply_colormap_cpu` but writes into `output` instead of allocating.
-/// The buffer is cleared and refilled, reusing its existing heap allocation.
-pub fn apply_colormap_cpu_into(
-    data: &[f32],
-    min_val: f32,
-    max_val: f32,
-    lut: &[[u8; 3]; 256],
-    output: &mut Vec<u8>,
-) {
-    let range = max_val - min_val;
-    output.clear();
-    output.reserve(data.len() * RGBA_CHANNELS);
-
-    for &value in data {
-        let normalized = if range > 0.0 {
-            ((value - min_val) / range).clamp(0.0, 1.0)
-        } else {
-            0.5
-        };
-
-        // Map to LUT index [0, COLORMAP_MAX_INDEX]
-        let idx = (normalized * COLORMAP_MAX_INDEX_F32).round() as usize;
-        let idx = idx.min(COLORMAP_MAX_INDEX);
-        let rgb = lut[idx];
-        output.push(rgb[0]);
-        output.push(rgb[1]);
-        output.push(rgb[2]);
-        output.push(RGBA_ALPHA_OPAQUE);
-    }
-}
-
 /// GPU texture + sampler for a colormap lookup table.
 ///
-/// The colormap is stored as a 256x1 RGBA texture. The compute shader
-/// samples this texture with the normalized data value to get the color.
+/// The colormap is stored as a 256x1 RGBA texture. The render shader samples
+/// this texture with the normalized data value to get the final color.
 ///
 /// Only available when compiling for WASM target.
 #[cfg(target_arch = "wasm32")]
@@ -270,91 +218,5 @@ mod tests {
         assert_eq!(names.len(), 6);
         assert!(names.contains(&"viridis"));
         assert!(names.contains(&"grayscale"));
-    }
-
-    // -----------------------------------------------------------------------
-    // apply_colormap_cpu tests
-    // -----------------------------------------------------------------------
-
-    fn grayscale_lut() -> &'static [[u8; 3]; COLORMAP_MAX_INDEX + 1] {
-        BuiltinColormaps
-            .get_colormap_rgb("grayscale")
-            .expect("grayscale must exist")
-    }
-
-    #[test]
-    fn test_apply_colormap_cpu_basic() {
-        let lut = grayscale_lut();
-        let data = vec![0.0, 0.5, 1.0];
-        let rgba = apply_colormap_cpu(&data, 0.0, 1.0, lut);
-
-        // 3 pixels × 4 channels
-        assert_eq!(rgba.len(), 12);
-
-        // First pixel: value=0 → index 0 → (0,0,0,255)
-        assert_eq!(rgba[0], 0);
-        assert_eq!(rgba[3], RGBA_ALPHA_OPAQUE);
-
-        // Last pixel: value=1 → index 255 → (255,255,255,255)
-        assert_eq!(rgba[8], RGBA_ALPHA_OPAQUE);
-        assert_eq!(rgba[11], RGBA_ALPHA_OPAQUE);
-    }
-
-    #[test]
-    fn test_apply_colormap_cpu_empty_data() {
-        let lut = grayscale_lut();
-        let rgba = apply_colormap_cpu(&[], 0.0, 1.0, lut);
-        assert!(rgba.is_empty());
-    }
-
-    #[test]
-    fn test_apply_colormap_cpu_zero_range() {
-        let lut = grayscale_lut();
-        let data = vec![5.0, 5.0, 5.0];
-        let rgba = apply_colormap_cpu(&data, 5.0, 5.0, lut);
-
-        // Zero range → normalized = 0.5 → index 128
-        assert_eq!(rgba.len(), 12);
-        assert_eq!(rgba[0], 128); // R
-        assert_eq!(rgba[1], 128); // G
-        assert_eq!(rgba[2], 128); // B
-        assert_eq!(rgba[3], RGBA_ALPHA_OPAQUE);
-    }
-
-    #[test]
-    fn test_apply_colormap_cpu_values_outside_range() {
-        let lut = grayscale_lut();
-        let data = vec![-10.0, 100.0];
-        let rgba = apply_colormap_cpu(&data, 0.0, 1.0, lut);
-
-        // Below min → clamped to 0 → index 0 → (0,0,0)
-        assert_eq!(rgba[0], 0);
-        // Above max → clamped to 1 → index 255 → (255,255,255)
-        assert_eq!(rgba[4], RGBA_ALPHA_OPAQUE);
-    }
-
-    #[test]
-    fn test_apply_colormap_cpu_nan_values() {
-        let lut = grayscale_lut();
-        let data = vec![f32::NAN];
-        let rgba = apply_colormap_cpu(&data, 0.0, 1.0, lut);
-
-        // NaN normalisation → clamp(NaN, 0, 1) → 0 → index 0
-        assert_eq!(rgba.len(), 4);
-        assert_eq!(rgba[3], RGBA_ALPHA_OPAQUE);
-    }
-
-    #[test]
-    fn test_apply_colormap_cpu_single_element() {
-        let lut = grayscale_lut();
-        let data = vec![0.5];
-        let rgba = apply_colormap_cpu(&data, 0.0, 1.0, lut);
-
-        // 0.5 → index 128 → grayscale (128, 128, 128)
-        assert_eq!(rgba.len(), 4);
-        assert_eq!(rgba[0], 128);
-        assert_eq!(rgba[1], 128);
-        assert_eq!(rgba[2], 128);
-        assert_eq!(rgba[3], RGBA_ALPHA_OPAQUE);
     }
 }

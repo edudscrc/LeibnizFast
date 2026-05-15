@@ -21,7 +21,7 @@ viewer.setDataScrolled(buffer.data, {
 ```
 
 ::: warning setRange() is required
-`setDataScrolled()` does not auto-detect the data range. If no range has been set, it falls back to a full `setData()`. Always call `viewer.setRange(min, max)` before starting the waterfall loop.
+`setDataScrolled()` does not auto-detect the data range. If no range has been set, it throws instead of falling back to a full upload. Always call `viewer.setRange(min, max)` before starting the waterfall loop.
 :::
 
 ## The Ring Buffer Pattern

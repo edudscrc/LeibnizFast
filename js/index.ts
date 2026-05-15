@@ -20,14 +20,17 @@ import type { LeibnizFast as WasmLeibnizFast } from '../pkg/leibniz_fast';
 import type {
   AxisConfig,
   ChartConfig,
+  ChunkedDataOptions,
   ColormapName,
   CreateOptions,
+  DataChunk,
   DataOptions,
   HoverCallback,
   HoverInfo,
   ScrolledDataOptions,
   StreamingAxisConfig,
   StreamingDataOptions,
+  WebGpuSupport,
 } from './types';
 import {
   computeLayout,
@@ -37,7 +40,7 @@ import {
   renderOverlay,
   uvToVisibleRange,
 } from './axes';
-import type { LayoutRect, VisibleRange } from './axes';
+import type { ColorbarData, LayoutRect, VisibleRange } from './axes';
 
 // ---------------------------------------------------------------------------
 // Interaction types
@@ -75,18 +78,89 @@ const ANIMATION_DURATION_MS = 300;
 export type {
   AxisConfig,
   ChartConfig,
+  ChunkedDataOptions,
   ColormapName,
   CreateOptions,
+  DataChunk,
   DataOptions,
   HoverCallback,
   HoverInfo,
   ScrolledDataOptions,
   StreamingAxisConfig,
   StreamingDataOptions,
+  WebGpuSupport,
 };
 
 /** Cached WASM module — initialized once on first `create()` call. */
 let wasmModule: typeof import('../pkg/leibniz_fast') | null = null;
+
+const WEBGPU_REQUIRED_MESSAGE =
+  'LeibnizFast requires WebGPU. Use a WebGPU-capable browser, enable hardware acceleration, and serve the page from HTTPS or localhost. No CPU/WebGL fallback is available.';
+
+type WebGpuDeviceLike = {
+  destroy?: () => void;
+};
+
+type WebGpuAdapterLike = {
+  requestDevice: () => Promise<WebGpuDeviceLike>;
+  info?: unknown;
+};
+
+type WebGpuNavigatorLike = Navigator & {
+  gpu?: {
+    requestAdapter: (
+      options?: Record<string, unknown>,
+    ) => Promise<WebGpuAdapterLike | null>;
+  };
+};
+
+type WasmLeibnizFastInner = WasmLeibnizFast & {
+  getColorRange(): Float32Array;
+  getColormapLut(): Uint8Array;
+};
+
+function normalizeAdapterInfo(
+  info: unknown,
+): Record<string, string | number | boolean> | undefined {
+  if (!info || typeof info !== 'object') return undefined;
+  const result: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(info as Record<string, unknown>)) {
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      result[key] = value;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function assertValidRange(range: { min: number; max: number }): void {
+  if (
+    !Number.isFinite(range.min) ||
+    !Number.isFinite(range.max) ||
+    range.max <= range.min
+  ) {
+    throw new Error(
+      'Range must contain finite values with max greater than min.',
+    );
+  }
+}
+
+async function* toAsyncIterable<T>(
+  values: Iterable<T> | AsyncIterable<T>,
+): AsyncIterable<T> {
+  if (Symbol.asyncIterator in Object(values)) {
+    for await (const value of values as AsyncIterable<T>) {
+      yield value;
+    }
+    return;
+  }
+  for (const value of values as Iterable<T>) {
+    yield value;
+  }
+}
 
 /**
  * Initialize the WASM module if not already loaded.
@@ -151,7 +225,7 @@ export class LeibnizFast {
   private zoomAnimationId: number | null = null;
 
   // --- Chart overlay state ---
-  /** Chart configuration (axes, title, labels). Null when no chart mode. */
+  /** Chart configuration (axes, colorbar, title, labels). Null when no chart mode. */
   private chartConfig: ChartConfig | null = null;
   /** Wrapper div that contains both canvases. */
   private wrapperDiv: HTMLDivElement | null = null;
@@ -177,6 +251,8 @@ export class LeibnizFast {
   private dataColMajor: boolean = false;
   /** Ring cursor position for scrolled streaming data (0 when not streaming). */
   private ringCursor: number = 0;
+  /** Active colormap lookup table for the overlay colorbar. */
+  private colorbarLut: Uint8Array | null = null;
 
   private constructor(
     inner: WasmLeibnizFast,
@@ -187,6 +263,7 @@ export class LeibnizFast {
     this.inner = inner;
     this.canvas = canvas;
     this.debug = debug;
+    this.refreshColorbarLut();
 
     // Bind DOM event handlers (must happen before setupChartOverlay,
     // which calls removeEventListeners/registerEventListeners)
@@ -223,6 +300,73 @@ export class LeibnizFast {
   }
 
   /**
+   * Check whether this browser can create a WebGPU adapter and device.
+   *
+   * A library cannot enable browser flags for the user. This method only
+   * reports the current browser/page state so apps can show a friendly message.
+   */
+  static async checkSupport(): Promise<WebGpuSupport> {
+    if (typeof window !== 'undefined' && window.isSecureContext === false) {
+      return {
+        supported: false,
+        reason: `${WEBGPU_REQUIRED_MESSAGE} This page is not a secure context.`,
+      };
+    }
+
+    if (typeof navigator === 'undefined') {
+      return {
+        supported: false,
+        reason: `${WEBGPU_REQUIRED_MESSAGE} navigator is not available.`,
+      };
+    }
+
+    const nav = navigator as WebGpuNavigatorLike;
+    if (!nav.gpu) {
+      return {
+        supported: false,
+        reason: `${WEBGPU_REQUIRED_MESSAGE} navigator.gpu is not available.`,
+      };
+    }
+
+    let adapter: WebGpuAdapterLike | null = null;
+    try {
+      adapter = await nav.gpu.requestAdapter({
+        powerPreference: 'high-performance',
+      });
+    } catch (error) {
+      return {
+        supported: false,
+        reason: `${WEBGPU_REQUIRED_MESSAGE} Adapter request failed: ${String(error)}`,
+      };
+    }
+
+    if (!adapter) {
+      return {
+        supported: false,
+        reason: `${WEBGPU_REQUIRED_MESSAGE} No WebGPU adapter was returned.`,
+      };
+    }
+
+    let device: WebGpuDeviceLike | null = null;
+    try {
+      device = await adapter.requestDevice();
+    } catch (error) {
+      return {
+        supported: false,
+        reason: `${WEBGPU_REQUIRED_MESSAGE} Device creation failed: ${String(error)}`,
+        adapterInfo: normalizeAdapterInfo(adapter.info),
+      };
+    } finally {
+      device?.destroy?.();
+    }
+
+    return {
+      supported: true,
+      adapterInfo: normalizeAdapterInfo(adapter.info),
+    };
+  }
+
+  /**
    * Create a new LeibnizFast viewer attached to the given canvas.
    *
    * Initializes WASM (if needed) and the GPU context.
@@ -237,6 +381,10 @@ export class LeibnizFast {
   ): Promise<LeibnizFast> {
     const debug = options?.debug ?? false;
     const t0 = debug ? performance.now() : 0;
+    const support = await LeibnizFast.checkSupport();
+    if (!support.supported) {
+      throw new Error(support.reason ?? WEBGPU_REQUIRED_MESSAGE);
+    }
     const wasm = await ensureWasmLoaded();
     if (debug)
       console.log(
@@ -266,6 +414,37 @@ export class LeibnizFast {
     const result = fn();
     console.log(`[perf] ${label}: ${(performance.now() - t0).toFixed(2)}ms`);
     return result;
+  }
+
+  /** Refresh the cached colormap LUT used by the 2D overlay colorbar. */
+  private refreshColorbarLut(): void {
+    const lut = (this.inner as WasmLeibnizFastInner).getColormapLut();
+    this.colorbarLut = lut.length > 0 ? lut : null;
+  }
+
+  /** Build colorbar render data from the current WASM colormap range. */
+  private getColorbarData(): ColorbarData | null {
+    if (!this.chartConfig || this.chartConfig.colorbar === false) return null;
+    if (!this.colorbarLut) return null;
+
+    const range = (this.inner as WasmLeibnizFastInner).getColorRange();
+    if (range.length < 2) return null;
+
+    const min = range[0];
+    const max = range[1];
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+      return null;
+    }
+
+    const colorbar: ColorbarData = {
+      min,
+      max,
+      colors: this.colorbarLut,
+    };
+    if (this.chartConfig.valueUnit) {
+      colorbar.label = this.chartConfig.valueUnit;
+    }
+    return colorbar;
   }
 
   /**
@@ -302,7 +481,7 @@ export class LeibnizFast {
    * from O(rows × cols) to O(rows × newCols).
    *
    * **Requires `setRange()` to be called first.** Without a fixed range, this
-   * falls back to a full `setData`.
+   * throws instead of falling back to a full upload.
    *
    * @param data - Full Float32Array in row-major order (used for hover lookups)
    * @param options - Matrix dimensions and number of new columns
@@ -339,6 +518,8 @@ export class LeibnizFast {
    */
   setColormap(name: ColormapName): void {
     this.timeSync('JS setColormap', () => this.inner.setColormap(name));
+    this.refreshColorbarLut();
+    this.updateOverlay();
   }
 
   /**
@@ -351,7 +532,9 @@ export class LeibnizFast {
    * @param max - Maximum data value
    */
   setRange(min: number, max: number): void {
+    assertValidRange({ min, max });
     this.inner.setRange(min, max);
+    this.updateOverlay();
   }
 
   /**
@@ -366,10 +549,19 @@ export class LeibnizFast {
   onHover(callback: HoverCallback): void {
     this.hoverCallback = callback;
     // Register a thin WASM-side callback that enriches and forwards
-    this.inner.onHover((row: number, col: number, value: number) => {
-      if (!this.hoverCallback) return;
-      this.hoverCallback(this.buildHoverInfo(row, col, value));
-    });
+    this.inner.onHover(
+      (
+        row: number,
+        col: number,
+        value: number,
+        valueAvailable: boolean = true,
+      ) => {
+        if (!this.hoverCallback) return;
+        this.hoverCallback(
+          this.buildHoverInfo(row, col, value, valueAvailable),
+        );
+      },
+    );
   }
 
   /**
@@ -381,6 +573,14 @@ export class LeibnizFast {
    * @param options - Matrix dimensions (rows, cols)
    */
   beginData(options: StreamingDataOptions): void {
+    if (options.retainData === false) {
+      throw new Error(
+        'beginData() retains CPU-side data. Use setDataChunks(..., { retainData: false }) for no-retention uploads.',
+      );
+    }
+    if (options.range) {
+      this.setRange(options.range.min, options.range.max);
+    }
     this.matrixRows = options.rows;
     this.matrixCols = options.cols;
     this.timeSync('JS beginData', () =>
@@ -402,6 +602,14 @@ export class LeibnizFast {
    * @param options - Matrix dimensions (rows, cols)
    */
   beginUpdate(options: StreamingDataOptions): void {
+    if (options.retainData === false) {
+      throw new Error(
+        'beginUpdate() retains CPU-side data. Use setDataChunks(..., { retainData: false }) for no-retention uploads.',
+      );
+    }
+    if (options.range) {
+      this.setRange(options.range.min, options.range.max);
+    }
     this.timeSync('JS beginUpdate', () =>
       this.inner.beginUpdate(options.rows, options.cols),
     );
@@ -450,6 +658,68 @@ export class LeibnizFast {
   }
 
   /**
+   * Upload a matrix as sequential row-major chunks.
+   *
+   * This path avoids requiring one giant JavaScript Float32Array. By default,
+   * chunks are uploaded directly to GPU textures and CPU-side values are not
+   * retained, so hover callbacks report `valueAvailable: false`.
+   */
+  async setDataChunks(
+    chunks: Iterable<DataChunk> | AsyncIterable<DataChunk>,
+    options: ChunkedDataOptions,
+  ): Promise<void> {
+    if (options.range) {
+      assertValidRange(options.range);
+    }
+
+    const debug = this.debug;
+    const t0 = debug ? performance.now() : 0;
+    const retainData = options.retainData ?? false;
+    const rangeMin = options.range?.min;
+    const rangeMax = options.range?.max;
+
+    this.matrixRows = options.rows;
+    this.matrixCols = options.cols;
+    this.dataRef = null;
+    this.dataColMajor = false;
+    this.ringCursor = 0;
+
+    try {
+      this.inner.beginDataChunks(
+        options.rows,
+        options.cols,
+        retainData,
+        rangeMin,
+        rangeMax,
+      );
+
+      for await (const chunk of toAsyncIterable(chunks)) {
+        this.inner.appendDataChunk(chunk.data, chunk.startRow);
+      }
+
+      this.inner.endDataChunks();
+    } catch (error) {
+      this.inner.abortDataChunks();
+      throw error;
+    }
+
+    if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
+      this.streamingDisplayCols = options.cols;
+      if (options.xOffset !== undefined) {
+        this.streamingXOffset = options.xOffset;
+      }
+    }
+
+    if (debug) {
+      console.log(
+        `[perf] JS setDataChunks: ${(performance.now() - t0).toFixed(2)}ms`,
+      );
+    }
+    this.updateOverlay();
+    this.refreshHoverIfNeeded();
+  }
+
+  /**
    * Get the maximum number of matrix elements supported by this device.
    *
    * @returns Maximum number of f32 elements that fit in a single GPU buffer
@@ -471,7 +741,7 @@ export class LeibnizFast {
   }
 
   /**
-   * Update the chart configuration (axes, title, labels).
+   * Update the chart configuration (axes, colorbar, title, labels).
    *
    * If no chart overlay exists yet, it will be created. If called with
    * `null`, the overlay is removed and the viewer reverts to raw matrix mode.
@@ -1116,6 +1386,7 @@ export class LeibnizFast {
       containerW,
       containerH,
       dpr,
+      this.getColorbarData(),
     );
 
     // Draw interaction overlays on top of axes (inside the same DPR transform)
@@ -1221,8 +1492,13 @@ export class LeibnizFast {
    * Build a HoverInfo object from raw matrix indices and value.
    * Maps row/col to axis coordinates when a chart config is present.
    */
-  private buildHoverInfo(row: number, col: number, value: number): HoverInfo {
-    const info: HoverInfo = { row, col, value };
+  private buildHoverInfo(
+    row: number,
+    col: number,
+    value: number,
+    valueAvailable: boolean = true,
+  ): HoverInfo {
+    const info: HoverInfo = { row, col, value, valueAvailable };
     const cfg = this.chartConfig;
     if (!cfg) return info;
 
@@ -1251,7 +1527,7 @@ export class LeibnizFast {
    * Re-invoke the hover lookup at the last known mouse position.
    */
   private refreshHoverIfNeeded(): void {
-    if (!this.mouseInside || !this.hoverCallback || !this.dataRef) return;
+    if (!this.mouseInside || !this.hoverCallback) return;
 
     const rows = this.matrixRows;
     const cols = this.matrixCols;
@@ -1268,9 +1544,13 @@ export class LeibnizFast {
     const bufCol = (col + this.ringCursor) % cols;
 
     const data = this.dataRef;
+    if (!data) {
+      this.hoverCallback(this.buildHoverInfo(row, col, Number.NaN, false));
+      return;
+    }
     const idx = this.dataColMajor ? bufCol * rows + row : row * cols + bufCol;
     const value = data[idx];
 
-    this.hoverCallback(this.buildHoverInfo(row, col, value));
+    this.hoverCallback(this.buildHoverInfo(row, col, value, true));
   }
 }

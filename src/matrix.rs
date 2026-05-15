@@ -200,7 +200,7 @@ impl MatrixData {
     /// Get the value at (row, col). Returns `None` if out of bounds.
     pub fn get_value(&self, row: u32, col: u32) -> Option<f32> {
         if row < self.rows && col < self.cols {
-            let idx = (row * self.cols + col) as usize;
+            let idx = row.checked_mul(self.cols)?.checked_add(col)? as usize;
             self.data.get(idx)
         } else {
             None
@@ -396,18 +396,25 @@ impl MatrixView {
         use wgpu::util::DeviceExt;
         let _timer = PerfTimer::new("MatrixView::with_empty_buffer", debug);
 
-        if cols == 0 {
-            return Err("Cannot create staging buffer for 0-column matrix".to_string());
+        if rows == 0 || cols == 0 {
+            return Err("Cannot create staging buffer for an empty matrix".to_string());
         }
 
-        let data_size = (rows as u64) * (cols as u64) * 4;
+        let elements = (rows as u64)
+            .checked_mul(cols as u64)
+            .ok_or_else(|| "Matrix dimensions overflow".to_string())?;
+        let data_size = elements
+            .checked_mul(4)
+            .ok_or_else(|| "Matrix byte size overflow".to_string())?;
         let limits = device.limits();
         let budget = compute_staging_budget(
             limits.max_buffer_size,
             limits.max_storage_buffer_binding_size,
         );
 
-        let row_bytes = cols as u64 * 4;
+        let row_bytes = (cols as u64)
+            .checked_mul(4)
+            .ok_or_else(|| "Matrix row byte size overflow".to_string())?;
         let raw_rows = (budget / row_bytes).min(rows as u64);
         // Align down to 16 rows (compute shader workgroup alignment), but allow
         // fewer if the total matrix is < 16 rows
@@ -566,16 +573,21 @@ impl JsDataSource {
     ///
     /// Allocates `rows × cols` elements in JS heap. Use `write_range()` to fill
     /// data during streaming, and `update_min_max()` to track the running range.
-    pub fn from_empty(rows: u32, cols: u32) -> Self {
-        let total = rows * cols;
+    pub fn from_empty(rows: u32, cols: u32) -> Result<Self, String> {
+        if rows == 0 || cols == 0 {
+            return Err("Matrix dimensions must be greater than zero".to_string());
+        }
+        let total = rows
+            .checked_mul(cols)
+            .ok_or_else(|| "Matrix dimensions overflow".to_string())?;
         let data = js_sys::Float32Array::new_with_length(total);
-        Self {
+        Ok(Self {
             data,
             rows,
             cols,
             min_val: f32::INFINITY,
             max_val: f32::NEG_INFINITY,
-        }
+        })
     }
 
     /// Get the value at (row, col). Returns `None` if out of bounds.
@@ -584,7 +596,7 @@ impl JsDataSource {
     /// This crosses the JS/WASM boundary once — negligible for hover events.
     pub fn get_value(&self, row: u32, col: u32) -> Option<f32> {
         if row < self.rows && col < self.cols {
-            let idx = row * self.cols + col;
+            let idx = row.checked_mul(self.cols)?.checked_add(col)?;
             Some(self.data.get_index(idx))
         } else {
             None
@@ -596,7 +608,9 @@ impl JsDataSource {
     /// Uses `subarray().copy_to()` for efficient bulk transfer from JS heap
     /// to WASM memory. Used by colormap re-dispatch to fill staging buffers.
     pub fn read_range(&self, start: usize, buf: &mut [f32]) {
-        let end = start + buf.len();
+        let end = start
+            .checked_add(buf.len())
+            .expect("JsDataSource::read_range overflow");
         self.data.subarray(start as u32, end as u32).copy_to(buf);
     }
 

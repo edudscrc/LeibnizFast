@@ -93,11 +93,12 @@ function renderOverlay(
   visible: VisibleRange,
   containerWidth: number,
   containerHeight: number,
-  dpr: number
+  dpr: number,
+  colorbar?: ColorbarData | null
 ): void
 ```
 
-Renders the complete chart overlay — margin background, title, X axis, Y axis, tick marks, and tick labels — onto the provided 2D context.
+Renders the complete chart overlay — margin background, title, X axis, Y axis, colorbar, tick marks, and tick labels — onto the provided 2D context.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -108,6 +109,7 @@ Renders the complete chart overlay — margin background, title, X axis, Y axis,
 | `containerWidth` | `number` | Container width in CSS pixels |
 | `containerHeight` | `number` | Container height in CSS pixels |
 | `dpr` | `number` | Device pixel ratio (from `window.devicePixelRatio`) |
+| `colorbar` | [`ColorbarData`](#colorbardata) \| `null` | Optional active colorbar range and colormap data |
 
 ---
 
@@ -202,3 +204,16 @@ The data-space range currently visible after applying the camera's pan and zoom.
 | `xMax` | `number` | Rightmost visible X axis value |
 | `yMin` | `number` | Bottom-most visible Y axis value |
 | `yMax` | `number` | Top-most visible Y axis value |
+
+### ColorbarData
+
+```ts
+interface ColorbarData {
+  min: number;
+  max: number;
+  colors: Uint8Array;
+  label?: string;
+}
+```
+
+The active colorbar value range and packed RGB lookup table used by [`renderOverlay()`](#renderoverlay).
