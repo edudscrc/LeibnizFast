@@ -68,6 +68,8 @@ setData(data: Float32Array, options: DataOptions): void
 
 Uploads a complete matrix to the GPU, colormaps all cells, and renders the frame.
 
+Heatmap-only. For line charts use [`setLineData()`](#setlinedata).
+
 Data must be in **row-major order**: element at row `r`, column `c` is at `data[r * cols + c]`.
 
 After this call, the data range is auto-detected from the min/max of `data`. Override it with [`setRange()`](#setrange).
@@ -93,6 +95,63 @@ Data must be in **column-major order**: element at row `r`, column `c` is at `da
 
 ::: warning
 `setRange()` must be called before the first `setDataScrolled()`. Without a fixed range, this method throws instead of falling back to a full upload.
+
+Heatmap-only. For scrolling line charts use [`setLineDataScrolled()`](#setlinedatascrolled).
+
+---
+
+## setLineData()
+
+```ts
+setLineData(series: LineSeriesInput[], options?: LineDataOptions): void
+```
+
+Uploads one or more line series. Every series shares the same X axis and sample count. Repeated calls with the same shape update the current frame without rebuilding the line renderer.
+
+```ts
+viewer.setLineData(
+  [
+    { id: 'a', name: 'Signal A', color: [80, 190, 255, 1], data: signalA },
+    { id: 'b', name: 'Signal B', color: [255, 170, 64, 1], data: signalB },
+  ],
+  {
+    xAxis: { kind: 'linear', label: 'Time', unit: 's', min: 0, max: 1 },
+  },
+);
+```
+
+---
+
+## setLineDataScrolled()
+
+```ts
+setLineDataScrolled(
+  updates: LineSeriesUpdate[],
+  options: LineScrolledDataOptions,
+): void
+```
+
+Appends new samples to the right edge of an existing line chart and scrolls old samples off the left without shifting CPU or GPU buffers. Call `setLineData()` once first to establish series names, colors, visibility, and window size.
+
+```ts
+viewer.setLineDataScrolled(
+  [
+    { id: 'a', data: newSamplesA },
+    { id: 'b', data: newSamplesB },
+  ],
+  { newSamples: 8, xOffset: totalSamplesReceived },
+);
+```
+
+---
+
+## setLineSeriesVisibility()
+
+```ts
+setLineSeriesVisibility(id: string, visible: boolean): void
+```
+
+Shows or hides a line series. Hidden series are excluded from drawing, hover hit-testing, and sticky-auto Y ranges.
 :::
 
 | Parameter | Type | Description |
@@ -178,19 +237,21 @@ viewer.setRange(-1.0, 1.0);
 onHover(callback: HoverCallback): void
 ```
 
-Registers a callback that fires when the pointer moves over a matrix cell. Only one callback is active at a time; calling `onHover()` again replaces the previous callback.
+Registers a callback that fires when the pointer moves over a chart value region. Only one callback is active at a time; calling `onHover()` again replaces the previous callback.
 
-The callback receives a [`HoverInfo`](/api/types#hoverinfo) object enriched with interpolated axis coordinates when a [`ChartConfig`](/api/types#chartconfig) is present.
+The callback receives a [`HoverInfo`](/api/types#hoverinfo) object. Heatmaps report one matrix cell; line charts report all visible finite series values at the current mouse X coordinate.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `callback` | [`HoverCallback`](/api/types#hovercallback) | Function called with hover details on cell entry |
+| `callback` | [`HoverCallback`](/api/types#hovercallback) | Function called with chart hover details |
 
 ```ts
 viewer.onHover((info) => {
-  console.log(`value=${info.value} at row=${info.row} col=${info.col}`);
-  if (info.x !== undefined) console.log(`x=${info.x} ${info.xUnit}`);
-  if (info.y !== undefined) console.log(`y=${info.y} ${info.yUnit}`);
+  if (info.kind === 'line') {
+    console.log(`x=${info.x}`, info.points);
+  } else {
+    console.log(`value=${info.value} at row=${info.row} col=${info.col}`);
+  }
 });
 ```
 

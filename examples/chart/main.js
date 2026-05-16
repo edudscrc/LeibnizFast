@@ -181,6 +181,24 @@ function showError(msg) {
   }, 6000);
 }
 
+function formatUnit(unit) {
+  return unit ? ` ${unit}` : '';
+}
+
+function colorSwatch(color) {
+  const [r, g, b, a] = color ?? [148, 163, 184, 0.65];
+  return `rgba(${r}, ${g}, ${b}, ${a})`;
+}
+
+function renderHeatmapTooltip(info, valueText, showValueUnit) {
+  const yText = `${info.y?.toFixed(1) ?? info.row}${formatUnit(info.yUnit)}`;
+  const xText = `${info.x?.toFixed(2) ?? info.col}${formatUnit(info.xUnit)}`;
+  const valueUnit = showValueUnit ? formatUnit(info.valueUnit) : '';
+  tooltip.innerHTML =
+    `<div class="tooltip-x">Y: ${yText}<br>X: ${xText}</div>` +
+    `<div class="tooltip-row"><span class="tooltip-swatch" style="background: ${colorSwatch(info.color)}"></span><strong>${valueText}${valueUnit}</strong></div>`;
+}
+
 /**
  * Read chart config from DOM inputs.
  * @returns {{ rows: number, cols: number, chart: object }}
@@ -336,10 +354,7 @@ async function load() {
       : generatedSineValue(info.row, info.col, currentRows, currentCols);
     const valueAvailable = Number.isFinite(value);
     const valueText = valueAvailable ? value.toFixed(4) : 'unavailable';
-    tooltip.innerHTML =
-      `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
-      `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
-      `Value: ${valueText}${valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
+    renderHeatmapTooltip(info, valueText, valueAvailable);
   });
 }
 

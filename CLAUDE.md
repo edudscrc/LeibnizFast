@@ -9,7 +9,7 @@ LeibnizFast is a GPU-accelerated 2D matrix visualization library for browsers, p
 ## Build & Dev Commands
 
 ```bash
-npm run build:wasm    # wasm-pack build --target web --release → pkg/
+npm run build:wasm    # wasm-pack build --target web --release --no-opt --no-pack → pkg/
 npm run build:js      # tsup js/index.ts --format esm --dts → dist/
 npm run build         # both WASM + JS
 npm run dev           # build + serve the chart example

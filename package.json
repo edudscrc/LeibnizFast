@@ -10,14 +10,16 @@
     "pkg/"
   ],
   "scripts": {
-    "build:wasm": "wasm-pack build --target web --release",
+    "build:wasm": "wasm-pack build --target web --release --no-opt --no-pack",
     "build:js": "tsup js/index.ts --format esm --dts --out-dir dist && cp pkg/leibniz_fast_bg.wasm dist/",
     "build": "npm run build:wasm && npm run build:js",
     "dev": "node scripts/run-example.mjs chart",
     "dev:chart": "node scripts/run-example.mjs chart",
+    "dev:line": "node scripts/run-example.mjs line",
     "dev:cpp-stream": "node scripts/run-example.mjs cpp-stream",
     "dev:waterfall": "node scripts/run-example.mjs waterfall",
     "example:chart": "node scripts/run-example.mjs chart",
+    "example:line": "node scripts/run-example.mjs line",
     "example:cpp-stream": "node scripts/run-example.mjs cpp-stream",
     "example:waterfall": "node scripts/run-example.mjs waterfall",
     "lint:rs": "cargo fmt --check && cargo clippy -- -D warnings",

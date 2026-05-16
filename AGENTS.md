@@ -7,6 +7,10 @@ browsers, published as the npm package `leibniz-fast`. It combines a
 Rust/WASM core built on `wgpu` with a thin TypeScript wrapper. WebGPU is
 required; do not add CPU or WebGL fallback paths.
 
+LeibnizFast is still in active development. Do not prioritize backward
+compatibility unless explicitly requested; prefer clean APIs and correct
+behavior even when a feature or change breaks older user programs.
+
 ## Commands
 
 - Build WASM: `npm run build:wasm`

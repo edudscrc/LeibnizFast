@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LeibnizFast — Line Chart Example</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        min-height: 100vh;
+        background: #151821;
+        color: #eceff4;
+        font-family: system-ui, sans-serif;
+      }
+
+      .container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+        padding: 20px;
+      }
+
+      h1 {
+        color: #f4f6fb;
+        font-size: 1.35rem;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+      }
+
+      button,
+      select {
+        border: 1px solid #3b4252;
+        border-radius: 4px;
+        background: #242a36;
+        color: #eceff4;
+        cursor: pointer;
+        padding: 5px 9px;
+      }
+
+      button:hover,
+      select:hover {
+        background: #303849;
+      }
+
+      label {
+        align-items: center;
+        display: flex;
+        gap: 6px;
+        font-size: 0.9rem;
+      }
+
+      #line-canvas {
+        width: 900px;
+        height: 560px;
+        border: 1px solid #303849;
+      }
+
+      .tooltip {
+        position: fixed;
+        display: none;
+        padding: 6px 10px;
+        border-radius: 4px;
+        background: rgba(0, 0, 0, 0.86);
+        color: #fff;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.82rem;
+        pointer-events: none;
+        min-width: 190px;
+      }
+
+      .tooltip-x {
+        margin-bottom: 5px;
+        color: #d8dee9;
+      }
+
+      .tooltip-row {
+        align-items: center;
+        display: grid;
+        grid-template-columns: 14px 1fr auto;
+        gap: 7px;
+        line-height: 1.45;
+      }
+
+      .tooltip-swatch {
+        display: inline-block;
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+      }
+
+      .error-banner {
+        display: none;
+        width: 100%;
+        max-width: 900px;
+        border: 1px solid #bf616a;
+        border-radius: 4px;
+        background: #4c1f25;
+        color: #ffd8dc;
+        font-size: 0.9rem;
+        padding: 8px 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>LeibnizFast — Line Chart</h1>
+      <div class="controls">
+        <label>
+          Mode
+          <select id="mode">
+            <option value="static">Static</option>
+            <option value="animated">Animated</option>
+            <option value="streaming">Streaming</option>
+          </select>
+        </label>
+        <label>
+          <input type="checkbox" id="grid" checked />
+          Grid
+        </label>
+        <button id="reload">Reload</button>
+      </div>
+      <div class="error-banner" id="error-banner"></div>
+      <canvas id="line-canvas"></canvas>
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

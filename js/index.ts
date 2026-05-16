@@ -12,7 +12,7 @@
  * const canvas = document.getElementById('canvas') as HTMLCanvasElement;
  * const viewer = await LeibnizFast.create(canvas, { colormap: 'viridis' });
  * viewer.setData(new Float32Array(data), { rows: 1000, cols: 2000 });
- * viewer.onHover((row, col, value) => console.log(row, col, value));
+ * viewer.onHover((info) => console.log(info));
  * ```
  */
 
@@ -25,8 +25,20 @@ import type {
   CreateOptions,
   DataChunk,
   DataOptions,
+  HeatmapChartConfig,
+  HeatmapHoverInfo,
   HoverCallback,
   HoverInfo,
+  LineChartConfig,
+  LineDataOptions,
+  LineHoverInfo,
+  LineHoverPoint,
+  LineScrolledDataOptions,
+  LineSeriesInput,
+  LineSeriesUpdate,
+  LineXAxisConfig,
+  LineYAxisConfig,
+  RgbaColor,
   ScrolledDataOptions,
   StreamingAxisConfig,
   StreamingDataOptions,
@@ -35,7 +47,10 @@ import type {
 import {
   computeLayout,
   drawAxisHighlight,
+  drawLineHoverGuides,
   drawSelectionRect,
+  isHeatmapChartConfig,
+  isLineChartConfig,
   isStreamingAxis,
   renderOverlay,
   uvToVisibleRange,
@@ -83,8 +98,20 @@ export type {
   CreateOptions,
   DataChunk,
   DataOptions,
+  HeatmapChartConfig,
+  HeatmapHoverInfo,
   HoverCallback,
   HoverInfo,
+  LineChartConfig,
+  LineDataOptions,
+  LineHoverInfo,
+  LineHoverPoint,
+  LineScrolledDataOptions,
+  LineSeriesInput,
+  LineSeriesUpdate,
+  LineXAxisConfig,
+  LineYAxisConfig,
+  RgbaColor,
   ScrolledDataOptions,
   StreamingAxisConfig,
   StreamingDataOptions,
@@ -117,7 +144,86 @@ type WebGpuNavigatorLike = Navigator & {
 type WasmLeibnizFastInner = WasmLeibnizFast & {
   getColorRange(): Float32Array;
   getColormapLut(): Uint8Array;
+  setLineData(
+    data: Float32Array,
+    sampleCount: number,
+    seriesCount: number,
+    colors: Float32Array,
+    visibility: Uint32Array,
+    xValues: Float32Array | undefined,
+    xMode: number,
+    xStart: number,
+    xStep: number,
+    xMin: number,
+    xMax: number,
+    yMin: number,
+    yMax: number,
+  ): void;
+  setLineDataScrolled(
+    data: Float32Array,
+    newSamples: number,
+    sampleCount: number,
+    seriesCount: number,
+    colors: Float32Array,
+    visibility: Uint32Array,
+    xStart: number,
+    xStep: number,
+    xMin: number,
+    xMax: number,
+    yMin: number,
+    yMax: number,
+  ): void;
+  updateLineConfig(
+    colors: Float32Array,
+    visibility: Uint32Array,
+    xMode: number,
+    xStart: number,
+    xStep: number,
+    xMin: number,
+    xMax: number,
+    yMin: number,
+    yMax: number,
+  ): void;
 };
+
+interface LineSeriesState {
+  id: string;
+  name: string;
+  color: [number, number, number, number];
+  visible: boolean;
+  data: Float32Array;
+}
+
+interface ResolvedLineXAxis {
+  config: LineXAxisConfig;
+  xMode: number;
+  xValues: Float32Array | undefined;
+  xStart: number;
+  xStep: number;
+  xMin: number;
+  xMax: number;
+}
+
+interface LineRange {
+  min: number;
+  max: number;
+}
+
+interface LineHoverGuidePoint {
+  x: number;
+  y: number;
+  color: [number, number, number, number];
+}
+
+interface LineHoverGuideState {
+  mouseX: number;
+  mouseY: number;
+  points: LineHoverGuidePoint[];
+}
+
+const LINE_X_MODE_LINEAR = 0;
+const LINE_X_MODE_EXPLICIT = 1;
+const DEFAULT_LINE_Y_PADDING_RATIO = 0.05;
 
 function normalizeAdapterInfo(
   info: unknown,
@@ -215,6 +321,8 @@ export class LeibnizFast {
   private lastMouseY: number = 0;
   /** Whether the mouse pointer is currently inside the canvas. */
   private mouseInside: boolean = false;
+  /** Whether the last pointer position was inside the data plot region. */
+  private mouseInPlot: boolean = false;
 
   // --- Interaction state ---
   /** Current interaction mode. */
@@ -223,6 +331,8 @@ export class LeibnizFast {
   private hoveredAxis: 'x' | 'y' | null = null;
   /** Active zoom-reset animation frame ID, or null if no animation is running. */
   private zoomAnimationId: number | null = null;
+  /** True after destroy() has started; stale DOM events are ignored. */
+  private disposed: boolean = false;
 
   // --- Chart overlay state ---
   /** Chart configuration (axes, colorbar, title, labels). Null when no chart mode. */
@@ -233,6 +343,8 @@ export class LeibnizFast {
   private overlayCanvas: HTMLCanvasElement | null = null;
   /** 2D rendering context for the overlay canvas. */
   private overlayCtx: CanvasRenderingContext2D | null = null;
+  /** DOM legend for line charts. */
+  private legendDiv: HTMLDivElement | null = null;
   /** Current layout (matrix area position within container). */
   private layout: LayoutRect = { x: 0, y: 0, width: 0, height: 0 };
   /** Streaming X axis: columns currently displayed in the matrix. */
@@ -253,6 +365,28 @@ export class LeibnizFast {
   private ringCursor: number = 0;
   /** Active colormap lookup table for the overlay colorbar. */
   private colorbarLut: Uint8Array | null = null;
+  /** Active heatmap value range cached outside Rust hover callbacks. */
+  private colorRange: { min: number; max: number } | null = null;
+
+  // --- Line chart state ---
+  /** Current line series state, including library-owned data buffers. */
+  private lineSeries: LineSeriesState[] = [];
+  /** Current line sample count. */
+  private lineSampleCount: number = 0;
+  /** Resolved line X axis for the active data. */
+  private lineXAxis: ResolvedLineXAxis | null = null;
+  /** Current base Y range used by the WebGPU line renderer. */
+  private lineYRange: LineRange | null = null;
+  /** Whether sticky auto Y range is currently active. */
+  private lineStickyYActive: boolean = true;
+  /** Line ring cursor for JS hover lookup. */
+  private lineRingCursor: number = 0;
+  /** Total samples received for streaming line axes. */
+  private lineTotalSamplesReceived: number = 0;
+  /** Current line hover guide geometry in canvas-local CSS pixels. */
+  private lineHoverGuide: LineHoverGuideState | null = null;
+  /** Signature of the currently rendered legend structure. */
+  private lineLegendSignature: string = '';
 
   private constructor(
     inner: WasmLeibnizFast,
@@ -271,11 +405,15 @@ export class LeibnizFast {
       mousedown: (e: MouseEvent) => this.handleMouseDown(e),
       mousemove: (e: MouseEvent) => this.handleMouseMove(e),
       mouseenter: () => {
+        if (this.disposed) return;
         this.mouseInside = true;
       },
       mouseleave: () => {
+        if (this.disposed) return;
         this.mouseInside = false;
+        this.mouseInPlot = false;
         this.hoveredAxis = null;
+        this.lineHoverGuide = null;
         this.updateCursor('default');
         this.scheduleOverlayUpdate();
       },
@@ -416,35 +554,109 @@ export class LeibnizFast {
     return result;
   }
 
+  /** Return the active heatmap chart config, or null in line/raw modes. */
+  private getHeatmapChart(): HeatmapChartConfig | null {
+    return this.chartConfig && isHeatmapChartConfig(this.chartConfig)
+      ? this.chartConfig
+      : null;
+  }
+
+  /** Return the active line chart config, or null otherwise. */
+  private getLineChart(): LineChartConfig | null {
+    return this.chartConfig && isLineChartConfig(this.chartConfig)
+      ? this.chartConfig
+      : null;
+  }
+
+  /** Whether the viewer is currently configured for line charts. */
+  private isLineChart(): boolean {
+    return this.getLineChart() !== null;
+  }
+
+  /** Fail fast when a heatmap API is called in line mode. */
+  private assertHeatmapMode(method: string): HeatmapChartConfig | null {
+    if (this.isLineChart()) {
+      throw new Error(`${method}() is only available for heatmap charts.`);
+    }
+    return this.getHeatmapChart();
+  }
+
+  /** Fail fast when a line API is called outside line mode. */
+  private assertLineMode(method: string): LineChartConfig {
+    const chart = this.getLineChart();
+    if (!chart) {
+      throw new Error(`${method}() requires chart.type === 'line'.`);
+    }
+    return chart;
+  }
+
   /** Refresh the cached colormap LUT used by the 2D overlay colorbar. */
   private refreshColorbarLut(): void {
     const lut = (this.inner as WasmLeibnizFastInner).getColormapLut();
     this.colorbarLut = lut.length > 0 ? lut : null;
   }
 
-  /** Build colorbar render data from the current WASM colormap range. */
-  private getColorbarData(): ColorbarData | null {
-    if (!this.chartConfig || this.chartConfig.colorbar === false) return null;
-    if (!this.colorbarLut) return null;
-
+  /** Refresh the cached heatmap value range outside hover callbacks. */
+  private refreshColorRange(): void {
     const range = (this.inner as WasmLeibnizFastInner).getColorRange();
-    if (range.length < 2) return null;
+    if (range.length < 2) {
+      this.colorRange = null;
+      return;
+    }
 
     const min = range[0];
     const max = range[1];
-    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
-      return null;
-    }
+    this.colorRange =
+      Number.isFinite(min) && Number.isFinite(max) && max > min
+        ? { min, max }
+        : null;
+  }
+
+  /** Build colorbar render data from the cached colormap range. */
+  private getColorbarData(): ColorbarData | null {
+    const chart = this.getHeatmapChart();
+    if (!chart || chart.colorbar === false) return null;
+    if (!this.colorbarLut) return null;
+    if (!this.colorRange) return null;
 
     const colorbar: ColorbarData = {
-      min,
-      max,
+      min: this.colorRange.min,
+      max: this.colorRange.max,
       colors: this.colorbarLut,
     };
-    if (this.chartConfig.valueUnit) {
-      colorbar.label = this.chartConfig.valueUnit;
+    if (chart.valueUnit) {
+      colorbar.label = chart.valueUnit;
     }
     return colorbar;
+  }
+
+  /** Resolve the current heatmap colormap color for a finite data value. */
+  private getHeatmapValueColor(value: number): RgbaColor | undefined {
+    if (!Number.isFinite(value) || !this.colorbarLut) return undefined;
+    if (!this.colorRange) return undefined;
+
+    const entries = Math.floor(this.colorbarLut.length / 3);
+    if (entries <= 0) return undefined;
+
+    const normalized = Math.max(
+      0,
+      Math.min(
+        1,
+        (value - this.colorRange.min) /
+          (this.colorRange.max - this.colorRange.min),
+      ),
+    );
+    const lutIndex = Math.max(
+      0,
+      Math.min(entries - 1, Math.round(normalized * (entries - 1))),
+    );
+    const offset = lutIndex * 3;
+    return [
+      this.colorbarLut[offset],
+      this.colorbarLut[offset + 1],
+      this.colorbarLut[offset + 2],
+      1,
+    ];
   }
 
   /**
@@ -454,6 +666,7 @@ export class LeibnizFast {
    * @param options - Matrix dimensions (rows, cols)
    */
   setData(data: Float32Array, options: DataOptions): void {
+    const chart = this.assertHeatmapMode('setData');
     this.matrixRows = options.rows;
     this.matrixCols = options.cols;
     this.dataRef = data;
@@ -462,7 +675,8 @@ export class LeibnizFast {
     this.timeSync('JS setData', () =>
       this.inner.setData(data, options.rows, options.cols),
     );
-    if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
+    this.refreshColorRange();
+    if (chart?.xAxis && isStreamingAxis(chart.xAxis)) {
       this.streamingDisplayCols = options.cols;
       if (options.xOffset !== undefined) {
         this.streamingXOffset = options.xOffset;
@@ -487,6 +701,7 @@ export class LeibnizFast {
    * @param options - Matrix dimensions and number of new columns
    */
   setDataScrolled(data: Float32Array, options: ScrolledDataOptions): void {
+    const chart = this.assertHeatmapMode('setDataScrolled');
     this.matrixRows = options.rows;
     this.matrixCols = options.cols;
     this.dataRef = data;
@@ -499,9 +714,10 @@ export class LeibnizFast {
         options.newCols,
       ),
     );
+    this.refreshColorRange();
     // Advance ring cursor to mirror the WASM renderer's ring_cursor
     this.ringCursor = (this.ringCursor + options.newCols) % options.cols;
-    if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
+    if (chart?.xAxis && isStreamingAxis(chart.xAxis)) {
       this.streamingDisplayCols = options.cols;
       if (options.xOffset !== undefined) {
         this.streamingXOffset = options.xOffset;
@@ -517,6 +733,7 @@ export class LeibnizFast {
    * @param name - One of the available colormap names
    */
   setColormap(name: ColormapName): void {
+    this.assertHeatmapMode('setColormap');
     this.timeSync('JS setColormap', () => this.inner.setColormap(name));
     this.refreshColorbarLut();
     this.updateOverlay();
@@ -532,19 +749,191 @@ export class LeibnizFast {
    * @param max - Maximum data value
    */
   setRange(min: number, max: number): void {
+    this.assertHeatmapMode('setRange');
     assertValidRange({ min, max });
     this.inner.setRange(min, max);
+    this.colorRange = { min, max };
     this.updateOverlay();
+  }
+
+  /**
+   * Upload full line series data or replace the current animated line frame.
+   *
+   * @param series - One or more named series sharing the same X axis
+   * @param options - Optional axis overrides for this upload
+   */
+  setLineData(series: LineSeriesInput[], options?: LineDataOptions): void {
+    const chart = this.assertLineMode('setLineData');
+    this.lineSeries = this.normalizeLineSeries(series);
+    this.lineSampleCount = this.lineSeries[0]?.data.length ?? 0;
+    this.lineRingCursor = 0;
+    this.lineTotalSamplesReceived = options?.xOffset ?? this.lineSampleCount;
+    const yAxis = options?.yAxis ?? chart.yAxis;
+    if (yAxis?.rangeMode === 'fixed') {
+      this.lineStickyYActive = false;
+    } else if (options?.resetYRange === true || this.lineYRange === null) {
+      this.lineStickyYActive = true;
+    }
+    this.lineXAxis = this.resolveLineXAxis(
+      options?.xAxis ?? chart.xAxis,
+      this.lineSampleCount,
+      this.lineTotalSamplesReceived,
+    );
+    this.lineYRange = this.resolveLineYRange(
+      yAxis,
+      options?.resetYRange ?? this.lineYRange === null,
+    );
+
+    this.matrixRows = 1;
+    this.matrixCols = this.lineSampleCount;
+
+    this.timeSync('JS setLineData', () =>
+      (this.inner as WasmLeibnizFastInner).setLineData(
+        this.flattenLineData(),
+        this.lineSampleCount,
+        this.lineSeries.length,
+        this.buildLineColorBuffer(),
+        this.buildLineVisibilityBuffer(),
+        this.lineXAxis?.xValues,
+        this.lineXAxis?.xMode ?? LINE_X_MODE_LINEAR,
+        this.lineXAxis?.xStart ?? 0,
+        this.lineXAxis?.xStep ?? 1,
+        this.lineXAxis?.xMin ?? 0,
+        this.lineXAxis?.xMax ?? 1,
+        this.lineYRange?.min ?? 0,
+        this.lineYRange?.max ?? 1,
+      ),
+    );
+
+    this.syncLineLegend();
+    this.updateOverlay();
+    this.refreshHoverIfNeeded();
+  }
+
+  /**
+   * Append new samples to an existing scrolling line chart.
+   *
+   * New samples enter on the right. Old samples leave on the left without
+   * shifting the internal buffers.
+   */
+  setLineDataScrolled(
+    updates: LineSeriesUpdate[],
+    options: LineScrolledDataOptions,
+  ): void {
+    const chart = this.assertLineMode('setLineDataScrolled');
+    if (this.lineSeries.length === 0 || this.lineSampleCount === 0) {
+      throw new Error(
+        'setLineDataScrolled() requires an initial setLineData().',
+      );
+    }
+    if (
+      !Number.isInteger(options.newSamples) ||
+      options.newSamples <= 0 ||
+      options.newSamples > this.lineSampleCount
+    ) {
+      throw new Error(
+        'newSamples must be a positive integer no greater than the active sample count.',
+      );
+    }
+
+    const updateMap = new Map<string, Float32Array>();
+    for (const update of updates) {
+      if (updateMap.has(update.id)) {
+        throw new Error(`Duplicate line update id: ${update.id}`);
+      }
+      if (update.data.length !== options.newSamples) {
+        throw new Error(
+          `Line update "${update.id}" length ${update.data.length} does not match newSamples ${options.newSamples}.`,
+        );
+      }
+      updateMap.set(update.id, update.data);
+    }
+    if (updateMap.size !== this.lineSeries.length) {
+      throw new Error(
+        'setLineDataScrolled() requires one update per line series.',
+      );
+    }
+
+    const flatUpdates = new Float32Array(
+      this.lineSeries.length * options.newSamples,
+    );
+    const cursor = this.lineRingCursor;
+    for (let s = 0; s < this.lineSeries.length; s++) {
+      const state = this.lineSeries[s];
+      const update = updateMap.get(state.id);
+      if (!update)
+        throw new Error(`Missing line update for series "${state.id}".`);
+      flatUpdates.set(update, s * options.newSamples);
+
+      const first = Math.min(options.newSamples, this.lineSampleCount - cursor);
+      state.data.set(update.subarray(0, first), cursor);
+      if (first < options.newSamples) {
+        state.data.set(update.subarray(first), 0);
+      }
+    }
+
+    this.lineTotalSamplesReceived =
+      options.xOffset ?? this.lineTotalSamplesReceived + options.newSamples;
+    this.lineXAxis = this.resolveLineXAxis(
+      chart.xAxis,
+      this.lineSampleCount,
+      this.lineTotalSamplesReceived,
+    );
+    if (this.lineXAxis.xMode === LINE_X_MODE_EXPLICIT) {
+      throw new Error(
+        'setLineDataScrolled() does not support explicit X arrays.',
+      );
+    }
+    this.lineYRange = this.resolveLineYRange(chart.yAxis, false);
+
+    this.timeSync('JS setLineDataScrolled', () =>
+      (this.inner as WasmLeibnizFastInner).setLineDataScrolled(
+        flatUpdates,
+        options.newSamples,
+        this.lineSampleCount,
+        this.lineSeries.length,
+        this.buildLineColorBuffer(),
+        this.buildLineVisibilityBuffer(),
+        this.lineXAxis?.xStart ?? 0,
+        this.lineXAxis?.xStep ?? 1,
+        this.lineXAxis?.xMin ?? 0,
+        this.lineXAxis?.xMax ?? 1,
+        this.lineYRange?.min ?? 0,
+        this.lineYRange?.max ?? 1,
+      ),
+    );
+
+    this.lineRingCursor = (cursor + options.newSamples) % this.lineSampleCount;
+    this.scheduleOverlayUpdate();
+    this.refreshHoverIfNeeded();
+  }
+
+  /**
+   * Toggle a line series by id. Hidden series are excluded from rendering,
+   * hover, legend active state, and sticky-auto Y ranges.
+   */
+  setLineSeriesVisibility(id: string, visible: boolean): void {
+    this.assertLineMode('setLineSeriesVisibility');
+    const series = this.lineSeries.find((item) => item.id === id);
+    if (!series) {
+      throw new Error(`Unknown line series id: ${id}`);
+    }
+    series.visible = visible;
+    this.lineYRange = this.resolveLineYRange(this.getLineChart()?.yAxis, true);
+    this.updateLineGpuConfig();
+    this.syncLineLegend();
+    this.updateOverlay();
+    this.refreshHoverIfNeeded();
   }
 
   /**
    * Register a callback for hover events.
    *
-   * The callback receives a {@link HoverInfo} object with matrix indices,
-   * the raw data value, and axis-mapped coordinates and units when a
-   * chart configuration is present.
+   * The callback receives a {@link HoverInfo} object. Heatmaps report one
+   * matrix cell; line charts report all visible finite series values at the
+   * current mouse X coordinate.
    *
-   * @param callback - Called with enriched hover info on cell hover
+   * @param callback - Called with enriched hover info while hovering the chart
    */
   onHover(callback: HoverCallback): void {
     this.hoverCallback = callback;
@@ -573,6 +962,7 @@ export class LeibnizFast {
    * @param options - Matrix dimensions (rows, cols)
    */
   beginData(options: StreamingDataOptions): void {
+    const chart = this.assertHeatmapMode('beginData');
     if (options.retainData === false) {
       throw new Error(
         'beginData() retains CPU-side data. Use setDataChunks(..., { retainData: false }) for no-retention uploads.',
@@ -586,7 +976,7 @@ export class LeibnizFast {
     this.timeSync('JS beginData', () =>
       this.inner.beginData(options.rows, options.cols),
     );
-    if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
+    if (chart?.xAxis && isStreamingAxis(chart.xAxis)) {
       this.streamingDisplayCols = options.cols;
     }
   }
@@ -602,6 +992,7 @@ export class LeibnizFast {
    * @param options - Matrix dimensions (rows, cols)
    */
   beginUpdate(options: StreamingDataOptions): void {
+    this.assertHeatmapMode('beginUpdate');
     if (options.retainData === false) {
       throw new Error(
         'beginUpdate() retains CPU-side data. Use setDataChunks(..., { retainData: false }) for no-retention uploads.',
@@ -642,6 +1033,7 @@ export class LeibnizFast {
    * @param startRow - Zero-based index of the first row in this chunk
    */
   appendChunk(data: Float32Array, startRow: number): void {
+    this.assertHeatmapMode('appendChunk');
     this.timeSync('JS appendChunk', () =>
       this.inner.appendChunk(data, startRow),
     );
@@ -652,7 +1044,9 @@ export class LeibnizFast {
    * pipelines, and renders.
    */
   endData(): void {
+    this.assertHeatmapMode('endData');
     this.timeSync('JS endData', () => this.inner.endData());
+    this.refreshColorRange();
     this.updateOverlay();
     this.refreshHoverIfNeeded();
   }
@@ -668,6 +1062,7 @@ export class LeibnizFast {
     chunks: Iterable<DataChunk> | AsyncIterable<DataChunk>,
     options: ChunkedDataOptions,
   ): Promise<void> {
+    const chart = this.assertHeatmapMode('setDataChunks');
     if (options.range) {
       assertValidRange(options.range);
     }
@@ -698,12 +1093,13 @@ export class LeibnizFast {
       }
 
       this.inner.endDataChunks();
+      this.refreshColorRange();
     } catch (error) {
       this.inner.abortDataChunks();
       throw error;
     }
 
-    if (this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)) {
+    if (chart?.xAxis && isStreamingAxis(chart.xAxis)) {
       this.streamingDisplayCols = options.cols;
       if (options.xOffset !== undefined) {
         this.streamingXOffset = options.xOffset;
@@ -758,6 +1154,19 @@ export class LeibnizFast {
     } else {
       this.chartConfig = config;
     }
+    if (this.getLineChart() && this.lineSeries.length > 0) {
+      const chart = this.getLineChart();
+      if (chart) {
+        this.lineXAxis = this.resolveLineXAxis(
+          chart.xAxis,
+          this.lineSampleCount,
+          this.lineTotalSamplesReceived,
+        );
+        this.lineYRange = this.resolveLineYRange(chart.yAxis, true);
+        this.updateLineGpuConfig();
+      }
+    }
+    this.syncLineLegend();
     this.handleResize();
   }
 
@@ -782,6 +1191,7 @@ export class LeibnizFast {
    * Equivalent to double-clicking the matrix area.
    */
   resetZoom(): void {
+    if (this.isLineChart()) this.resetLineStickyY();
     const uv = this.inner.getVisibleRange();
     this.animateToUvRect(
       { x: uv[0], y: uv[1], w: uv[2], h: uv[3] },
@@ -794,6 +1204,8 @@ export class LeibnizFast {
    * Must be called when the viewer is no longer needed.
    */
   destroy(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     if (this.zoomAnimationId !== null) {
       cancelAnimationFrame(this.zoomAnimationId);
       this.zoomAnimationId = null;
@@ -801,14 +1213,602 @@ export class LeibnizFast {
     this.removeEventListeners();
     this.hoverCallback = null;
     this.dataRef = null;
+    this.colorRange = null;
     this.interactionMode = { type: 'idle' };
+    this.mouseInside = false;
+    this.mouseInPlot = false;
     this.hoveredAxis = null;
+    this.lineHoverGuide = null;
+    this.lineLegendSignature = '';
 
     // Clean up overlay DOM
-    this.teardownChartOverlay();
+    this.teardownChartOverlay(false);
 
     // Destroy WASM instance (frees GPU resources)
     this.inner.destroy();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: line chart data helpers
+  // ---------------------------------------------------------------------------
+
+  private normalizeLineSeries(series: LineSeriesInput[]): LineSeriesState[] {
+    if (series.length === 0) {
+      throw new Error('Line charts require at least one series.');
+    }
+
+    const previousVisibility = new Map(
+      this.lineSeries.map((state) => [state.id, state.visible]),
+    );
+    const ids = new Set<string>();
+    const sampleCount = series[0].data.length;
+    if (sampleCount < 2) {
+      throw new Error('Line charts require at least two samples per series.');
+    }
+
+    return series.map((input, index) => {
+      const id = input.id ?? input.name;
+      if (!id)
+        throw new Error(`Line series at index ${index} needs an id or name.`);
+      if (!input.name) throw new Error(`Line series "${id}" needs a name.`);
+      if (ids.has(id)) throw new Error(`Duplicate line series id: ${id}`);
+      ids.add(id);
+      if (input.data.length !== sampleCount) {
+        throw new Error('All line series must have the same sample count.');
+      }
+      this.assertValidLineColor(input.color, id);
+      return {
+        id,
+        name: input.name,
+        color: input.color,
+        visible: input.visible ?? previousVisibility.get(id) ?? true,
+        data: new Float32Array(input.data),
+      };
+    });
+  }
+
+  private assertValidLineColor(
+    color: [number, number, number, number],
+    id: string,
+  ): void {
+    const [r, g, b, a] = color;
+    const valid =
+      Number.isFinite(r) &&
+      Number.isFinite(g) &&
+      Number.isFinite(b) &&
+      Number.isFinite(a) &&
+      r >= 0 &&
+      r <= 255 &&
+      g >= 0 &&
+      g <= 255 &&
+      b >= 0 &&
+      b <= 255 &&
+      a >= 0 &&
+      a <= 1;
+    if (!valid) {
+      throw new Error(
+        `Line series "${id}" color must use RGB values in 0..255 and alpha in 0..1.`,
+      );
+    }
+  }
+
+  private resolveLineXAxis(
+    config: LineXAxisConfig | undefined,
+    sampleCount: number,
+    xOffset?: number,
+  ): ResolvedLineXAxis {
+    const axis = config ?? { kind: 'index' as const };
+
+    if ('values' in axis) {
+      const values =
+        axis.values instanceof Float32Array
+          ? new Float32Array(axis.values)
+          : new Float32Array(axis.values);
+      if (values.length !== sampleCount) {
+        throw new Error('Explicit line X values must match the series length.');
+      }
+      for (let i = 0; i < values.length; i++) {
+        if (!Number.isFinite(values[i])) {
+          throw new Error('Explicit line X values must be finite.');
+        }
+        if (i > 0 && values[i] <= values[i - 1]) {
+          throw new Error(
+            'Explicit line X values must be strictly increasing.',
+          );
+        }
+      }
+      return {
+        config: axis,
+        xMode: LINE_X_MODE_EXPLICIT,
+        xValues: values,
+        xStart: values[0],
+        xStep: values.length > 1 ? values[1] - values[0] : 1,
+        xMin: values[0],
+        xMax: values[values.length - 1],
+      };
+    }
+
+    if ('unitsPerSample' in axis) {
+      const units = axis.unitsPerSample;
+      if (!Number.isFinite(units) || units <= 0) {
+        throw new Error(
+          'Line streaming unitsPerSample must be finite and positive.',
+        );
+      }
+      const start = axis.start ?? 0;
+      if (!Number.isFinite(start)) {
+        throw new Error('Line streaming start must be finite.');
+      }
+      const total = (xOffset ?? this.lineTotalSamplesReceived) || sampleCount;
+      const xMin = start + Math.max(0, total - sampleCount) * units;
+      const xMax = xMin + (sampleCount - 1) * units;
+      return {
+        config: axis,
+        xMode: LINE_X_MODE_LINEAR,
+        xValues: undefined,
+        xStart: xMin,
+        xStep: units,
+        xMin,
+        xMax,
+      };
+    }
+
+    if ('min' in axis && 'max' in axis) {
+      if (
+        !Number.isFinite(axis.min) ||
+        !Number.isFinite(axis.max) ||
+        axis.max <= axis.min
+      ) {
+        throw new Error(
+          'Line X axis min/max must be finite with max greater than min.',
+        );
+      }
+      return {
+        config: axis,
+        xMode: LINE_X_MODE_LINEAR,
+        xValues: undefined,
+        xStart: axis.min,
+        xStep: (axis.max - axis.min) / (sampleCount - 1),
+        xMin: axis.min,
+        xMax: axis.max,
+      };
+    }
+
+    return {
+      config: axis,
+      xMode: LINE_X_MODE_LINEAR,
+      xValues: undefined,
+      xStart: 0,
+      xStep: 1,
+      xMin: 0,
+      xMax: sampleCount - 1,
+    };
+  }
+
+  private resolveLineYRange(
+    config: LineYAxisConfig | undefined,
+    reset: boolean,
+  ): LineRange {
+    if (config?.rangeMode === 'fixed') {
+      if (
+        config.min === undefined ||
+        config.max === undefined ||
+        !Number.isFinite(config.min) ||
+        !Number.isFinite(config.max) ||
+        config.max <= config.min
+      ) {
+        throw new Error('Fixed line Y ranges require finite min/max values.');
+      }
+      this.lineStickyYActive = false;
+      return { min: config.min, max: config.max };
+    }
+
+    if (!this.lineStickyYActive && !reset && this.lineYRange) {
+      return this.lineYRange;
+    }
+
+    const computed = this.computeLineAutoYRange(
+      config?.paddingRatio ?? DEFAULT_LINE_Y_PADDING_RATIO,
+    );
+    if (reset || !this.lineYRange || !this.lineStickyYActive) {
+      this.lineStickyYActive = true;
+      return computed;
+    }
+    return {
+      min: Math.min(this.lineYRange.min, computed.min),
+      max: Math.max(this.lineYRange.max, computed.max),
+    };
+  }
+
+  private computeLineAutoYRange(paddingRatio: number): LineRange {
+    const padding = Number.isFinite(paddingRatio)
+      ? Math.max(0, paddingRatio)
+      : DEFAULT_LINE_Y_PADDING_RATIO;
+    let min = Number.POSITIVE_INFINITY;
+    let max = Number.NEGATIVE_INFINITY;
+
+    for (const series of this.lineSeries) {
+      if (!series.visible) continue;
+      for (const value of series.data) {
+        if (!Number.isFinite(value)) continue;
+        min = Math.min(min, value);
+        max = Math.max(max, value);
+      }
+    }
+
+    if (!Number.isFinite(min) || !Number.isFinite(max)) {
+      return { min: -1, max: 1 };
+    }
+    if (min === max) {
+      const delta = Math.max(1, Math.abs(min) * padding);
+      return { min: min - delta, max: max + delta };
+    }
+    const delta = (max - min) * padding;
+    return { min: min - delta, max: max + delta };
+  }
+
+  private flattenLineData(): Float32Array {
+    const flat = new Float32Array(
+      this.lineSeries.length * this.lineSampleCount,
+    );
+    for (let i = 0; i < this.lineSeries.length; i++) {
+      flat.set(this.lineSeries[i].data, i * this.lineSampleCount);
+    }
+    return flat;
+  }
+
+  private buildLineColorBuffer(): Float32Array {
+    const colors = new Float32Array(this.lineSeries.length * 4);
+    for (let i = 0; i < this.lineSeries.length; i++) {
+      const [r, g, b, a] = this.lineSeries[i].color;
+      const offset = i * 4;
+      colors[offset] = r / 255;
+      colors[offset + 1] = g / 255;
+      colors[offset + 2] = b / 255;
+      colors[offset + 3] = a;
+    }
+    return colors;
+  }
+
+  private buildLineVisibilityBuffer(): Uint32Array {
+    const visibility = new Uint32Array(this.lineSeries.length);
+    for (let i = 0; i < this.lineSeries.length; i++) {
+      visibility[i] = this.lineSeries[i].visible ? 1 : 0;
+    }
+    return visibility;
+  }
+
+  private updateLineGpuConfig(): void {
+    if (!this.lineXAxis || !this.lineYRange || this.lineSeries.length === 0) {
+      return;
+    }
+    if (this.lineXAxis.xMode === LINE_X_MODE_EXPLICIT) {
+      (this.inner as WasmLeibnizFastInner).setLineData(
+        this.flattenLineData(),
+        this.lineSampleCount,
+        this.lineSeries.length,
+        this.buildLineColorBuffer(),
+        this.buildLineVisibilityBuffer(),
+        this.lineXAxis.xValues,
+        this.lineXAxis.xMode,
+        this.lineXAxis.xStart,
+        this.lineXAxis.xStep,
+        this.lineXAxis.xMin,
+        this.lineXAxis.xMax,
+        this.lineYRange.min,
+        this.lineYRange.max,
+      );
+      return;
+    }
+    (this.inner as WasmLeibnizFastInner).updateLineConfig(
+      this.buildLineColorBuffer(),
+      this.buildLineVisibilityBuffer(),
+      this.lineXAxis.xMode,
+      this.lineXAxis.xStart,
+      this.lineXAxis.xStep,
+      this.lineXAxis.xMin,
+      this.lineXAxis.xMax,
+      this.lineYRange.min,
+      this.lineYRange.max,
+    );
+  }
+
+  private syncLineLegend(): void {
+    const chart = this.getLineChart();
+    if (!this.legendDiv || !chart || chart.legend === false) {
+      if (this.legendDiv) this.legendDiv.style.display = 'none';
+      this.lineLegendSignature = '';
+      return;
+    }
+
+    this.legendDiv.style.display = 'block';
+
+    const signature = this.getLineLegendSignature();
+    if (
+      signature !== this.lineLegendSignature ||
+      this.legendDiv.childElementCount !== this.lineSeries.length
+    ) {
+      this.legendDiv.replaceChildren();
+      for (const series of this.lineSeries) {
+        this.legendDiv.appendChild(this.createLineLegendButton(series));
+      }
+      this.lineLegendSignature = signature;
+    } else {
+      const buttons = this.legendDiv.querySelectorAll<HTMLButtonElement>(
+        '.lf-line-legend-item',
+      );
+      for (let i = 0; i < this.lineSeries.length; i++) {
+        const button = buttons[i];
+        if (button) this.updateLineLegendButton(button, this.lineSeries[i]);
+      }
+    }
+    this.positionLineLegend();
+  }
+
+  private getLineLegendSignature(): string {
+    return this.lineSeries
+      .map(
+        (series) =>
+          `${series.id}\u0000${series.name}\u0000${series.color.join(',')}`,
+      )
+      .join('\u0001');
+  }
+
+  private createLineLegendButton(series: LineSeriesState): HTMLButtonElement {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.style.display = 'flex';
+    button.style.alignItems = 'center';
+    button.style.gap = '6px';
+    button.style.width = '100%';
+    button.style.margin = '0 0 4px 0';
+    button.style.padding = '3px 4px';
+    button.style.border = '0';
+    button.style.borderRadius = '3px';
+    button.style.background = 'transparent';
+    button.style.color = 'inherit';
+    button.style.cursor = 'pointer';
+    button.style.textAlign = 'left';
+
+    const swatch = document.createElement('span');
+    swatch.className = 'lf-line-legend-swatch';
+    swatch.style.width = '18px';
+    swatch.style.height = '3px';
+    swatch.style.flex = '0 0 auto';
+
+    const label = document.createElement('span');
+    label.className = 'lf-line-legend-label';
+    label.style.overflow = 'hidden';
+    label.style.textOverflow = 'ellipsis';
+    label.style.whiteSpace = 'nowrap';
+
+    button.append(swatch, label);
+    button.addEventListener('mousedown', (event) => event.stopPropagation());
+    button.addEventListener('mouseup', (event) => event.stopPropagation());
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const id = button.dataset.seriesId;
+      const current = this.lineSeries.find((item) => item.id === id);
+      if (id && current) {
+        this.setLineSeriesVisibility(id, !current.visible);
+      }
+    });
+
+    this.updateLineLegendButton(button, series);
+    return button;
+  }
+
+  private updateLineLegendButton(
+    button: HTMLButtonElement,
+    series: LineSeriesState,
+  ): void {
+    button.dataset.seriesId = series.id;
+    button.className = series.visible
+      ? 'lf-line-legend-item'
+      : 'lf-line-legend-item is-hidden';
+    button.title = series.name;
+    button.style.opacity = series.visible ? '1' : '0.38';
+
+    const swatch = button.querySelector<HTMLSpanElement>(
+      '.lf-line-legend-swatch',
+    );
+    if (swatch) {
+      const [r, g, b, a] = series.color;
+      swatch.style.background = `rgba(${r}, ${g}, ${b}, ${a})`;
+    }
+
+    const label = button.querySelector<HTMLSpanElement>(
+      '.lf-line-legend-label',
+    );
+    if (label) label.textContent = series.name;
+  }
+
+  private positionLineLegend(): void {
+    if (!this.legendDiv || !this.wrapperDiv) return;
+    const chart = this.getLineChart();
+    if (!chart || chart.legend === false) return;
+
+    const wrapperRect = this.wrapperDiv.getBoundingClientRect();
+    const left = this.layout.x + this.layout.width + 16;
+    const rightPadding = 16;
+    const width = Math.max(80, wrapperRect.width - left - rightPadding);
+    this.legendDiv.style.left = `${left}px`;
+    this.legendDiv.style.top = `${this.layout.y}px`;
+    this.legendDiv.style.width = `${width}px`;
+    this.legendDiv.style.maxHeight = `${this.layout.height}px`;
+  }
+
+  private setLineYManual(): void {
+    const chart = this.getLineChart();
+    if (chart?.yAxis?.rangeMode !== 'fixed') {
+      this.lineStickyYActive = false;
+    }
+  }
+
+  private resetLineStickyY(): void {
+    const chart = this.getLineChart();
+    if (!chart || chart.yAxis?.rangeMode === 'fixed') return;
+    this.lineStickyYActive = true;
+    this.lineYRange = this.resolveLineYRange(chart.yAxis, true);
+    this.updateLineGpuConfig();
+  }
+
+  private resolveLineSampleAtX(
+    series: LineSeriesState,
+    x: number,
+  ): { sampleIndex: number; value: number } | null {
+    if (
+      !this.lineXAxis ||
+      this.lineSampleCount < 2 ||
+      x < this.lineXAxis.xMin ||
+      x > this.lineXAxis.xMax
+    ) {
+      return null;
+    }
+
+    let sampleIndex = 0;
+    let fraction = 0;
+
+    const xValues = this.lineXAxis.xValues;
+    if (xValues) {
+      if (x === xValues[this.lineSampleCount - 1]) {
+        sampleIndex = this.lineSampleCount - 2;
+        fraction = 1;
+      } else {
+        let lo = 0;
+        let hi = this.lineSampleCount - 1;
+        while (hi - lo > 1) {
+          const mid = lo + Math.floor((hi - lo) / 2);
+          if (xValues[mid] <= x) lo = mid;
+          else hi = mid;
+        }
+        sampleIndex = lo;
+        const x0 = xValues[sampleIndex];
+        const x1 = xValues[sampleIndex + 1];
+        fraction = (x - x0) / (x1 - x0);
+      }
+    } else {
+      const rawIndex = (x - this.lineXAxis.xStart) / this.lineXAxis.xStep;
+      if (rawIndex >= this.lineSampleCount - 1) {
+        sampleIndex = this.lineSampleCount - 2;
+        fraction = 1;
+      } else {
+        sampleIndex = Math.max(0, Math.floor(rawIndex));
+        fraction = rawIndex - sampleIndex;
+      }
+    }
+
+    fraction = Math.max(0, Math.min(1, fraction));
+    const firstIndex =
+      (this.lineRingCursor + sampleIndex) % this.lineSampleCount;
+    const secondIndex =
+      (this.lineRingCursor + sampleIndex + 1) % this.lineSampleCount;
+    const first = series.data[firstIndex];
+    const second = series.data[secondIndex];
+    if (!Number.isFinite(first) || !Number.isFinite(second)) return null;
+
+    return {
+      sampleIndex,
+      value: first + (second - first) * fraction,
+    };
+  }
+
+  private lineValueToCanvasPoint(
+    x: number,
+    value: number,
+    uv: Float32Array,
+  ): { x: number; y: number } | null {
+    if (!this.lineXAxis || !this.lineYRange) return null;
+
+    const xSpan = this.lineXAxis.xMax - this.lineXAxis.xMin;
+    const ySpan = this.lineYRange.max - this.lineYRange.min;
+    if (xSpan <= 0 || ySpan <= 0 || uv[2] <= 0 || uv[3] <= 0) return null;
+
+    const fullU = (x - this.lineXAxis.xMin) / xSpan;
+    const fullV = (this.lineYRange.max - value) / ySpan;
+    return {
+      x: ((fullU - uv[0]) / uv[2]) * this.canvas.clientWidth,
+      y: ((fullV - uv[1]) / uv[3]) * this.canvas.clientHeight,
+    };
+  }
+
+  private emitLineHover(canvasX: number, canvasY: number): void {
+    if (!this.lineXAxis || !this.lineYRange || this.lineSampleCount < 2) {
+      this.lineHoverGuide = null;
+      return;
+    }
+
+    const canvasWidth = this.canvas.clientWidth;
+    const canvasHeight = this.canvas.clientHeight;
+    if (canvasWidth <= 0 || canvasHeight <= 0) {
+      this.lineHoverGuide = null;
+      return;
+    }
+
+    const clampedMouseX = Math.max(0, Math.min(canvasX, canvasWidth));
+    const clampedMouseY = Math.max(0, Math.min(canvasY, canvasHeight));
+    const uv = this.inner.getVisibleRange();
+    const xSpan = this.lineXAxis.xMax - this.lineXAxis.xMin;
+    const fullU = uv[0] + (clampedMouseX / canvasWidth) * uv[2];
+    const x = this.lineXAxis.xMin + fullU * xSpan;
+    const chart = this.getLineChart();
+    const points: LineHoverPoint[] = [];
+    const guidePoints: LineHoverGuidePoint[] = [];
+
+    for (
+      let seriesIndex = 0;
+      seriesIndex < this.lineSeries.length;
+      seriesIndex++
+    ) {
+      const series = this.lineSeries[seriesIndex];
+      if (!series.visible) continue;
+
+      const resolved = this.resolveLineSampleAtX(series, x);
+      if (!resolved) continue;
+
+      points.push({
+        seriesId: series.id,
+        seriesName: series.name,
+        seriesIndex,
+        sampleIndex: resolved.sampleIndex,
+        x,
+        value: resolved.value,
+        color: [...series.color] as [number, number, number, number],
+      });
+
+      const point = this.lineValueToCanvasPoint(x, resolved.value, uv);
+      if (
+        point &&
+        point.x >= 0 &&
+        point.x <= canvasWidth &&
+        point.y >= 0 &&
+        point.y <= canvasHeight
+      ) {
+        guidePoints.push({
+          x: point.x,
+          y: point.y,
+          color: series.color,
+        });
+      }
+    }
+
+    this.lineHoverGuide = {
+      mouseX: clampedMouseX,
+      mouseY: clampedMouseY,
+      points: guidePoints,
+    };
+
+    this.hoverCallback?.({
+      kind: 'line',
+      x,
+      mouseX: clampedMouseX,
+      mouseY: clampedMouseY,
+      xUnit: chart?.xAxis?.unit,
+      yUnit: chart?.yAxis?.unit,
+      points,
+    });
+    this.scheduleOverlayUpdate();
   }
 
   // ---------------------------------------------------------------------------
@@ -821,6 +1821,7 @@ export class LeibnizFast {
   }
 
   private registerEventListeners(): void {
+    if (this.disposed) return;
     const target = this.eventTarget;
     target.addEventListener('mousedown', this.boundHandlers.mousedown);
     target.addEventListener('mousemove', this.boundHandlers.mousemove);
@@ -836,14 +1837,18 @@ export class LeibnizFast {
   }
 
   private removeEventListeners(): void {
-    const target = this.eventTarget;
-    target.removeEventListener('mousedown', this.boundHandlers.mousedown);
-    target.removeEventListener('mousemove', this.boundHandlers.mousemove);
-    target.removeEventListener('mouseenter', this.boundHandlers.mouseenter);
-    target.removeEventListener('mouseleave', this.boundHandlers.mouseleave);
-    target.removeEventListener('wheel', this.boundHandlers.wheel);
-    target.removeEventListener('contextmenu', this.boundHandlers.contextmenu);
-    target.removeEventListener('dblclick', this.boundHandlers.dblclick);
+    const targets = new Set<HTMLElement>([this.canvas]);
+    if (this.wrapperDiv) targets.add(this.wrapperDiv);
+
+    for (const target of targets) {
+      target.removeEventListener('mousedown', this.boundHandlers.mousedown);
+      target.removeEventListener('mousemove', this.boundHandlers.mousemove);
+      target.removeEventListener('mouseenter', this.boundHandlers.mouseenter);
+      target.removeEventListener('mouseleave', this.boundHandlers.mouseleave);
+      target.removeEventListener('wheel', this.boundHandlers.wheel);
+      target.removeEventListener('contextmenu', this.boundHandlers.contextmenu);
+      target.removeEventListener('dblclick', this.boundHandlers.dblclick);
+    }
     window.removeEventListener('mouseup', this.boundHandlers.mouseup);
     window.removeEventListener('resize', this.boundHandlers.resize);
   }
@@ -898,9 +1903,8 @@ export class LeibnizFast {
 
   /** Whether this is a streaming/waterfall chart (X axis is time). */
   private isStreamingChart(): boolean {
-    return !!(
-      this.chartConfig?.xAxis && isStreamingAxis(this.chartConfig.xAxis)
-    );
+    const chart = this.getHeatmapChart();
+    return !!(chart?.xAxis && isStreamingAxis(chart.xAxis));
   }
 
   // ---------------------------------------------------------------------------
@@ -908,6 +1912,7 @@ export class LeibnizFast {
   // ---------------------------------------------------------------------------
 
   private handleMouseDown(e: MouseEvent): void {
+    if (this.disposed) return;
     const { wx, wy } = this.wrapperCoords(e);
     const region = this.getHitRegion(wx, wy);
     const { cx, cy } = this.toCanvasLocal(wx, wy);
@@ -917,16 +1922,24 @@ export class LeibnizFast {
 
     if (isLeft && region === 'matrix') {
       // Standard left-drag pan via WASM
+      if (this.isLineChart()) this.setLineYManual();
+      this.mouseInPlot = true;
+      this.lineHoverGuide = null;
       this.interactionMode = { type: 'matrix-pan' };
       this.inner.onMouseDown(cx, cy);
       this.updateCursor('grabbing');
     } else if (isLeft && region === 'y-axis') {
+      this.mouseInPlot = false;
+      if (this.isLineChart()) this.setLineYManual();
       this.interactionMode = { type: 'axis-pan', axis: 'y', lastPos: wy };
       this.updateCursor('grabbing');
-    } else if (isLeft && region === 'x-axis' && !streaming) {
+    } else if (isLeft && region === 'x-axis') {
+      this.mouseInPlot = false;
       this.interactionMode = { type: 'axis-pan', axis: 'x', lastPos: wx };
       this.updateCursor('grabbing');
     } else if (isRight && region === 'matrix' && !streaming) {
+      this.mouseInPlot = true;
+      if (this.isLineChart()) this.setLineYManual();
       this.interactionMode = {
         type: 'rect-select',
         startX: wx,
@@ -936,13 +1949,16 @@ export class LeibnizFast {
       };
       this.updateCursor('crosshair');
     } else if (isRight && region === 'y-axis') {
+      this.mouseInPlot = false;
+      if (this.isLineChart()) this.setLineYManual();
       this.interactionMode = {
         type: 'axis-select',
         axis: 'y',
         startPos: wy,
         currentPos: wy,
       };
-    } else if (isRight && region === 'x-axis' && !streaming) {
+    } else if (isRight && region === 'x-axis') {
+      this.mouseInPlot = false;
       this.interactionMode = {
         type: 'axis-select',
         axis: 'x',
@@ -953,6 +1969,7 @@ export class LeibnizFast {
   }
 
   private handleMouseMove(e: MouseEvent): void {
+    if (this.disposed) return;
     const { wx, wy } = this.wrapperCoords(e);
     const { cx, cy } = this.toCanvasLocal(wx, wy);
     const mode = this.interactionMode;
@@ -1000,16 +2017,28 @@ export class LeibnizFast {
         const region = this.getHitRegion(wx, wy);
 
         if (region === 'matrix') {
-          this.inner.onMouseMove(cx, cy);
+          this.mouseInPlot = true;
+          if (this.isLineChart()) {
+            this.emitLineHover(cx, cy);
+          } else {
+            this.lineHoverGuide = null;
+            this.inner.onMouseMove(cx, cy);
+          }
           this.hoveredAxis = null;
           this.updateCursor('default');
         } else if (region === 'x-axis') {
-          this.hoveredAxis = this.isStreamingChart() ? null : 'x';
-          this.updateCursor(this.isStreamingChart() ? 'default' : 'col-resize');
+          this.mouseInPlot = false;
+          this.lineHoverGuide = null;
+          this.hoveredAxis = 'x';
+          this.updateCursor('col-resize');
         } else if (region === 'y-axis') {
+          this.mouseInPlot = false;
+          this.lineHoverGuide = null;
           this.hoveredAxis = 'y';
           this.updateCursor('row-resize');
         } else {
+          this.mouseInPlot = false;
+          this.lineHoverGuide = null;
           this.hoveredAxis = null;
           this.updateCursor('default');
         }
@@ -1020,6 +2049,7 @@ export class LeibnizFast {
   }
 
   private handleMouseUp(_e: MouseEvent): void {
+    if (this.disposed) return;
     const mode = this.interactionMode;
 
     switch (mode.type) {
@@ -1048,19 +2078,21 @@ export class LeibnizFast {
   }
 
   private handleWheel(e: WheelEvent): void {
+    if (this.disposed) return;
     e.preventDefault();
     const { wx, wy } = this.wrapperCoords(e);
     const region = this.getHitRegion(wx, wy);
     const { cx, cy } = this.toCanvasLocal(wx, wy);
     const delta = -e.deltaY;
-    const streaming = this.isStreamingChart();
 
     if (region === 'matrix') {
+      if (this.isLineChart()) this.setLineYManual();
       this.inner.onWheel(cx, cy, delta);
-    } else if (region === 'x-axis' && !streaming) {
+    } else if (region === 'x-axis') {
       // Zoom X at the horizontal position mapped to canvas-local X
       this.inner.zoomAtX(cx, delta);
     } else if (region === 'y-axis') {
+      if (this.isLineChart()) this.setLineYManual();
       // Zoom Y at the vertical position mapped to canvas-local Y
       this.inner.zoomAtY(cy, delta);
     }
@@ -1068,18 +2100,20 @@ export class LeibnizFast {
   }
 
   private handleDblClick(e: MouseEvent): void {
+    if (this.disposed) return;
     const { wx, wy } = this.wrapperCoords(e);
     const region = this.getHitRegion(wx, wy);
-    const streaming = this.isStreamingChart();
 
     const uv = this.inner.getVisibleRange();
     const from = { x: uv[0], y: uv[1], w: uv[2], h: uv[3] };
 
     if (region === 'matrix') {
+      if (this.isLineChart()) this.resetLineStickyY();
       this.animateToUvRect(from, { x: 0, y: 0, w: 1, h: 1 });
-    } else if (region === 'x-axis' && !streaming) {
+    } else if (region === 'x-axis') {
       this.animateToUvRect(from, { x: 0, y: from.y, w: 1, h: from.h });
     } else if (region === 'y-axis') {
+      if (this.isLineChart()) this.resetLineStickyY();
       this.animateToUvRect(from, { x: from.x, y: 0, w: from.w, h: 1 });
     }
   }
@@ -1092,6 +2126,7 @@ export class LeibnizFast {
     from: { x: number; y: number; w: number; h: number },
     to: { x: number; y: number; w: number; h: number },
   ): void {
+    if (this.disposed) return;
     // Cancel any in-progress animation
     if (this.zoomAnimationId !== null) {
       cancelAnimationFrame(this.zoomAnimationId);
@@ -1101,6 +2136,7 @@ export class LeibnizFast {
     const startTime = performance.now();
 
     const step = (now: number) => {
+      if (this.disposed) return;
       const elapsed = now - startTime;
       const rawT = Math.min(1, elapsed / ANIMATION_DURATION_MS);
       // Ease-out cubic: decelerates smoothly
@@ -1162,6 +2198,7 @@ export class LeibnizFast {
     const vMin = uv[1] + y0 * uv[3];
     const vMax = uv[1] + y1 * uv[3];
 
+    if (this.isLineChart()) this.setLineYManual();
     this.inner.zoomToUvRect(uMin, vMin, uMax, vMax);
   }
 
@@ -1200,6 +2237,7 @@ export class LeibnizFast {
       const vMin = uv[1] + y0 * uv[3];
       const vMax = uv[1] + y1 * uv[3];
       // Keep current X range
+      if (this.isLineChart()) this.setLineYManual();
       this.inner.zoomToUvRect(uv[0], vMin, uv[0] + uv[2], vMax);
     }
   }
@@ -1209,6 +2247,7 @@ export class LeibnizFast {
   // ---------------------------------------------------------------------------
 
   private updateCursor(cursor: string): void {
+    if (this.disposed) return;
     this.eventTarget.style.cursor = cursor;
   }
 
@@ -1221,6 +2260,7 @@ export class LeibnizFast {
    * Reparents the WebGPU canvas inside a container div.
    */
   private setupChartOverlay(): void {
+    if (this.disposed) return;
     if (this.wrapperDiv) return; // already set up
 
     // Remove listeners from canvas before reparenting
@@ -1261,19 +2301,35 @@ export class LeibnizFast {
     overlay.style.pointerEvents = 'none';
     wrapper.appendChild(overlay);
 
+    const legend = document.createElement('div');
+    legend.className = 'lf-line-legend';
+    legend.style.position = 'absolute';
+    legend.style.display = 'none';
+    legend.style.padding = '8px';
+    legend.style.border = '1px solid rgba(255, 255, 255, 0.18)';
+    legend.style.borderRadius = '4px';
+    legend.style.background = 'rgba(12, 12, 16, 0.86)';
+    legend.style.overflow = 'auto';
+    legend.style.pointerEvents = 'auto';
+    legend.style.font = '12px sans-serif';
+    legend.style.color = '#ddd';
+    wrapper.appendChild(legend);
+
     this.wrapperDiv = wrapper;
     this.overlayCanvas = overlay;
     this.overlayCtx = overlay.getContext('2d');
+    this.legendDiv = legend;
 
     // Re-register listeners on wrapper (covers axis regions)
     this.registerEventListeners();
+    this.syncLineLegend();
   }
 
   /**
    * Remove the overlay canvas and wrapper div, restoring the original
    * canvas position in the DOM.
    */
-  private teardownChartOverlay(): void {
+  private teardownChartOverlay(registerCanvasListeners: boolean = true): void {
     if (!this.wrapperDiv) return;
 
     this.removeEventListeners();
@@ -1293,13 +2349,19 @@ export class LeibnizFast {
     if (this.overlayCanvas) {
       this.overlayCanvas.remove();
     }
+    if (this.legendDiv) {
+      this.legendDiv.remove();
+    }
 
     this.wrapperDiv = null;
     this.overlayCanvas = null;
     this.overlayCtx = null;
+    this.legendDiv = null;
 
-    // Re-register on canvas directly
-    this.registerEventListeners();
+    // Re-register on canvas directly when the viewer remains alive.
+    if (registerCanvasListeners && !this.disposed) {
+      this.registerEventListeners();
+    }
   }
 
   /**
@@ -1307,6 +2369,7 @@ export class LeibnizFast {
    * update the WASM renderer, and redraw the overlay.
    */
   private handleResize(): void {
+    if (this.disposed) return;
     const dpr = window.devicePixelRatio || 1;
 
     if (this.chartConfig && this.wrapperDiv && this.overlayCtx) {
@@ -1341,6 +2404,7 @@ export class LeibnizFast {
 
       // Redraw overlay
       this.updateOverlay();
+      this.positionLineLegend();
     } else {
       // No chart mode: standard resize
       const rect = this.canvas.getBoundingClientRect();
@@ -1355,9 +2419,11 @@ export class LeibnizFast {
    * Multiple calls per frame are coalesced into a single redraw.
    */
   private scheduleOverlayUpdate(): void {
+    if (this.disposed) return;
     if (this.overlayDirty) return;
     this.overlayDirty = true;
     requestAnimationFrame(() => {
+      if (this.disposed) return;
       this.overlayDirty = false;
       this.updateOverlay();
     });
@@ -1368,6 +2434,7 @@ export class LeibnizFast {
    * Called after data changes, pan/zoom, and resize.
    */
   private updateOverlay(): void {
+    if (this.disposed) return;
     if (!this.chartConfig || !this.overlayCtx || !this.wrapperDiv) return;
 
     const ctx = this.overlayCtx;
@@ -1388,6 +2455,7 @@ export class LeibnizFast {
       dpr,
       this.getColorbarData(),
     );
+    this.positionLineLegend();
 
     // Draw interaction overlays on top of axes (inside the same DPR transform)
     ctx.save();
@@ -1401,6 +2469,20 @@ export class LeibnizFast {
         this.hoveredAxis,
         containerW,
         containerH,
+      );
+    }
+
+    if (
+      this.isLineChart() &&
+      this.interactionMode.type === 'idle' &&
+      this.lineHoverGuide
+    ) {
+      drawLineHoverGuides(
+        ctx,
+        this.layout,
+        this.lineHoverGuide.mouseX,
+        this.lineHoverGuide.mouseY,
+        this.lineHoverGuide.points,
       );
     }
 
@@ -1451,6 +2533,17 @@ export class LeibnizFast {
     const xRange = this.getFullXRange();
     const yRange = this.getFullYRange();
 
+    if (this.isLineChart()) {
+      const xSpan = xRange[1] - xRange[0];
+      const ySpan = yRange[1] - yRange[0];
+      return {
+        xMin: xRange[0] + uvOffset[0] * xSpan,
+        xMax: xRange[0] + (uvOffset[0] + uvScale[0]) * xSpan,
+        yMin: yRange[1] - (uvOffset[1] + uvScale[1]) * ySpan,
+        yMax: yRange[1] - uvOffset[1] * ySpan,
+      };
+    }
+
     return uvToVisibleRange(
       uvOffset,
       uvScale,
@@ -1468,8 +2561,15 @@ export class LeibnizFast {
    *   xMin = (totalColsReceived - displayCols) * unitsPerCell
    */
   private getFullXRange(): [number, number] {
-    if (!this.chartConfig?.xAxis) return [0, 1];
-    const xAxis = this.chartConfig.xAxis;
+    if (this.isLineChart()) {
+      return this.lineXAxis
+        ? [this.lineXAxis.xMin, this.lineXAxis.xMax]
+        : [0, Math.max(1, this.lineSampleCount - 1)];
+    }
+
+    const chart = this.getHeatmapChart();
+    if (!chart?.xAxis) return [0, 1];
+    const xAxis = chart.xAxis;
     if (isStreamingAxis(xAxis)) {
       const xMax = this.streamingXOffset * xAxis.unitsPerCell;
       const xMin =
@@ -1484,8 +2584,15 @@ export class LeibnizFast {
    * Get the full Y axis range from the chart configuration.
    */
   private getFullYRange(): [number, number] {
-    if (!this.chartConfig?.yAxis) return [0, 1];
-    return [this.chartConfig.yAxis.min, this.chartConfig.yAxis.max];
+    if (this.isLineChart()) {
+      return this.lineYRange
+        ? [this.lineYRange.min, this.lineYRange.max]
+        : [-1, 1];
+    }
+
+    const chart = this.getHeatmapChart();
+    if (!chart?.yAxis) return [0, 1];
+    return [chart.yAxis.min, chart.yAxis.max];
   }
 
   /**
@@ -1498,8 +2605,8 @@ export class LeibnizFast {
     value: number,
     valueAvailable: boolean = true,
   ): HoverInfo {
-    const info: HoverInfo = { row, col, value, valueAvailable };
-    const cfg = this.chartConfig;
+    const info: HeatmapHoverInfo = { row, col, value, valueAvailable };
+    const cfg = this.getHeatmapChart();
     if (!cfg) return info;
 
     if (cfg.yAxis) {
@@ -1520,6 +2627,11 @@ export class LeibnizFast {
       info.valueUnit = cfg.valueUnit;
     }
 
+    const color = this.getHeatmapValueColor(value);
+    if (color) {
+      info.color = color;
+    }
+
     return info;
   }
 
@@ -1527,7 +2639,15 @@ export class LeibnizFast {
    * Re-invoke the hover lookup at the last known mouse position.
    */
   private refreshHoverIfNeeded(): void {
-    if (!this.mouseInside || !this.hoverCallback) return;
+    if (!this.mouseInside) return;
+
+    if (this.isLineChart()) {
+      if (!this.mouseInPlot) return;
+      this.emitLineHover(this.lastMouseX, this.lastMouseY);
+      return;
+    }
+
+    if (!this.hoverCallback) return;
 
     const rows = this.matrixRows;
     const cols = this.matrixCols;

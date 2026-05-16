@@ -272,6 +272,24 @@ function updateDataRate(bytes) {
   }
 }
 
+function formatUnit(unit) {
+  return unit ? ` ${unit}` : '';
+}
+
+function colorSwatch(color) {
+  const [r, g, b, a] = color ?? [148, 163, 184, 0.65];
+  return `rgba(${r}, ${g}, ${b}, ${a})`;
+}
+
+function renderHeatmapTooltip(info, valueText, showValueUnit) {
+  const yText = `${info.y?.toFixed(1) ?? info.row}${formatUnit(info.yUnit)}`;
+  const xText = `${info.x?.toFixed(2) ?? info.col}${formatUnit(info.xUnit)}`;
+  const valueUnit = showValueUnit ? formatUnit(info.valueUnit) : '';
+  tooltip.innerHTML =
+    `<div class="tooltip-x">Y: ${yText}<br>X: ${xText}</div>` +
+    `<div class="tooltip-row"><span class="tooltip-swatch" style="background: ${colorSwatch(info.color)}"></span><strong>${valueText}${valueUnit}</strong></div>`;
+}
+
 function applyRange() {
   const mn = parseFloat(rangeMinInput.value);
   const mx = parseFloat(rangeMaxInput.value);
@@ -631,10 +649,7 @@ async function main() {
     const valueText = info.valueAvailable
       ? info.value.toFixed(4)
       : 'unavailable';
-    tooltip.innerHTML =
-      `Y: ${info.y?.toFixed(1) ?? info.row} ${info.yUnit ?? ''}<br>` +
-      `X: ${info.x?.toFixed(2) ?? info.col} ${info.xUnit ?? ''}<br>` +
-      `Value: ${valueText}${info.valueAvailable && info.valueUnit ? ' ' + info.valueUnit : ''}`;
+    renderHeatmapTooltip(info, valueText, info.valueAvailable);
   });
 
   canvas.addEventListener('mousemove', (e) => {

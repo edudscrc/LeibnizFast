@@ -31,6 +31,7 @@ const examples = new Map([
       compiler: 'g++',
     },
   ],
+  ['line', { path: '/examples/line/' }]
 ]);
 
 const config = examples.get(example);

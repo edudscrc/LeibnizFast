@@ -1,314 +1,404 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LeibnizFast — Waterfall</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
 
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>LeibnizFast — Waterfall</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
+      body {
+        font-family: system-ui, sans-serif;
+        background: #1a1a2e;
+        color: #eee;
+      }
 
-    body {
-      font-family: system-ui, sans-serif;
-      background: #1a1a2e;
-      color: #eee;
-    }
+      .container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 20px;
+        gap: 12px;
+      }
 
-    .container {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 20px;
-      gap: 12px;
-    }
+      h1 {
+        font-size: 1.4rem;
+        color: #e0e0ff;
+      }
 
-    h1 {
-      font-size: 1.4rem;
-      color: #e0e0ff;
-    }
+      p.note {
+        font-size: 0.85rem;
+        color: #aaa;
+        max-width: 820px;
+        text-align: center;
+      }
 
-    p.note {
-      font-size: 0.85rem;
-      color: #aaa;
-      max-width: 820px;
-      text-align: center;
-    }
+      .controls {
+        display: flex;
+        gap: 16px;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
 
-    .controls {
-      display: flex;
-      gap: 16px;
-      align-items: center;
-      flex-wrap: wrap;
-      justify-content: center;
-    }
+      label {
+        font-size: 0.9rem;
+      }
 
-    label {
-      font-size: 0.9rem;
-    }
+      select {
+        padding: 4px 8px;
+        border-radius: 4px;
+        border: 1px solid #444;
+        background: #2a2a4e;
+        color: #eee;
+      }
 
-    select {
-      padding: 4px 8px;
-      border-radius: 4px;
-      border: 1px solid #444;
-      background: #2a2a4e;
-      color: #eee;
-    }
+      input[type='number'] {
+        padding: 4px 8px;
+        border-radius: 4px;
+        border: 1px solid #444;
+        background: #2a2a4e;
+        color: #eee;
+        width: 72px;
+      }
 
-    input[type="number"] {
-      padding: 4px 8px;
-      border-radius: 4px;
-      border: 1px solid #444;
-      background: #2a2a4e;
-      color: #eee;
-      width: 72px;
-    }
+      canvas {
+        border: 1px solid #333;
+        cursor: crosshair;
+      }
 
-    canvas {
-      border: 1px solid #333;
-      cursor: crosshair;
-    }
+      .tooltip {
+        position: fixed;
+        padding: 6px 10px;
+        background: rgba(0, 0, 0, 0.86);
+        color: #fff;
+        border-radius: 4px;
+        font-size: 0.82rem;
+        pointer-events: none;
+        display: none;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        min-width: 190px;
+      }
 
-    .tooltip {
-      position: fixed;
-      padding: 6px 10px;
-      background: rgba(0, 0, 0, 0.85);
-      color: #fff;
-      border-radius: 4px;
-      font-size: 0.85rem;
-      pointer-events: none;
-      display: none;
-      font-family: monospace;
-    }
+      .tooltip-x {
+        margin-bottom: 5px;
+        color: #d8dee9;
+      }
 
-    .error-banner {
-      width: 100%;
-      max-width: 820px;
-      padding: 8px 14px;
-      background: #5c1a1a;
-      color: #ffcccc;
-      border: 1px solid #c44;
-      border-radius: 4px;
-      font-size: 0.85rem;
-      display: none;
-    }
+      .tooltip-row {
+        align-items: center;
+        display: grid;
+        grid-template-columns: 14px auto;
+        gap: 5px;
+        line-height: 1.45;
+      }
 
-    /* Connection status badge */
-    .status-row {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
+      .tooltip-swatch {
+        display: inline-block;
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+      }
 
-    .status-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 12px;
-      border-radius: 12px;
-      font-size: 0.8rem;
-      font-weight: 600;
-      letter-spacing: 0.03em;
-      transition: background 0.3s, color 0.3s;
-    }
+      .error-banner {
+        width: 100%;
+        max-width: 820px;
+        padding: 8px 14px;
+        background: #5c1a1a;
+        color: #ffcccc;
+        border: 1px solid #c44;
+        border-radius: 4px;
+        font-size: 0.85rem;
+        display: none;
+      }
 
-    .status-badge.connecting   { background: #3a3a20; color: #ccc840; }
-    .status-badge.connected    { background: #1a3a1a; color: #4ccc4c; }
-    .status-badge.disconnected { background: #3a1a1a; color: #cc4444; }
+      /* Connection status badge */
+      .status-row {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
 
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: currentColor;
-    }
+      .status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        letter-spacing: 0.03em;
+        transition:
+          background 0.3s,
+          color 0.3s;
+      }
 
-    .fps-counter {
-      font-size: 0.85rem;
-      color: #aaa;
-      font-family: monospace;
-      min-width: 72px;
-    }
+      .status-badge.connecting {
+        background: #3a3a20;
+        color: #ccc840;
+      }
+      .status-badge.connected {
+        background: #1a3a1a;
+        color: #4ccc4c;
+      }
+      .status-badge.disconnected {
+        background: #3a1a1a;
+        color: #cc4444;
+      }
 
-    .data-rate {
-      font-size: 0.85rem;
-      color: #aaa;
-      font-family: monospace;
-      min-width: 100px;
-    }
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: currentColor;
+      }
 
-    .range-inputs {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
+      .fps-counter {
+        font-size: 0.85rem;
+        color: #aaa;
+        font-family: monospace;
+        min-width: 72px;
+      }
 
-    .gen-params {
-      border: 1px solid #3a3a5e;
-      border-radius: 6px;
-      padding: 12px 16px;
-      max-width: 820px;
-      width: 100%;
-    }
+      .data-rate {
+        font-size: 0.85rem;
+        color: #aaa;
+        font-family: monospace;
+        min-width: 100px;
+      }
 
-    .gen-params legend {
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: #aab;
-      padding: 0 6px;
-      letter-spacing: 0.05em;
-    }
+      .range-inputs {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
 
-    .gen-params-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-      gap: 10px 20px;
-      margin-bottom: 12px;
-    }
+      .gen-params {
+        border: 1px solid #3a3a5e;
+        border-radius: 6px;
+        padding: 12px 16px;
+        max-width: 820px;
+        width: 100%;
+      }
 
-    .gen-params-grid label {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      font-size: 0.82rem;
-      color: #ccc;
-    }
+      .gen-params legend {
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: #aab;
+        padding: 0 6px;
+        letter-spacing: 0.05em;
+      }
 
-    .gen-params-grid input[type="number"] {
-      width: 100%;
-    }
+      .gen-params-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 10px 20px;
+        margin-bottom: 12px;
+      }
 
-    .gen-params-footer {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
+      .gen-params-grid label {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 0.82rem;
+        color: #ccc;
+      }
 
-    button#gen-save {
-      padding: 6px 18px;
-      border-radius: 4px;
-      border: 1px solid #556;
-      background: #2a2a5e;
-      color: #dde;
-      font-size: 0.88rem;
-      cursor: pointer;
-      transition: background 0.15s;
-    }
+      .gen-params-grid input[type='number'] {
+        width: 100%;
+      }
 
-    button#gen-save:hover {
-      background: #3a3a7e;
-    }
+      .gen-params-footer {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
 
-    button#gen-save:active {
-      background: #4a4a9e;
-    }
+      button#gen-save {
+        padding: 6px 18px;
+        border-radius: 4px;
+        border: 1px solid #556;
+        background: #2a2a5e;
+        color: #dde;
+        font-size: 0.88rem;
+        cursor: pointer;
+        transition: background 0.15s;
+      }
 
-    #gen-status {
-      font-size: 0.8rem;
-      color: #aab;
-      font-family: monospace;
-    }
-  </style>
-</head>
+      button#gen-save:hover {
+        background: #3a3a7e;
+      }
 
-<body>
-  <div class="container">
-    <h1>LeibnizFast — Waterfall</h1>
-    <p class="note">
-      Simulated spatial-temporal data acquisition streamed from a C++ generator
-      over ZeroMQ to a Python WebSocket bridge. The generator produces signal
-      data at a fixed sampling rate with configurable spatial resolution.
-      New data appears on the right; old data scrolls left.
-      Pan and zoom to explore; hover for per-cell values.
-    </p>
+      button#gen-save:active {
+        background: #4a4a9e;
+      }
 
-    <!-- Connection status + FPS + Data rate -->
-    <div class="status-row">
-      <span class="status-badge connecting" id="status-badge">
-        <span class="status-dot"></span>
-        <span id="status-text">Connecting&hellip;</span>
-      </span>
-      <span class="fps-counter" id="fps-counter">-- FPS</span>
-      <span class="data-rate" id="data-rate">-- MB/s</span>
-    </div>
+      #gen-status {
+        font-size: 0.8rem;
+        color: #aab;
+        font-family: monospace;
+      }
+    </style>
+  </head>
 
-    <div class="controls">
-      <label for="colormap">Colormap:</label>
-      <select id="colormap">
-        <option value="viridis" selected>Viridis</option>
-        <option value="inferno">Inferno</option>
-        <option value="magma">Magma</option>
-        <option value="plasma">Plasma</option>
-        <option value="cividis">Cividis</option>
-        <option value="grayscale">Grayscale</option>
-      </select>
+  <body>
+    <div class="container">
+      <h1>LeibnizFast — Waterfall</h1>
+      <p class="note">
+        Simulated spatial-temporal data acquisition streamed from a C++
+        generator over ZeroMQ to a Python WebSocket bridge. The generator
+        produces signal data at a fixed sampling rate with configurable spatial
+        resolution. New data appears on the right; old data scrolls left. Pan
+        and zoom to explore; hover for per-cell values.
+      </p>
 
-      <div class="range-inputs">
-        <label for="range-min">Min:</label>
-        <input type="number" id="range-min" value="-0.5" step="0.05" />
-        <label for="range-max">Max:</label>
-        <input type="number" id="range-max" value="1.0" step="0.05" />
+      <!-- Connection status + FPS + Data rate -->
+      <div class="status-row">
+        <span class="status-badge connecting" id="status-badge">
+          <span class="status-dot"></span>
+          <span id="status-text">Connecting&hellip;</span>
+        </span>
+        <span class="fps-counter" id="fps-counter">-- FPS</span>
+        <span class="data-rate" id="data-rate">-- MB/s</span>
       </div>
 
-      <label for="debug">
-        <input type="checkbox" id="debug" /> Debug timing
-      </label>
-    </div>
+      <div class="controls">
+        <label for="colormap">Colormap:</label>
+        <select id="colormap">
+          <option value="viridis" selected>Viridis</option>
+          <option value="inferno">Inferno</option>
+          <option value="magma">Magma</option>
+          <option value="plasma">Plasma</option>
+          <option value="cividis">Cividis</option>
+          <option value="grayscale">Grayscale</option>
+        </select>
 
-    <!-- Generator Parameters panel -->
-    <fieldset class="gen-params">
-      <legend>GENERATOR PARAMETERS</legend>
-      <div class="gen-params-grid">
-        <label>
-          Spatial Start (m)
-          <input type="number" id="gen-spatial-start" value="10000" min="0" max="1000000" step="100" />
-        </label>
-        <label>
-          Spatial End (m)
-          <input type="number" id="gen-spatial-end" value="15000" min="1" max="1000000" step="100" />
-        </label>
-        <label>
-          Sampling Rate (MHz)
-          <input type="number" id="gen-sampling-rate" value="400" min="1" max="10000" step="1" />
-        </label>
-        <label>
-          Repetition Rate (Hz)
-          <input type="number" id="gen-repetition-rate" value="1000" min="1" max="1000000" step="100" />
-        </label>
-        <label>
-          Spatial Downsample
-          <input type="number" id="gen-spatial-downsample" value="5" min="1" max="1000" step="1" />
-        </label>
-        <label>
-          Time Buffer (s) — e.g. 0.15, 0.2
-          <input type="number" id="gen-time-buffer" value="0.15" min="0.001" max="60" step="0.01" />
-        </label>
-        <label>
-          Time Window (s) — visible duration
-          <input type="number" id="gen-time-window" value="1.0" min="0.01" max="600" step="0.1" />
+        <div class="range-inputs">
+          <label for="range-min">Min:</label>
+          <input type="number" id="range-min" value="-0.5" step="0.05" />
+          <label for="range-max">Max:</label>
+          <input type="number" id="range-max" value="1.0" step="0.05" />
+        </div>
+
+        <label for="debug">
+          <input type="checkbox" id="debug" /> Debug timing
         </label>
       </div>
-      <div class="gen-params-footer">
-        <button id="gen-save">Save &amp; Restart Generator</button>
-        <span id="gen-status"></span>
-      </div>
-    </fieldset>
 
-    <div id="signal-stats" style="display:flex; gap:20px; font-size:0.82rem; color:#aab; font-family:monospace; padding:2px 0">
-      <span id="stat-rows">Rows: –</span>
-      <span id="stat-cols">Cols/msg: –</span>
-      <span id="stat-rate">Rate: – MB/s</span>
+      <!-- Generator Parameters panel -->
+      <fieldset class="gen-params">
+        <legend>GENERATOR PARAMETERS</legend>
+        <div class="gen-params-grid">
+          <label>
+            Spatial Start (m)
+            <input
+              type="number"
+              id="gen-spatial-start"
+              value="10000"
+              min="0"
+              max="1000000"
+              step="100"
+            />
+          </label>
+          <label>
+            Spatial End (m)
+            <input
+              type="number"
+              id="gen-spatial-end"
+              value="15000"
+              min="1"
+              max="1000000"
+              step="100"
+            />
+          </label>
+          <label>
+            Sampling Rate (MHz)
+            <input
+              type="number"
+              id="gen-sampling-rate"
+              value="400"
+              min="1"
+              max="10000"
+              step="1"
+            />
+          </label>
+          <label>
+            Repetition Rate (Hz)
+            <input
+              type="number"
+              id="gen-repetition-rate"
+              value="1000"
+              min="1"
+              max="1000000"
+              step="100"
+            />
+          </label>
+          <label>
+            Spatial Downsample
+            <input
+              type="number"
+              id="gen-spatial-downsample"
+              value="5"
+              min="1"
+              max="1000"
+              step="1"
+            />
+          </label>
+          <label>
+            Time Buffer (s) — e.g. 0.15, 0.2
+            <input
+              type="number"
+              id="gen-time-buffer"
+              value="0.15"
+              min="0.001"
+              max="60"
+              step="0.01"
+            />
+          </label>
+          <label>
+            Time Window (s) — visible duration
+            <input
+              type="number"
+              id="gen-time-window"
+              value="1.0"
+              min="0.01"
+              max="600"
+              step="0.1"
+            />
+          </label>
+        </div>
+        <div class="gen-params-footer">
+          <button id="gen-save">Save &amp; Restart Generator</button>
+          <span id="gen-status"></span>
+        </div>
+      </fieldset>
+
+      <div
+        id="signal-stats"
+        style="
+          display: flex;
+          gap: 20px;
+          font-size: 0.82rem;
+          color: #aab;
+          font-family: monospace;
+          padding: 2px 0;
+        "
+      >
+        <span id="stat-rows">Rows: –</span>
+        <span id="stat-cols">Cols/msg: –</span>
+        <span id="stat-rate">Rate: – MB/s</span>
+      </div>
+
+      <div class="error-banner" id="error-banner"></div>
+      <canvas id="canvas" width="800" height="600"></canvas>
+      <div class="tooltip" id="tooltip"></div>
     </div>
 
-    <div class="error-banner" id="error-banner"></div>
-    <canvas id="canvas" width="800" height="600"></canvas>
-    <div class="tooltip" id="tooltip"></div>
-  </div>
-
-  <!--
+    <!--
     Build & run instructions:
 
     C++ generator (needs libzmq):
@@ -328,7 +418,6 @@
 
     Then open: http://localhost:8080/examples/waterfall/
   -->
-  <script type="module" src="main.js"></script>
-</body>
-
+    <script type="module" src="main.js"></script>
+  </body>
 </html>

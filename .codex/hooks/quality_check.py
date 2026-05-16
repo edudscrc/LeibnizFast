@@ -188,7 +188,17 @@ def main() -> int:
             ["cargo", "fmt"],
             ["cargo", "clippy", "--", "-D", "warnings"],
             ["cargo", "test"],
-            ["wasm-pack", "build", "--target", "web", "--release"],
+            [
+                "wasm-pack",
+                "build",
+                "--target",
+                "web",
+                "--release",
+                "--no-opt",
+                "--no-pack",
+                "--out-dir",
+                "target/codex-wasm-pack",
+            ],
         ):
             if not run_or_fail(args):
                 return 0

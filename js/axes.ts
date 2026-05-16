@@ -6,7 +6,13 @@
  * on top of the WebGPU canvas. The WebGPU pipeline is not modified.
  */
 
-import type { AxisConfig, ChartConfig, StreamingAxisConfig } from './types';
+import type {
+  AxisConfig,
+  ChartConfig,
+  HeatmapChartConfig,
+  LineChartConfig,
+  StreamingAxisConfig,
+} from './types';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -34,6 +40,10 @@ const COLORBAR_GAP = 16;
 const COLORBAR_TICK_LABEL_WIDTH = 72;
 /** Gap between colorbar tick labels and the rotated colorbar label. */
 const COLORBAR_LABEL_GAP = 3;
+/** Width reserved for the right-side line legend in CSS pixels. */
+const LINE_LEGEND_WIDTH = 140;
+/** Grid line color for line charts. */
+const GRID_STROKE = 'rgba(255, 255, 255, 0.08)';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -81,6 +91,16 @@ export interface ColorbarData {
   label?: string;
 }
 
+/** One line hover marker, in plot-local CSS pixels. */
+export interface LineHoverGuidePoint {
+  /** X position relative to the plot area. */
+  x: number;
+  /** Y position relative to the plot area. */
+  y: number;
+  /** Marker color as user-supplied RGBA. */
+  color: [number, number, number, number];
+}
+
 // ---------------------------------------------------------------------------
 // Type guards
 // ---------------------------------------------------------------------------
@@ -94,9 +114,29 @@ export function isStreamingAxis(
   return 'unitsPerCell' in axis;
 }
 
+/** Returns true when a chart config is a WebGPU line chart. */
+export function isLineChartConfig(
+  chart: ChartConfig,
+): chart is LineChartConfig {
+  return chart.type === 'line';
+}
+
+/** Returns true when a chart config is a heatmap chart. */
+export function isHeatmapChartConfig(
+  chart: ChartConfig,
+): chart is HeatmapChartConfig {
+  return !isLineChartConfig(chart);
+}
+
 /** Returns true when the default chart colorbar should reserve layout space. */
-function isColorbarEnabled(chart: ChartConfig): boolean {
+function isColorbarEnabled(chart: ChartConfig): chart is HeatmapChartConfig {
+  if (!isHeatmapChartConfig(chart)) return false;
   return chart.colorbar !== false;
+}
+
+/** Returns true when the line chart legend should reserve layout space. */
+export function isLegendEnabled(chart: ChartConfig): boolean {
+  return isLineChartConfig(chart) && chart.legend !== false;
 }
 
 /**
@@ -276,12 +316,13 @@ export function computeLayout(
   let leftMargin = EDGE_PADDING;
   if (chart.yAxis) {
     // Estimate max tick label width using extreme values
-    const maxTickWidth = estimateMaxTickLabelWidth(
-      chart.yAxis.min,
-      chart.yAxis.max,
-      ctx,
-      font,
-    );
+    const yMin = isLineChartConfig(chart)
+      ? (chart.yAxis.min ?? 0)
+      : chart.yAxis.min;
+    const yMax = isLineChartConfig(chart)
+      ? (chart.yAxis.max ?? 1)
+      : chart.yAxis.max;
+    const maxTickWidth = estimateMaxTickLabelWidth(yMin, yMax, ctx, font);
     leftMargin += TICK_LENGTH + 2 + maxTickWidth + PADDING;
 
     if (chart.yAxis.label || chart.yAxis.unit) {
@@ -299,6 +340,8 @@ export function computeLayout(
     if (chart.valueUnit) {
       rightMargin += tickLabelHeight + COLORBAR_LABEL_GAP;
     }
+  } else if (isLegendEnabled(chart)) {
+    rightMargin += COLORBAR_GAP + LINE_LEGEND_WIDTH;
   }
 
   return {
@@ -403,6 +446,7 @@ export function renderOverlay(
   const tickColor = chart.tickColor ?? DEFAULT_TICK_COLOR;
   const labelColor = chart.labelColor ?? DEFAULT_LABEL_COLOR;
   const bgColor = chart.backgroundColor ?? DEFAULT_BG_COLOR;
+  const yDirection: 'down' | 'up' = isLineChartConfig(chart) ? 'up' : 'down';
 
   // Scale for DPR — all drawing uses CSS pixel coordinates
   ctx.save();
@@ -419,6 +463,10 @@ export function renderOverlay(
     drawTitle(ctx, chart.title, layout, containerWidth, titleFont, labelColor);
   }
 
+  if (isLineChartConfig(chart) && chart.grid === true) {
+    drawGrid(ctx, layout, visible, font, GRID_STROKE, yDirection);
+  }
+
   // Draw X axis
   if (chart.xAxis) {
     drawXAxis(ctx, layout, chart.xAxis, visible, font, tickColor, labelColor);
@@ -426,7 +474,16 @@ export function renderOverlay(
 
   // Draw Y axis
   if (chart.yAxis) {
-    drawYAxis(ctx, layout, chart.yAxis, visible, font, tickColor, labelColor);
+    drawYAxis(
+      ctx,
+      layout,
+      chart.yAxis,
+      visible,
+      font,
+      tickColor,
+      labelColor,
+      yDirection,
+    );
   }
 
   if (isColorbarEnabled(chart) && colorbar) {
@@ -492,7 +549,7 @@ function drawTitle(
 function drawXAxis(
   ctx: CanvasRenderingContext2D,
   layout: LayoutRect,
-  axisConfig: AxisConfig | StreamingAxisConfig,
+  axisConfig: { label?: string; unit?: string },
   visible: VisibleRange,
   font: string,
   tickColor: string,
@@ -566,11 +623,12 @@ function drawXAxis(
 function drawYAxis(
   ctx: CanvasRenderingContext2D,
   layout: LayoutRect,
-  axisConfig: AxisConfig,
+  axisConfig: { label?: string; unit?: string },
   visible: VisibleRange,
   font: string,
   tickColor: string,
   labelColor: string,
+  yDirection: 'down' | 'up' = 'down',
 ): void {
   const axisX = layout.x;
 
@@ -606,9 +664,11 @@ function drawYAxis(
   for (const tick of ticks) {
     // No inversion: UV.y=0 is the top of the canvas, which corresponds to
     // yMin (row 0), so position=0 should map to the top of the matrix area.
+    const rawPosition =
+      yDirection === 'up' ? layout.height - tick.position : tick.position;
     const y =
       layout.y +
-      alignAxisTickPosition(tick.position, layout.height, ctx.lineWidth);
+      alignAxisTickPosition(rawPosition, layout.height, ctx.lineWidth);
 
     // Tick mark
     ctx.strokeStyle = tickColor;
@@ -643,6 +703,55 @@ function drawYAxis(
     ctx.fillText(axisLabel, 0, 0);
     ctx.restore();
   }
+}
+
+/** Draw optional grid lines for line charts. */
+function drawGrid(
+  ctx: CanvasRenderingContext2D,
+  layout: LayoutRect,
+  visible: VisibleRange,
+  font: string,
+  gridColor: string,
+  yDirection: 'down' | 'up',
+): void {
+  const xTicks = generateTicks(
+    visible.xMin,
+    visible.xMax,
+    layout.width,
+    ctx,
+    font,
+  );
+  const yTicks = generateTicks(
+    visible.yMin,
+    visible.yMax,
+    layout.height,
+    ctx,
+    font,
+  );
+
+  ctx.save();
+  ctx.strokeStyle = gridColor;
+  ctx.lineWidth = 1;
+
+  for (const tick of xTicks) {
+    const x = layout.x + tick.position;
+    ctx.beginPath();
+    ctx.moveTo(x, layout.y);
+    ctx.lineTo(x, layout.y + layout.height);
+    ctx.stroke();
+  }
+
+  for (const tick of yTicks) {
+    const rawPosition =
+      yDirection === 'up' ? layout.height - tick.position : tick.position;
+    const y = layout.y + rawPosition;
+    ctx.beginPath();
+    ctx.moveTo(layout.x, y);
+    ctx.lineTo(layout.x + layout.width, y);
+    ctx.stroke();
+  }
+
+  ctx.restore();
 }
 
 /**
@@ -747,6 +856,10 @@ const SELECTION_FILL = 'rgba(59, 130, 246, 0.2)';
 const SELECTION_STROKE = 'rgba(59, 130, 246, 0.8)';
 /** Subtle highlight for axis hover feedback. */
 const AXIS_HOVER_FILL = 'rgba(255, 255, 255, 0.05)';
+/** Almost-transparent dashed line color for line hover guides. */
+const LINE_HOVER_GUIDE_STROKE = 'rgba(255, 255, 255, 0.18)';
+/** Radius of line hover dots in CSS pixels. */
+const LINE_HOVER_DOT_RADIUS = 4;
 
 /**
  * Draw a selection rectangle on the overlay canvas.
@@ -801,6 +914,67 @@ export function drawAxisHighlight(
   } else {
     ctx.fillRect(0, layout.y, layout.x, layout.height);
   }
+}
+
+/**
+ * Draw line-chart hover guides and dots on top of the plot area.
+ *
+ * @param ctx - 2D rendering context
+ * @param layout - Matrix/plot area layout
+ * @param mouseX - Mouse X position relative to the plot area
+ * @param mouseY - Mouse Y position relative to the plot area
+ * @param points - Resolved visible line points in plot-local CSS pixels
+ */
+export function drawLineHoverGuides(
+  ctx: CanvasRenderingContext2D,
+  layout: LayoutRect,
+  mouseX: number,
+  mouseY: number,
+  points: LineHoverGuidePoint[],
+): void {
+  const mx = layout.x + mouseX;
+  const my = layout.y + mouseY;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(layout.x, layout.y, layout.width, layout.height);
+  ctx.clip();
+
+  ctx.strokeStyle = LINE_HOVER_GUIDE_STROKE;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 4]);
+
+  ctx.beginPath();
+  ctx.moveTo(mx, layout.y);
+  ctx.lineTo(mx, layout.y + layout.height);
+  ctx.moveTo(layout.x, my);
+  ctx.lineTo(mx, my);
+  ctx.stroke();
+
+  for (const point of points) {
+    const px = layout.x + point.x;
+    const py = layout.y + point.y;
+
+    ctx.beginPath();
+    ctx.moveTo(layout.x, py);
+    ctx.lineTo(px, py);
+    ctx.moveTo(mx, my);
+    ctx.lineTo(px, py);
+    ctx.stroke();
+  }
+
+  ctx.setLineDash([]);
+  for (const point of points) {
+    const [r, g, b, a] = point.color;
+    const px = layout.x + point.x;
+    const py = layout.y + point.y;
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a})`;
+    ctx.beginPath();
+    ctx.arc(px, py, LINE_HOVER_DOT_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
 }
 
 /**

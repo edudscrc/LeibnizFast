@@ -33,20 +33,60 @@ Remove the overlay entirely by passing `null`:
 viewer.setChart(null); // reverts to raw matrix mode
 ```
 
+## Line Charts
+
+Set `chart.type` to `'line'`, then upload one or more named series:
+
+```ts
+const viewer = await LeibnizFast.create(canvas, {
+  chart: {
+    type: 'line',
+    title: 'Oscilloscope',
+    grid: true,
+    xAxis: { kind: 'linear', label: 'Time', unit: 's', min: 0, max: 2 },
+    yAxis: { label: 'Amplitude', unit: 'V', rangeMode: 'stickyAuto' },
+  },
+});
+
+viewer.setLineData([
+  { id: 'signal', name: 'Signal', color: [80, 190, 255, 1], data: signal },
+  { id: 'ref', name: 'Reference', color: [255, 170, 64, 1], data: reference },
+]);
+```
+
+The line legend appears in the right-side margin. Clicking a series hides or shows it, and hidden series are excluded from hover and sticky-auto Y ranges.
+
+For scrolling streams, initialize the window once and then append new samples:
+
+```ts
+viewer.setLineData(initialSeries, {
+  xAxis: { kind: 'streaming', label: 'Time', unit: 's', unitsPerSample: 0.001 },
+  xOffset: initialSamplesReceived,
+});
+
+viewer.setLineDataScrolled(
+  [
+    { id: 'signal', data: nextSignalSamples },
+    { id: 'ref', data: nextReferenceSamples },
+  ],
+  { newSamples: nextSignalSamples.length, xOffset: totalSamplesReceived },
+);
+```
+
 ## `ChartConfig`
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `title` | `string` | — | Text displayed centered above the matrix |
-| `xAxis` | [`AxisConfig`](/api/types#axisconfig) \| [`StreamingAxisConfig`](/api/types#streamingaxisconfig) | — | X axis configuration |
-| `yAxis` | [`AxisConfig`](/api/types#axisconfig) | — | Y axis configuration |
-| `valueUnit` | `string` | — | Unit appended to the value in the hover tooltip and used as the colorbar label (e.g. `'dBFS'`, `'°C'`) |
-| `colorbar` | `boolean` | `true` | Show the right-side colorbar. Set to `false` to hide it. |
-| `font` | `string` (CSS) | `'12px sans-serif'` | Font for tick labels |
-| `titleFont` | `string` (CSS) | `'bold 16px sans-serif'` | Font for the chart title |
-| `tickColor` | `string` (CSS color) | `'#999'` | Color of tick marks and axis lines |
-| `labelColor` | `string` (CSS color) | `'#ccc'` | Color of all text labels |
-| `backgroundColor` | `string` (CSS color) | `'#1a1a1a'` | Background fill of the margin area around the matrix |
+| Field             | Type                                                                                             | Default                  | Description                                                                                            |
+| ----------------- | ------------------------------------------------------------------------------------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------ |
+| `title`           | `string`                                                                                         | —                        | Text displayed centered above the matrix                                                               |
+| `xAxis`           | [`AxisConfig`](/api/types#axisconfig) \| [`StreamingAxisConfig`](/api/types#streamingaxisconfig) | —                        | X axis configuration                                                                                   |
+| `yAxis`           | [`AxisConfig`](/api/types#axisconfig)                                                            | —                        | Y axis configuration                                                                                   |
+| `valueUnit`       | `string`                                                                                         | —                        | Unit appended to the value in the hover tooltip and used as the colorbar label (e.g. `'dBFS'`, `'°C'`) |
+| `colorbar`        | `boolean`                                                                                        | `true`                   | Show the right-side colorbar. Set to `false` to hide it.                                               |
+| `font`            | `string` (CSS)                                                                                   | `'12px sans-serif'`      | Font for tick labels                                                                                   |
+| `titleFont`       | `string` (CSS)                                                                                   | `'bold 16px sans-serif'` | Font for the chart title                                                                               |
+| `tickColor`       | `string` (CSS color)                                                                             | `'#999'`                 | Color of tick marks and axis lines                                                                     |
+| `labelColor`      | `string` (CSS color)                                                                             | `'#ccc'`                 | Color of all text labels                                                                               |
+| `backgroundColor` | `string` (CSS color)                                                                             | `'#1a1a1a'`              | Background fill of the margin area around the matrix                                                   |
 
 ## Axis Types
 
@@ -63,12 +103,12 @@ const yAxis: AxisConfig = {
 };
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `label` | `string` | No | Human-readable axis name shown beside the axis |
-| `unit` | `string` | No | Unit string displayed after the label |
-| `min` | `number` | **Yes** | Data-space minimum value at the axis origin |
-| `max` | `number` | **Yes** | Data-space maximum value at the axis far end |
+| Field   | Type     | Required | Description                                    |
+| ------- | -------- | -------- | ---------------------------------------------- |
+| `label` | `string` | No       | Human-readable axis name shown beside the axis |
+| `unit`  | `string` | No       | Unit string displayed after the label          |
+| `min`   | `number` | **Yes**  | Data-space minimum value at the axis origin    |
+| `max`   | `number` | **Yes**  | Data-space maximum value at the axis far end   |
 
 ### `StreamingAxisConfig` — Auto-Incrementing
 
@@ -83,24 +123,24 @@ const xAxis: StreamingAxisConfig = {
 };
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `label` | `string` | No | Human-readable axis name |
-| `unit` | `string` | No | Unit string displayed after the label |
-| `unitsPerCell` | `number` | **Yes** | Value increment per column |
+| Field          | Type     | Required | Description                           |
+| -------------- | -------- | -------- | ------------------------------------- |
+| `label`        | `string` | No       | Human-readable axis name              |
+| `unit`         | `string` | No       | Unit string displayed after the label |
+| `unitsPerCell` | `number` | **Yes**  | Value increment per column            |
 
 ## Colormaps
 
 Six colormaps are built in. All are perceptually uniform and designed for scientific visualization.
 
-| Name | Character |
-|---|---|
-| `'viridis'` | Blue → green → yellow. Default. Best general-purpose choice. |
-| `'inferno'` | Black → purple → orange → yellow. High contrast for dark data. |
-| `'magma'` | Black → purple → pink → white. |
-| `'plasma'` | Blue → purple → orange → yellow. High contrast, vivid. |
-| `'cividis'` | Blue-grey → yellow. Colorblind-friendly. |
-| `'grayscale'` | Black → white. |
+| Name          | Character                                                      |
+| ------------- | -------------------------------------------------------------- |
+| `'viridis'`   | Blue → green → yellow. Default. Best general-purpose choice.   |
+| `'inferno'`   | Black → purple → orange → yellow. High contrast for dark data. |
+| `'magma'`     | Black → purple → pink → white.                                 |
+| `'plasma'`    | Blue → purple → orange → yellow. High contrast, vivid.         |
+| `'cividis'`   | Blue-grey → yellow. Colorblind-friendly.                       |
+| `'grayscale'` | Black → white.                                                 |
 
 Change the colormap at any time without reloading data:
 
@@ -149,17 +189,20 @@ viewer.onHover((info) => {
 
 The [`HoverInfo`](/api/types#hoverinfo) object contains:
 
-| Field | Type | Description |
-|---|---|---|
-| `row` | `number` | Zero-based row index |
-| `col` | `number` | Zero-based column index |
-| `value` | `number` | Raw data value at `(row, col)` |
-| `valueAvailable` | `boolean` | False when chunked upload skipped CPU-side retention |
-| `y` | `number?` | Interpolated Y axis value (present when `yAxis` is configured) |
-| `x` | `number?` | Interpolated X axis value (present when `xAxis` is configured) |
-| `yUnit` | `string?` | Y axis unit string |
-| `xUnit` | `string?` | X axis unit string |
-| `valueUnit` | `string?` | Value unit from `ChartConfig.valueUnit` |
+| Field            | Type         | Description                                                    |
+| ---------------- | ------------ | -------------------------------------------------------------- |
+| `row`            | `number`     | Zero-based row index                                           |
+| `col`            | `number`     | Zero-based column index                                        |
+| `value`          | `number`     | Raw data value at `(row, col)`                                 |
+| `valueAvailable` | `boolean`    | False when chunked upload skipped CPU-side retention           |
+| `y`              | `number?`    | Interpolated Y axis value (present when `yAxis` is configured) |
+| `x`              | `number?`    | Interpolated X axis value (present when `xAxis` is configured) |
+| `yUnit`          | `string?`    | Y axis unit string                                             |
+| `xUnit`          | `string?`    | X axis unit string                                             |
+| `valueUnit`      | `string?`    | Value unit from `ChartConfig.valueUnit`                        |
+| `color`          | `RgbaColor?` | Color currently used to render the hovered heatmap value       |
+
+Line charts return `kind: 'line'`, the current `x`, mouse position, units, and a `points` array with one interpolated value per visible finite series.
 
 ## Updating the Title
 
@@ -190,7 +233,7 @@ viewer.setRange(-2, 35);
 
 viewer.onHover((info) => {
   console.log(
-    `${info.y?.toFixed(2)}°N, ${info.x?.toFixed(2)}°E: ${info.value.toFixed(1)}°C`
+    `${info.y?.toFixed(2)}°N, ${info.x?.toFixed(2)}°E: ${info.value.toFixed(1)}°C`,
   );
 });
 ```

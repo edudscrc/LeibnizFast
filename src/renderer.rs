@@ -15,6 +15,7 @@
 use crate::camera::Camera;
 use crate::chunked_upload::WORKGROUP_ALIGNMENT;
 use crate::colormap::ColormapTexture;
+use crate::line::{LineParams, LINE_X_MODE_EXPLICIT, LINE_X_MODE_LINEAR};
 use crate::matrix::{MatrixParams, MatrixView};
 use crate::perf::PerfTimer;
 use crate::pipeline::PipelineFactory;
@@ -127,6 +128,23 @@ pub struct Renderer {
     /// Ring buffer write cursor: the next texture column to write to.
     /// Advances by `new_cols` on each scrolled update. Wraps at `matrix_cols`.
     ring_cursor: u32,
+
+    // --- Line chart rendering resources ---
+    line_pipeline: Option<wgpu::RenderPipeline>,
+    line_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    line_bind_group: Option<wgpu::BindGroup>,
+    line_y_buffer: Option<wgpu::Buffer>,
+    line_x_buffer: Option<wgpu::Buffer>,
+    line_color_buffer: Option<wgpu::Buffer>,
+    line_visibility_buffer: Option<wgpu::Buffer>,
+    line_params_buffer: Option<wgpu::Buffer>,
+    line_y_capacity_bytes: u64,
+    line_x_capacity_bytes: u64,
+    line_color_capacity_bytes: u64,
+    line_visibility_capacity_bytes: u64,
+    line_sample_count: u32,
+    line_series_count: u32,
+    line_params: LineParams,
 }
 
 impl Renderer {
@@ -231,6 +249,21 @@ impl Renderer {
             debug,
             chunk_buffer: Vec::new(),
             ring_cursor: 0,
+            line_pipeline: None,
+            line_bind_group_layout: None,
+            line_bind_group: None,
+            line_y_buffer: None,
+            line_x_buffer: None,
+            line_color_buffer: None,
+            line_visibility_buffer: None,
+            line_params_buffer: None,
+            line_y_capacity_bytes: 0,
+            line_x_capacity_bytes: 0,
+            line_color_capacity_bytes: 0,
+            line_visibility_capacity_bytes: 0,
+            line_sample_count: 0,
+            line_series_count: 0,
+            line_params: LineParams::default(),
         })
     }
 
@@ -1025,6 +1058,458 @@ impl Renderer {
     }
 
     // -----------------------------------------------------------------------
+    // Line chart data upload
+    // -----------------------------------------------------------------------
+
+    fn line_buffer_bytes<T>(element_count: usize) -> Result<u64, String> {
+        let bytes = element_count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| "Line buffer size overflow.".to_string())?;
+        u64::try_from(bytes).map_err(|_| "Line buffer size does not fit in u64.".to_string())
+    }
+
+    fn create_line_storage_buffer(&self, label: &'static str, size: u64) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn ensure_line_pipeline(&mut self) {
+        if self.line_pipeline.is_some() && self.line_bind_group_layout.is_some() {
+            return;
+        }
+        let factory = PipelineFactory::new(&self.device, self.debug);
+        let (pipeline, layout) = factory.create_line_pipeline(self.surface_config.format);
+        self.line_pipeline = Some(pipeline);
+        self.line_bind_group_layout = Some(layout);
+    }
+
+    fn ensure_line_buffers(
+        &mut self,
+        y_bytes: u64,
+        x_bytes: u64,
+        color_bytes: u64,
+        visibility_bytes: u64,
+    ) -> bool {
+        let mut rebuilt = false;
+
+        if self.line_y_buffer.is_none() || self.line_y_capacity_bytes < y_bytes {
+            self.line_y_buffer = Some(self.create_line_storage_buffer("Line Y Buffer", y_bytes));
+            self.line_y_capacity_bytes = y_bytes;
+            rebuilt = true;
+        }
+
+        if self.line_x_buffer.is_none() || self.line_x_capacity_bytes < x_bytes {
+            self.line_x_buffer = Some(self.create_line_storage_buffer("Line X Buffer", x_bytes));
+            self.line_x_capacity_bytes = x_bytes;
+            rebuilt = true;
+        }
+
+        if self.line_color_buffer.is_none() || self.line_color_capacity_bytes < color_bytes {
+            self.line_color_buffer =
+                Some(self.create_line_storage_buffer("Line Color Buffer", color_bytes));
+            self.line_color_capacity_bytes = color_bytes;
+            rebuilt = true;
+        }
+
+        if self.line_visibility_buffer.is_none()
+            || self.line_visibility_capacity_bytes < visibility_bytes
+        {
+            self.line_visibility_buffer =
+                Some(self.create_line_storage_buffer("Line Visibility Buffer", visibility_bytes));
+            self.line_visibility_capacity_bytes = visibility_bytes;
+            rebuilt = true;
+        }
+
+        if self.line_params_buffer.is_none() {
+            use wgpu::util::DeviceExt;
+            self.line_params_buffer = Some(self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("Line Params Buffer"),
+                    contents: bytemuck::cast_slice(&[LineParams::default()]),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                },
+            ));
+            rebuilt = true;
+        }
+
+        rebuilt
+    }
+
+    fn rebuild_line_bind_group(&mut self) -> Result<(), String> {
+        self.ensure_line_pipeline();
+        let layout = self
+            .line_bind_group_layout
+            .as_ref()
+            .ok_or_else(|| "Line bind group layout is missing.".to_string())?;
+        let y_buffer = self
+            .line_y_buffer
+            .as_ref()
+            .ok_or_else(|| "Line Y buffer is missing.".to_string())?;
+        let x_buffer = self
+            .line_x_buffer
+            .as_ref()
+            .ok_or_else(|| "Line X buffer is missing.".to_string())?;
+        let color_buffer = self
+            .line_color_buffer
+            .as_ref()
+            .ok_or_else(|| "Line color buffer is missing.".to_string())?;
+        let visibility_buffer = self
+            .line_visibility_buffer
+            .as_ref()
+            .ok_or_else(|| "Line visibility buffer is missing.".to_string())?;
+        let params_buffer = self
+            .line_params_buffer
+            .as_ref()
+            .ok_or_else(|| "Line params buffer is missing.".to_string())?;
+
+        let factory = PipelineFactory::new(&self.device, self.debug);
+        self.line_bind_group = Some(factory.create_line_bind_group(
+            layout,
+            y_buffer,
+            x_buffer,
+            color_buffer,
+            visibility_buffer,
+            params_buffer,
+        ));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_line_inputs(
+        sample_count: u32,
+        series_count: u32,
+        colors: &[f32],
+        visibility: &[u32],
+        x_mode: u32,
+        x_values: Option<&[f32]>,
+        x_min: f32,
+        x_max: f32,
+        y_min: f32,
+        y_max: f32,
+    ) -> Result<(), String> {
+        if sample_count == 0 || series_count == 0 {
+            return Err("Line charts require at least one sample and one series.".to_string());
+        }
+        let expected_colors = (series_count as usize)
+            .checked_mul(4)
+            .ok_or_else(|| "Line color count overflow.".to_string())?;
+        if colors.len() != expected_colors {
+            return Err(format!(
+                "Line color buffer length {} does not match series_count x 4 = {}.",
+                colors.len(),
+                expected_colors
+            ));
+        }
+        if visibility.len() != series_count as usize {
+            return Err(format!(
+                "Line visibility length {} does not match series_count {}.",
+                visibility.len(),
+                series_count
+            ));
+        }
+        if x_mode != LINE_X_MODE_LINEAR && x_mode != LINE_X_MODE_EXPLICIT {
+            return Err(format!("Unknown line X mode: {x_mode}."));
+        }
+        if x_mode == LINE_X_MODE_EXPLICIT {
+            let values = x_values
+                .ok_or_else(|| "Explicit line X mode requires an X values buffer.".to_string())?;
+            if values.len() != sample_count as usize {
+                return Err(format!(
+                    "Line X buffer length {} does not match sample_count {}.",
+                    values.len(),
+                    sample_count
+                ));
+            }
+        }
+        if !x_min.is_finite() || !x_max.is_finite() || x_max <= x_min {
+            return Err(
+                "Line X range must contain finite values with max greater than min.".into(),
+            );
+        }
+        if !y_min.is_finite() || !y_max.is_finite() || y_max <= y_min {
+            return Err(
+                "Line Y range must contain finite values with max greater than min.".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Upload full series-major line data and prepare the line render path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_line_data(
+        &mut self,
+        data: &[f32],
+        sample_count: u32,
+        series_count: u32,
+        colors: &[f32],
+        visibility: &[u32],
+        x_values: Option<&[f32]>,
+        x_mode: u32,
+        x_start: f32,
+        x_step: f32,
+        x_min: f32,
+        x_max: f32,
+        y_min: f32,
+        y_max: f32,
+    ) -> Result<(), String> {
+        let _timer = PerfTimer::new("set_line_data", self.debug);
+        Self::validate_line_inputs(
+            sample_count,
+            series_count,
+            colors,
+            visibility,
+            x_mode,
+            x_values,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        )?;
+
+        let expected = (sample_count as usize)
+            .checked_mul(series_count as usize)
+            .ok_or_else(|| "Line data length overflow.".to_string())?;
+        if data.len() != expected {
+            return Err(format!(
+                "Line data length {} does not match sample_count x series_count = {}.",
+                data.len(),
+                expected
+            ));
+        }
+
+        self.ensure_line_pipeline();
+        let y_bytes = Self::line_buffer_bytes::<f32>(data.len())?;
+        let x_len = if x_mode == LINE_X_MODE_EXPLICIT {
+            sample_count as usize
+        } else {
+            1
+        };
+        let x_bytes = Self::line_buffer_bytes::<f32>(x_len)?;
+        let color_bytes = Self::line_buffer_bytes::<f32>(colors.len())?;
+        let visibility_bytes = Self::line_buffer_bytes::<u32>(visibility.len())?;
+        let rebuilt = self.ensure_line_buffers(y_bytes, x_bytes, color_bytes, visibility_bytes);
+
+        if let Some(buffer) = &self.line_y_buffer {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(data));
+        }
+        if let Some(buffer) = &self.line_x_buffer {
+            if let Some(values) = x_values {
+                self.queue
+                    .write_buffer(buffer, 0, bytemuck::cast_slice(values));
+            } else {
+                self.queue
+                    .write_buffer(buffer, 0, bytemuck::cast_slice(&[0.0f32]));
+            }
+        }
+        if let Some(buffer) = &self.line_color_buffer {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(colors));
+        }
+        if let Some(buffer) = &self.line_visibility_buffer {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(visibility));
+        }
+
+        self.line_sample_count = sample_count;
+        self.line_series_count = series_count;
+        self.line_params = LineParams {
+            sample_count,
+            series_count,
+            ring_cursor: 0,
+            x_mode,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            x_start,
+            x_step,
+            ..LineParams::default()
+        };
+
+        if let Some(buffer) = &self.line_params_buffer {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[self.line_params]));
+        }
+
+        if rebuilt || self.line_bind_group.is_none() {
+            self.rebuild_line_bind_group()?;
+        }
+
+        Ok(())
+    }
+
+    /// Update line colors, visibility, and ranges without uploading Y values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_line_config(
+        &mut self,
+        colors: &[f32],
+        visibility: &[u32],
+        x_mode: u32,
+        x_start: f32,
+        x_step: f32,
+        x_min: f32,
+        x_max: f32,
+        y_min: f32,
+        y_max: f32,
+    ) -> Result<(), String> {
+        let _timer = PerfTimer::new("update_line_config", self.debug);
+        Self::validate_line_inputs(
+            self.line_sample_count,
+            self.line_series_count,
+            colors,
+            visibility,
+            x_mode,
+            None,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        )?;
+        if x_mode == LINE_X_MODE_EXPLICIT && self.line_params.x_mode != LINE_X_MODE_EXPLICIT {
+            return Err("Cannot switch to explicit line X values without setLineData().".into());
+        }
+
+        if let Some(buffer) = &self.line_color_buffer {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(colors));
+        }
+        if let Some(buffer) = &self.line_visibility_buffer {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(visibility));
+        }
+
+        self.line_params.x_mode = x_mode;
+        self.line_params.x_start = x_start;
+        self.line_params.x_step = x_step;
+        self.line_params.x_min = x_min;
+        self.line_params.x_max = x_max;
+        self.line_params.y_min = y_min;
+        self.line_params.y_max = y_max;
+
+        if let Some(buffer) = &self.line_params_buffer {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[self.line_params]));
+        }
+
+        Ok(())
+    }
+
+    /// Upload newest samples into the line ring buffer without shifting old data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_line_data_scrolled(
+        &mut self,
+        data: &[f32],
+        new_samples: u32,
+        sample_count: u32,
+        series_count: u32,
+        colors: &[f32],
+        visibility: &[u32],
+        x_start: f32,
+        x_step: f32,
+        x_min: f32,
+        x_max: f32,
+        y_min: f32,
+        y_max: f32,
+    ) -> Result<(), String> {
+        let _timer = PerfTimer::new("set_line_data_scrolled", self.debug);
+        if self.line_y_buffer.is_none() {
+            return Err(
+                "setLineDataScrolled() requires an existing line buffer. Call setLineData() first."
+                    .into(),
+            );
+        }
+        if sample_count != self.line_sample_count || series_count != self.line_series_count {
+            return Err(
+                "Scrolled line updates must match the active sample and series counts.".into(),
+            );
+        }
+        if new_samples > sample_count {
+            return Err("newSamples cannot exceed the active line sample count.".into());
+        }
+        let expected = (new_samples as usize)
+            .checked_mul(series_count as usize)
+            .ok_or_else(|| "Scrolled line update length overflow.".to_string())?;
+        if data.len() != expected {
+            return Err(format!(
+                "Scrolled line data length {} does not match newSamples x series_count = {}.",
+                data.len(),
+                expected
+            ));
+        }
+        Self::validate_line_inputs(
+            sample_count,
+            series_count,
+            colors,
+            visibility,
+            LINE_X_MODE_LINEAR,
+            None,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        )?;
+
+        if new_samples > 0 {
+            let y_buffer = self
+                .line_y_buffer
+                .as_ref()
+                .ok_or_else(|| "Line Y buffer is missing.".to_string())?;
+            let cursor = self.line_params.ring_cursor;
+            let first = new_samples.min(sample_count - cursor);
+            let second = new_samples - first;
+
+            for series in 0..series_count {
+                let src_base = (series as usize)
+                    .checked_mul(new_samples as usize)
+                    .ok_or_else(|| "Scrolled line source offset overflow.".to_string())?;
+                let dst_series_base = (series as u64)
+                    .checked_mul(sample_count as u64)
+                    .ok_or_else(|| "Scrolled line destination offset overflow.".to_string())?;
+
+                if first > 0 {
+                    let src_end = src_base + first as usize;
+                    let dst_elements = dst_series_base + cursor as u64;
+                    self.queue.write_buffer(
+                        y_buffer,
+                        dst_elements * 4,
+                        bytemuck::cast_slice(&data[src_base..src_end]),
+                    );
+                }
+                if second > 0 {
+                    let src_start = src_base + first as usize;
+                    let src_end = src_start + second as usize;
+                    self.queue.write_buffer(
+                        y_buffer,
+                        dst_series_base * 4,
+                        bytemuck::cast_slice(&data[src_start..src_end]),
+                    );
+                }
+            }
+
+            self.line_params.ring_cursor = (cursor + new_samples) % sample_count;
+        }
+
+        self.update_line_config(
+            colors,
+            visibility,
+            LINE_X_MODE_LINEAR,
+            x_start,
+            x_step,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        )?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Frame rendering
     // -----------------------------------------------------------------------
 
@@ -1102,6 +1587,84 @@ impl Renderer {
                 render_pass.set_bind_group(0, bind_group, &[]);
                 render_pass.draw(0..6, 0..1);
             }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        Ok(())
+    }
+
+    /// Render the active line chart.
+    pub fn render_line_frame(&self, camera: &Camera) -> Result<(), String> {
+        let _timer = PerfTimer::new("render_line_frame", self.debug);
+        let render_pipeline = match self.line_pipeline.as_ref() {
+            Some(p) => p,
+            None => return self.render_clear(),
+        };
+        let bind_group = match self.line_bind_group.as_ref() {
+            Some(bg) => bg,
+            None => return self.render_clear(),
+        };
+        if self.line_sample_count < 2 || self.line_series_count == 0 {
+            return self.render_clear();
+        }
+
+        if let Some(params_buffer) = &self.line_params_buffer {
+            let cam = camera.state.get_uniforms();
+            let mut params = self.line_params;
+            params.uv_x_offset = cam.uv_offset[0];
+            params.uv_y_offset = cam.uv_offset[1];
+            params.uv_x_scale = cam.uv_scale[0];
+            params.uv_y_scale = cam.uv_scale[1];
+            self.queue
+                .write_buffer(params_buffer, 0, bytemuck::cast_slice(&[params]));
+        }
+
+        let Some(output) = self.acquire_surface_texture()? else {
+            return Ok(());
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Line Render Encoder"),
+            });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Line Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.1,
+                            b: 0.1,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            let vertices_per_series = (self.line_sample_count - 1)
+                .checked_mul(2)
+                .ok_or_else(|| "Line vertex count overflow.".to_string())?;
+            let vertex_count = vertices_per_series
+                .checked_mul(self.line_series_count)
+                .ok_or_else(|| "Line vertex count overflow.".to_string())?;
+
+            render_pass.set_pipeline(render_pipeline);
+            render_pass.set_bind_group(0, bind_group, &[]);
+            render_pass.draw(0..vertex_count, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

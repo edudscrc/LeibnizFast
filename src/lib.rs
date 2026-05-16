@@ -23,6 +23,7 @@ pub mod chunked_upload;
 pub mod colormap;
 pub mod colormap_data;
 pub mod interaction;
+pub mod line;
 pub mod matrix;
 pub mod tile_grid;
 
@@ -41,6 +42,7 @@ mod wasm_entry {
     use crate::camera;
     use crate::colormap;
     use crate::interaction;
+    use crate::line;
     use crate::matrix;
     use crate::perf::PerfTimer;
     use crate::renderer;
@@ -117,6 +119,18 @@ mod wasm_entry {
         (min_val, max_val)
     }
 
+    fn copy_float32_array(data: &js_sys::Float32Array) -> Vec<f32> {
+        let mut out = vec![0.0f32; data.length() as usize];
+        data.copy_to(&mut out);
+        out
+    }
+
+    fn copy_uint32_array(data: &js_sys::Uint32Array) -> Vec<u32> {
+        let mut out = vec![0u32; data.length() as usize];
+        data.copy_to(&mut out);
+        out
+    }
+
     fn finalize_range(min_val: f32, max_val: f32) -> (f32, f32) {
         if min_val.is_infinite() || max_val.is_infinite() {
             (0.0, 1.0)
@@ -153,6 +167,12 @@ mod wasm_entry {
         max_val: f32,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RenderMode {
+        Heatmap,
+        Line,
+    }
+
     /// Main entry point for the library. Owns all GPU state and provides
     /// the public API for matrix visualization.
     ///
@@ -181,6 +201,8 @@ mod wasm_entry {
         /// When Some, `set_data` skips the min/max scan and uses this range
         /// directly, eliminating both the scan cost and the second GPU dispatch.
         sticky_range: Option<(f32, f32)>,
+        /// Which renderer path should draw the next frame.
+        render_mode: RenderMode,
         /// Enable performance timing logs
         debug: bool,
     }
@@ -226,6 +248,7 @@ mod wasm_entry {
                 pending_upload: None,
                 pending_chunk_upload: None,
                 sticky_range: None,
+                render_mode: RenderMode::Heatmap,
                 debug,
             })
         }
@@ -336,6 +359,7 @@ mod wasm_entry {
             // a fresh JS WaterfallBuffer whose ringCursor is also 0.
             self.renderer.reset_ring_cursor();
 
+            self.render_mode = RenderMode::Heatmap;
             self.render_frame()?;
 
             Ok(())
@@ -430,6 +454,7 @@ mod wasm_entry {
                     self.renderer
                         .apply_colormap_tiled(matrix_view, &read_fn, cols);
                 }
+                self.render_mode = RenderMode::Heatmap;
                 self.render_frame()?;
                 return Ok(());
             }
@@ -444,6 +469,7 @@ mod wasm_entry {
                     .apply_colormap_ring(matrix_view, &read_fn, cols, new_cols);
             }
 
+            self.render_mode = RenderMode::Heatmap;
             self.render_frame()?;
             Ok(())
         }
@@ -466,6 +492,7 @@ mod wasm_entry {
                         .map_err(|e| JsValue::from_str(&e))?;
                 }
 
+                self.render_mode = RenderMode::Heatmap;
                 self.render_frame()?;
             }
 
@@ -492,9 +519,149 @@ mod wasm_entry {
                 // Update the range uniform buffer — fragment shader picks it up immediately
                 self.renderer.update_range_buffer(min, max);
 
+                self.render_mode = RenderMode::Heatmap;
                 self.render_frame()?;
             }
 
+            Ok(())
+        }
+
+        /// Upload full series-major line data and render it as a line chart.
+        #[allow(clippy::too_many_arguments)]
+        #[wasm_bindgen(js_name = setLineData)]
+        pub fn set_line_data(
+            &mut self,
+            data: js_sys::Float32Array,
+            sample_count: u32,
+            series_count: u32,
+            colors: js_sys::Float32Array,
+            visibility: js_sys::Uint32Array,
+            x_values: Option<js_sys::Float32Array>,
+            x_mode: u32,
+            x_start: f32,
+            x_step: f32,
+            x_min: f32,
+            x_max: f32,
+            y_min: f32,
+            y_max: f32,
+        ) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("set_line_data", self.debug);
+            if self.pending_upload.is_some() || self.pending_chunk_upload.is_some() {
+                return Err(JsValue::from_str("An upload is already in progress."));
+            }
+            let data = copy_float32_array(&data);
+            let colors = copy_float32_array(&colors);
+            let visibility = copy_uint32_array(&visibility);
+            let x_values = x_values.as_ref().map(copy_float32_array);
+            let x_ref = x_values.as_deref();
+
+            if x_mode != line::LINE_X_MODE_LINEAR && x_mode != line::LINE_X_MODE_EXPLICIT {
+                return Err(JsValue::from_str("Unknown line X mode."));
+            }
+
+            self.camera.state.set_matrix_size(1, sample_count.max(1));
+            self.renderer
+                .set_line_data(
+                    &data,
+                    sample_count,
+                    series_count,
+                    &colors,
+                    &visibility,
+                    x_ref,
+                    x_mode,
+                    x_start,
+                    x_step,
+                    x_min,
+                    x_max,
+                    y_min,
+                    y_max,
+                )
+                .map_err(|e| JsValue::from_str(&e))?;
+            self.render_mode = RenderMode::Line;
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Upload newest line samples into the active line ring buffer.
+        #[allow(clippy::too_many_arguments)]
+        #[wasm_bindgen(js_name = setLineDataScrolled)]
+        pub fn set_line_data_scrolled(
+            &mut self,
+            data: js_sys::Float32Array,
+            new_samples: u32,
+            sample_count: u32,
+            series_count: u32,
+            colors: js_sys::Float32Array,
+            visibility: js_sys::Uint32Array,
+            x_start: f32,
+            x_step: f32,
+            x_min: f32,
+            x_max: f32,
+            y_min: f32,
+            y_max: f32,
+        ) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("set_line_data_scrolled", self.debug);
+            if self.pending_upload.is_some() || self.pending_chunk_upload.is_some() {
+                return Err(JsValue::from_str("An upload is already in progress."));
+            }
+            let data = copy_float32_array(&data);
+            let colors = copy_float32_array(&colors);
+            let visibility = copy_uint32_array(&visibility);
+            self.camera.state.set_matrix_size(1, sample_count.max(1));
+            self.renderer
+                .set_line_data_scrolled(
+                    &data,
+                    new_samples,
+                    sample_count,
+                    series_count,
+                    &colors,
+                    &visibility,
+                    x_start,
+                    x_step,
+                    x_min,
+                    x_max,
+                    y_min,
+                    y_max,
+                )
+                .map_err(|e| JsValue::from_str(&e))?;
+            self.render_mode = RenderMode::Line;
+            self.render_frame()?;
+            Ok(())
+        }
+
+        /// Update line colors, visibility, and visible data ranges.
+        #[allow(clippy::too_many_arguments)]
+        #[wasm_bindgen(js_name = updateLineConfig)]
+        pub fn update_line_config(
+            &mut self,
+            colors: js_sys::Float32Array,
+            visibility: js_sys::Uint32Array,
+            x_mode: u32,
+            x_start: f32,
+            x_step: f32,
+            x_min: f32,
+            x_max: f32,
+            y_min: f32,
+            y_max: f32,
+        ) -> Result<(), JsValue> {
+            let _timer = PerfTimer::new("update_line_config", self.debug);
+            let colors = copy_float32_array(&colors);
+            let visibility = copy_uint32_array(&visibility);
+            self.renderer
+                .update_line_config(
+                    &colors,
+                    &visibility,
+                    x_mode,
+                    x_start,
+                    x_step,
+                    x_min,
+                    x_max,
+                    y_min,
+                    y_max,
+                )
+                .map_err(|e| JsValue::from_str(&e))?;
+            self.render_mode = RenderMode::Line;
+            self.render_frame()?;
             Ok(())
         }
 
@@ -767,6 +934,7 @@ mod wasm_entry {
                     .apply_colormap_tiled(matrix_view, &read_fn, cols);
             }
 
+            self.render_mode = RenderMode::Heatmap;
             self.render_frame()?;
 
             Ok(())
@@ -979,6 +1147,7 @@ mod wasm_entry {
             self.renderer.update_range_buffer(min_val, max_val);
             self.js_data = pending.js_data;
             self.matrix = Some(pending.matrix_view);
+            self.render_mode = RenderMode::Heatmap;
             self.render_frame()?;
 
             Ok(())
@@ -1181,7 +1350,7 @@ mod wasm_entry {
                 .resize(width, height)
                 .map_err(|e| JsValue::from_str(&e))?;
             self.camera.update_uniform(&self.renderer.queue);
-            if self.matrix.is_some() {
+            if self.matrix.is_some() || self.render_mode == RenderMode::Line {
                 self.render_frame()?;
             }
             Ok(())
@@ -1216,9 +1385,16 @@ mod wasm_entry {
 
         /// Render a single frame.
         fn render_frame(&mut self) -> Result<(), JsValue> {
-            self.renderer
-                .render_frame(&self.colormap_texture, &self.camera)
-                .map_err(|e| JsValue::from_str(&e))
+            match self.render_mode {
+                RenderMode::Heatmap => self
+                    .renderer
+                    .render_frame(&self.colormap_texture, &self.camera)
+                    .map_err(|e| JsValue::from_str(&e)),
+                RenderMode::Line => self
+                    .renderer
+                    .render_line_frame(&self.camera)
+                    .map_err(|e| JsValue::from_str(&e)),
+            }
         }
 
         /// Handle hover by looking up the matrix value when retained data exists.

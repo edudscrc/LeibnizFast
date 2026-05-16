@@ -128,13 +128,34 @@
       .tooltip {
         position: fixed;
         padding: 6px 10px;
-        background: rgba(0, 0, 0, 0.85);
+        background: rgba(0, 0, 0, 0.86);
         color: #fff;
         border-radius: 4px;
-        font-size: 0.85rem;
+        font-size: 0.82rem;
         pointer-events: none;
         display: none;
-        font-family: monospace;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        min-width: 190px;
+      }
+
+      .tooltip-x {
+        margin-bottom: 5px;
+        color: #d8dee9;
+      }
+
+      .tooltip-row {
+        align-items: center;
+        display: grid;
+        grid-template-columns: 14px auto;
+        gap: 5px;
+        line-height: 1.45;
+      }
+
+      .tooltip-swatch {
+        display: inline-block;
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
       }
 
       .error-banner {
